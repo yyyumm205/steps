@@ -83,4 +83,23 @@ B01 分项状态：
 
 ## 5. 本轮文档检查
 
-本轮验证范围为总纲与三规格/差异说明的链接、版本、S/T/B覆盖、历史证据与计划分离、暂定/待确认标记、源码定位、敏感链接排除及 Git 文件范围。最终检查结果记入 [change-review.md](change-review.md) 并随交付汇报。本轮不执行新的构建、业务测试、设备采集或上传。
+此前本节记录的是文档规格阶段的验证范围：总纲与三规格/差异说明的链接、版本、S/T/B覆盖、历史证据与计划分离、暂定/待确认标记、源码定位、敏感链接排除及 Git 文件范围。T1 实施后的构建、自动测试和代码审查结果见下一节；设备采集和上传仍按条件保持待执行。
+
+## 6. T1 实施验证记录（2026-09-18）
+
+本节覆盖 T1“独立入口与采集准备”实现，不能替代 T2 的 session、计步器、下载、上传或后端验收。
+
+| 检查 | 实际执行与证据 | 结果 |
+| --- | --- | --- |
+| JVM 自动测试 | 在 `android` 目录使用 JDK 21 与 `-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK` 执行 `gradlew.bat testDebugUnitTest`；XML 报告发现 63 项测试（CapturePurpose 5、HealthTimeAnchor 5、ParticipantProfileStore 3、PreparationStore 17、RingPreparationController 21、RingProtocol 12），失败 0、错误 0、跳过 0。GBK 是当前中文 Windows Gradle 缓存路径的命令行兼容参数，项目仍为 UTF-8。 | 已通过 |
+| Debug 构建 | 同一命令执行 `assembleDebug` 与 `assembleDebugAndroidTest`，退出码 0；生成独立 Debug APK 与测试 APK。 | 已通过 |
+| APK 身份和导航 | 使用 Android SDK `aapt dump badging` 检查：`com.nexthci.ringfitness.steps`、versionCode 26、versionName `0.6.0-t1`、显示名“步数采集”、启动 Activity 为 `StepPreparationActivity`、minSdk 30/targetSdk 36。Manifest 已移除旧 `ringfitness://` 登录/Oura 回调；开始按钮在 Activity 中明确禁用。 | 已通过静态检查 |
+| T1 本地持久化 | PreparationStore 的 17 项行为测试覆盖登记规范化、跨实例恢复、位置/戒指关联、损坏保护、原子替换失败、并发读改写和重开；Activity 使用单一磁盘队列，只有写入成功后更新已确认显示。 | 已通过自动测试；Android 文件系统断电/强杀仍待真机 |
+| T1 BLE 状态控制 | RingPreparationController 的 21 项测试覆盖只读查询、真实连接/STATUS 门槛、正在采集/已有记录/错误阻断、断连、刷新、超时、迟到回调和旧监听器隔离；Android adapter 每次连接使用新 RingBleClient，未绑定旧采集服务。 | 已通过自动测试；真实 BLE 仍待设备 |
+| 公共目录隔离 | CaptureFile、HealthRawV2、DailySummaryStore、PolarHrRrCapture 统一使用 `BuildConfig.PUBLIC_DATA_DIRECTORY = RingFitnessSteps`；Android instrumented test 已编译并加入 Download 相对路径断言，但没有可用设备执行。 | 代码核对通过；设备文件检查待执行 |
+| 独立代码审查 | 两次只读审查覆盖 Activity、Android BLE adapter、PreparationStore、Controller、Manifest/build 身份和公共目录。发现的两项低风险状态问题已修复：迟到设备回复清除过时超时提示；扫描提示进入统一状态源，且选择设备前先清除旧连接状态。修复后复查无新增阻塞项。 | 已完成 |
+| lint | 执行 `lintDebug` 未通过：旧的未声明启动 `MainActivity.kt:149` 触发 Android 16 `GestureBackNavigation` 错误；该 Activity 仍保留作为历史源文件，本轮没有导航到它。其余为既有警告和 3 条 T1 文案/KTX 警告。 | 受历史源码限制；未作为 T1 通过依据 |
+| 真机/模拟器 | `adb devices -l` 返回空列表；本机没有可用 AVD/system image。 | 受条件限制，待执行 |
+| 云盘/后端 | T1 不创建 session、不上传数据；本轮未进行云盘或 Python 导入测试。 | 不适用，留待 T2/T3 |
+
+T1 当前可交付范围是“打开独立 App、离线登记编号、记住位置和所选戒指、执行只读设备准备检查”。自动测试和 APK 静态身份检查已通过；真实 Android 11+ 手机、真实戒指、应用重启/升级/共存、权限、BLE、实际文件目录仍需设备证据。发现戒指正在采集或报告已有记录时，页面会保持待核对，不会接管或清除数据。

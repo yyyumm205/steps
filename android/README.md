@@ -1,5 +1,23 @@
 # RingFitness Android
 
+当前开发版：**步数采集 0.6.0-t1（versionCode 26）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+
+本版仅交付采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。开始采集按钮暂未开放；尚不产生 session、计步器参考数、下载或上传。
+
+独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，本版准备页不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
+
+构建使用 JDK 21 和 Android SDK 36。在 `android` 目录执行：
+
+```powershell
+.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest '-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK' --console=plain
+```
+
+此命令的 GBK 参数适用于当前 Windows Java 启动器与中文 Gradle 缓存路径的兼容问题，项目文件仍保持 UTF-8；原因见 [基线记录](../docs/android-baseline-20260918.md)。APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。设备测试须另行连接 Android 11+ 手机或模拟器执行 `connectedDebugAndroidTest`；测试 APK 构建成功不代表设备测试通过。
+
+## 原版历史说明
+
+以下保留交接版本的能力和操作说明，适用范围为原版 0.5.3。新版本已退出这些旧导航入口，后续采集与上传按新规格逐步接入。
+
 0.5.3（versionCode 25）将采集结束评分改为可选项：用户可关闭“填写评分”并直接保存评价。日常活动评价在“主观评价”之前新增最多 500 字的“活动细节”，可填写工作内容、饮食内容、步行/骑行/跑步路线等。未评分时上传清单省略 `score`，活动细节非空时写入 `activity_detail`；睡眠评价不显示或上传活动细节。
 
 0.5.2（versionCode 24）新增采集结束后的主观评价。睡眠采集仅在启用 Oura 时评价；日常活动中的走路、骑车、跑步、工作和吃饭需要评价，“其他活动”跳过。用户先选择“立即上传”或“暂存到戒指”，App 停止传感器后要求滑动选择 1–10 分，可选填写最多 500 字评价，再继续 Flash 查询、下载或暂存。评价会持久化并随上传包写入 `manifest.json`；同时修正 Flash 收尾期间过早显示下载进度的问题。

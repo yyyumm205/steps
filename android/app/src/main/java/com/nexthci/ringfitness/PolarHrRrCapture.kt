@@ -72,12 +72,12 @@ class PolarHrRrCapture private constructor(
                 put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
                 put(
                     MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_DOWNLOADS + "/RingFitness/${dayFormatter.format(now)}",
+                    Environment.DIRECTORY_DOWNLOADS + "/${BuildConfig.PUBLIC_DATA_DIRECTORY}/${dayFormatter.format(now)}",
                 )
             }
             val resolver = context.contentResolver
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: error("无法在 Download/RingFitness 创建 Polar 数据文件")
+                ?: error("无法在 Download/${BuildConfig.PUBLIC_DATA_DIRECTORY} 创建 Polar 数据文件")
             val stream = resolver.openOutputStream(uri, "w") ?: error("无法打开 Polar 数据文件")
             return PolarHrRrCapture(
                 name,

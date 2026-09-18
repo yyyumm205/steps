@@ -39,7 +39,7 @@ object HealthRawV2 {
             put(MediaStore.MediaColumns.MIME_TYPE, MIME)
             put(
                 MediaStore.MediaColumns.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS + "/RingFitness/" +
+                Environment.DIRECTORY_DOWNLOADS + "/${BuildConfig.PUBLIC_DATA_DIRECTORY}/" +
                     Instant.ofEpochMilli(startedAtMs).atZone(ZoneId.systemDefault()).toLocalDate(),
             )
         }

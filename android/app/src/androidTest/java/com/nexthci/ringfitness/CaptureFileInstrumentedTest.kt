@@ -17,6 +17,10 @@ class CaptureFileInstrumentedTest {
     fun writesTimestampedImuAndPpgCsvToDownloads() {
         val imu = CaptureFile.create(context, CaptureKind.IMU)
         try {
+            context.contentResolver.query(imu.uri, arrayOf(android.provider.MediaStore.MediaColumns.RELATIVE_PATH), null, null, null)!!.use {
+                assertTrue(it.moveToFirst())
+                assertTrue(it.getString(0).startsWith("Download/RingFitnessSteps/"))
+            }
             imu.writeImu(
                 SensorPacket.Imu(
                     packetSeq = 7,

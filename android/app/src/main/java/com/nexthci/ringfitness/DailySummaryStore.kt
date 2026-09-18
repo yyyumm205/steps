@@ -173,7 +173,7 @@ class DailySummaryStore(context: Context) {
     private fun regenerate(date: LocalDate, nowMs: Long) {
         val json = buildSummary(date, nowMs).toString(2)
         val resolver = appContext.contentResolver
-        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/RingFitness/$date/"
+        val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/${BuildConfig.PUBLIC_DATA_DIRECTORY}/$date/"
         val uri = findSummaryUri(relativePath) ?: resolver.insert(
             MediaStore.Downloads.EXTERNAL_CONTENT_URI,
             ContentValues().apply {

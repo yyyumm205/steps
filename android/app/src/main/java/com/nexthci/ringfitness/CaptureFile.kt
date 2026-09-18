@@ -161,12 +161,12 @@ class CaptureFile private constructor(
                 put(MediaStore.MediaColumns.MIME_TYPE, "text/csv")
                 put(
                     MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_DOWNLOADS + "/RingFitness/$dateFolder",
+                    Environment.DIRECTORY_DOWNLOADS + "/${BuildConfig.PUBLIC_DATA_DIRECTORY}/$dateFolder",
                 )
             }
             val resolver = context.contentResolver
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: error("无法在 Download/RingFitness 创建文件")
+                ?: error("无法在 Download/${BuildConfig.PUBLIC_DATA_DIRECTORY} 创建文件")
             val stream = resolver.openOutputStream(uri, "w")
                 ?: error("无法打开采集文件：$name")
             return CaptureFile(
