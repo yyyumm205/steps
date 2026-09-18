@@ -182,6 +182,11 @@ class StepPreparationActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
         subtitle = label(header, "", 14f)
+        if (BuildConfig.DEBUG) {
+            QuietUi(this).button(header, "体验完整流程", tag = "open_demo") {
+                startActivity(Intent().setClassName(packageName, "com.nexthci.ringfitness.DemoCollectionActivity"))
+            }
+        }
         scroll = ScrollView(this).apply { isFillViewport = true }
         frame.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), dp(12)) }

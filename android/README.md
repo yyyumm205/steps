@@ -1,21 +1,25 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.6.4-t2b（versionCode 30）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+当前开发版：**步数采集 0.6.5-t2p（versionCode 31）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
 
-本版仅交付采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。开始采集按钮暂未开放；尚不产生 session、计步器参考数、下载或上传。
+正式设备入口继续提供采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。真实开始采集仍待接入，现有真机证据覆盖准备功能。
 
-T1b准备导航保持原行为。T2b.1新增纯Kotlin采集协调器，使用现有请求账本和可替换传输接口，验证请求先落盘、设备观察后确认以及异常保全；尚未接入页面、真实BLE或前台服务。协调器须由未来单一采集服务串行持有；协议缺少请求nonce/boot ID，跨连接或进程恢复暂保持待核对。完整页面设计、服务迁移和真实入口的安全门槛见规格，模拟测试通过不代表真实采集已开放。
+T2-P新增同一原生App中的完整流程演示。从准备页顶部点击“体验完整流程”，填写独立体验编号和佩戴位置，即可操作开始、结束、填写步数、本地保存和模拟传输。日常重新打开时，已完成任务显示在首页，未完成任务优先恢复；“演示选项”提供确认超时、保存失败、下载失败、上传失败和断连等受控场景。首页、采集中和填写步数页采用统一的轻背景、圆角卡片及单一主按钮。
+
+演示复用原生页面、采集请求协调器和持久化账本；参考数字实际落盘，文件实际校验，退出或重开可恢复同一记录。设备状态、信号文件及上传回执由测试替身生成，全程显示模拟标记。演示入口仅存在于Debug构建，Activity不向其他应用导出；数据位于应用私有的`files/collection-demo/`，与正式准备信息和实验记录隔离。演示不发真实BLE命令、不访问云盘，也不生成可供实验分析的`.rfbin`；真实采集边界保持未知。
+
+T2b.1协调器已用于演示中的开始/停止路径。正式BLE适配、单一前台采集服务与原始记录下载按T2b.2/T2c/T2d接入，真实上传和后端按T2e/T3验证。真实协议缺少请求nonce/boot ID，跨连接或进程恢复继续保留待核对规则；演示设备自身持久保存的session身份只用于测试恢复，不能作为真实戒指恢复的证据。
 
 首次在同页填写编号和佩戴位置，点击“保存并连接戒指”。一次原子保存成功后按需请求权限并直接搜索；选中戒指保存成功后回首页连接，完成后自动显示结果。修改位置在首页弹窗中选择即保存，成功才更新，失败保留原值并允许重试；取消或选择原值不写入。
 
 已有完整档案冷启动时，权限、蓝牙及必要定位齐备便自动连接一次；条件不足或连接失败时显示恢复动作。自动连接不弹系统授权，不在后台执行；取消、返回、关闭弹窗及页面重建不循环重连。首页共用同一判断显示当前状态和主要操作，电量、固件及 STATUS 未齐时持续显示检查中。技术信息、系统设置和更换戒指位于“设备详情”。本轮测试结果见 [B20 与验证记录](../specs/independent-step-collection/validation.md)，历史版本通过项保留原适用范围。
 
-独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，本版准备页不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
+独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，准备页和流程演示均不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
 
 构建使用 JDK 21 和 Android SDK 36。在 `android` 目录执行：
 
 ```powershell
-.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest '-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK' --console=plain
+.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease '-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK' --console=plain
 ```
 
 此命令的 GBK 参数适用于当前 Windows Java 启动器与中文 Gradle 缓存路径的兼容问题，项目文件仍保持 UTF-8；原因见 [基线记录](../docs/android-baseline-20260918.md)。APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。设备测试须另行连接 Android 11+ 手机或模拟器执行 `connectedDebugAndroidTest`；测试 APK 构建成功不代表设备测试通过。
@@ -33,6 +37,14 @@ adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.P
 ```
 
 以上权限命令适用于API31模拟器；缺少蓝牙条件时，相关用例会明确跳过。测试期间避免同时操作App。测试使用合成档案与可控设备回复检查保存、恢复、等待及重试，真实BLE另用手机和戒指验证。手动复核首次登记后自动搜索、选择后首页状态及强停重开；写失败用可控夹具验证，操作结果同时核对持久档案。具体数量、失败和未覆盖项统一记录在validation。
+
+完整流程的8项原生页面测试使用独立缓存目录，显式启用后执行；测试替身无需实体戒指或网络，不覆盖默认演示档案：
+
+```powershell
+adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.CollectionFlowInstrumentedTest -e verifyCollectionFlow true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+0.6.5-t2p的验证通过范围为193项JVM测试、25项API31 Android测试（完整流程8项及已有17项），以及上述四项Gradle任务。正常路径另经模拟器实际操作，核对562步、同一session、合成文件哈希和模拟回执；故障与恢复范围及限制见[验证记录E15](../specs/independent-step-collection/validation.md)。真实采集、实验云盘上传读回、后端和长时能力继续单独验收。
 
 ## 原版历史说明
 

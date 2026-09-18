@@ -418,7 +418,11 @@ class FreeLivingSessionStoreTest {
         val envelope = JsonParser().parse(file.readText()).asJsonObject
         val payload = envelope.getAsJsonObject("session")
         change(payload)
-        val digest = MessageDigest.getInstance("SHA-256").digest(payload.toString().toByteArray(Charsets.UTF_8))
+        val hashed = if (envelope.get("journal_version").asInt == 2) JsonObject().apply {
+            add("session", payload)
+            add("archived_sessions", envelope.get("archived_sessions"))
+        } else payload
+        val digest = MessageDigest.getInstance("SHA-256").digest(hashed.toString().toByteArray(Charsets.UTF_8))
             .joinToString("") { "%02x".format(it.toInt() and 255) }
         envelope.addProperty("sha256", digest)
         file.writeText(envelope.toString())

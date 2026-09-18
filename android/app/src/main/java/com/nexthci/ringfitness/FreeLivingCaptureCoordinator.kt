@@ -236,7 +236,7 @@ class FreeLivingCaptureCoordinator(
                     return
                 }
                 // A second owner of this journal is unsupported. Recheck before issuing a command.
-                val existing = try { store.read() } catch (_: Exception) { storageFailure(); return }
+                val existing = try { store.readPending() } catch (_: Exception) { storageFailure(); return }
                 if (existing != null) { session = existing; publishRestored(); return }
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone) } ?: return
                 baseline = observed
@@ -326,7 +326,7 @@ class FreeLivingCaptureCoordinator(
 
     private fun readJournal() {
         try {
-            session = store.read()
+            session = store.readPending()
             restored = true
             publishRestored()
         } catch (_: Exception) {
