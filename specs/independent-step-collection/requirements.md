@@ -2,7 +2,7 @@
 
 状态：修订草稿，待审阅。日期：2026-09-18。分支：`codex/free-living-session-spec`。
 
-本规格服从 [CONSTITUTION.md](../../CONSTITUTION.md) 2.0.0 修订草稿；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。本轮交付为文档对齐，业务实现待审阅后推进。
+本规格服从用户已确认的 [CONSTITUTION.md](../../CONSTITUTION.md) 2.0.0；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。用户已授权从独立入口与准备开始实现，Q01–Q03仍单独待确认。
 
 ## 1. 本功能边界与当前事实
 

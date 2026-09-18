@@ -1,0 +1,6 @@
+# Copy this file to local.properties and replace the placeholders.
+sdk.dir=C\:\\Users\\YOUR_NAME\\AppData\\Local\\Android\\Sdk
+ringfitness.uploadLink=https\://cloud.example.edu/shared/ringfitness/
+ringfitness.activityUploadLink=
+ringfitness.authorizationUrl=https\://your-ringfitness-auth.example.workers.dev
+ringfitness.enrollmentCode=replace-with-worker-enrollment-code

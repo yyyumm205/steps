@@ -1,6 +1,6 @@
 # 独立计步实验 App：自由活动执行计划
 
-依据：[总纲](../../CONSTITUTION.md) 2.0.0 修订草稿、[需求](requirements.md)、[验收](validation.md)。状态：待审阅；业务代码未实施本次调整。
+依据：用户已确认的[总纲](../../CONSTITUTION.md) 2.0.0、[需求](requirements.md)、[验收](validation.md)。状态：已授权T0基线复现与T1准备切片；其余规格的待确认项保留。
 
 ## 1. 本轮边界与下一小步
 

@@ -1,0 +1,17 @@
+# Reference handoff and all original artifacts remain local.
+/original/
+/.local/
+/data/
+/research-data/
+/secrets/
+/android/dist/
+.env
+.env.*
+!.env.example
+*.rfbin
+*.csv
+*.apk
+*.aab
+*.jks
+*.keystore
+# Local configuration and generated Android files are also excluded by android/.gitignore.
