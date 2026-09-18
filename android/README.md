@@ -1,8 +1,10 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.6.1-t1（versionCode 27）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+当前开发版：**步数采集 0.6.2-t1（versionCode 28）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
 
 本版仅交付采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。开始采集按钮暂未开放；尚不产生 session、计步器参考数、下载或上传。
+
+准备流程分为首次登记、佩戴位置、戒指连接和准备概览。已登记用户重新打开后进入概览；修改位置确认保存后返回，取消保留原值。每页主要操作固定底部，设备信息读取超时可重试，搜索可以取消；设备技术信息收进详情。最新模拟器验证范围见规格的 B20 和验证记录第 9 节。
 
 独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，本版准备页不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
 

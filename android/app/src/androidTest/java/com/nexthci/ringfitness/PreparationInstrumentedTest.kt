@@ -1,6 +1,7 @@
 package com.nexthci.ringfitness
 
 import android.content.Context
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -30,15 +31,32 @@ class PreparationInstrumentedTest {
         ActivityScenario.launch<StepPreparationActivity>(launch).use { scenario ->
             repeat(2) { index ->
                 if (index == 1) scenario.recreate()
+                awaitPreparationLoaded(scenario)
                 scenario.onActivity { activity ->
-                    val views = descendants(activity.findViewById(android.R.id.content)).toList()
-                    assertTrue(views.filterIsInstance<TextView>().any { it.text.toString() == "步数采集" })
-                    val start = views.filterIsInstance<Button>().single { it.text.startsWith("开始采集") }
-                    assertFalse(start.isEnabled)
-                    assertFalse(views.filterIsInstance<Button>().any { it.text.contains("登录") || it.text.contains("Oura") })
+                    val views = descendants(activity.findViewById(android.R.id.content)).filter { it.isShown }.toList()
+                    assertTrue(views.filterIsInstance<TextView>().any {
+                        it.tag == "heading" && it.text.contains("步数采集")
+                    })
+                    assertFalse(views.filterIsInstance<Button>().any {
+                        it.isEnabled && (it.text.startsWith("开始采集") || it.text.contains("登录") || it.text.contains("Oura"))
+                    })
                 }
             }
         }
+    }
+
+    private fun awaitPreparationLoaded(scenario: ActivityScenario<StepPreparationActivity>) {
+        val deadline = SystemClock.elapsedRealtime() + 10_000
+        do {
+            var loaded = false
+            scenario.onActivity { activity ->
+                val primary = activity.findViewById<View>(android.R.id.content).findViewWithTag<Button>("primary")
+                loaded = primary != null && primary.text.toString() !in listOf("正在读取…", "正在保存…")
+            }
+            if (loaded) return
+            SystemClock.sleep(25)
+        } while (SystemClock.elapsedRealtime() < deadline)
+        throw AssertionError("Preparation page did not finish reading its profile within 10 seconds")
     }
 
     @Test

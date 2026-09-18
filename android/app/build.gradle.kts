@@ -26,8 +26,8 @@ android {
         applicationId = "com.nexthci.ringfitness.steps"
         minSdk = 30
         targetSdk = 36
-        versionCode = 27
-        versionName = "0.6.1-t1"
+        versionCode = 28
+        versionName = "0.6.2-t1"
 
         buildConfigField("String", "PUBLIC_DATA_DIRECTORY", "\"RingFitnessSteps\"")
 
