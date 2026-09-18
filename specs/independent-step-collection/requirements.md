@@ -2,7 +2,7 @@
 
 状态：总纲已确认，T1b依据E11收口；当前0.6.4-t2b（30）新增T2b.1纯Kotlin请求协调，147项JVM、17项API31运行测试及构建通过，见validation第11节。正式入口仍为准备流程，真实采集与服务尚未接入；历史真机证据保持原适用版本。Q01/Q02待确认，Q03于2026-09-19确认。更新日期：2026-09-19。分支：`codex/free-living-session-spec`。
 
-本规格服从用户已确认的 [CONSTITUTION.md](../../CONSTITUTION.md) 2.0.0；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。用户已授权按小切片持续实现；Q01/Q02 待确认，Q03 按 2026-09-19 已确认方案实施。
+本规格服从用户已确认的 [CONSTITUTION.md](../../CONSTITUTION.md) 2.1.0；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。用户已授权按小切片持续实现；Q01/Q02 待确认，Q03 按 2026-09-19 已确认方案实施。
 
 ## 1. 本功能边界与当前事实
 
