@@ -1,6 +1,6 @@
 # 独立计步实验 App：自由活动 session 需求
 
-状态：总纲已确认，T1b 精简准备路径已实现为 0.6.3-t1（29），114项JVM、17项API31运行测试、构建及真机只读路径通过；T1b 初版与 T2a 软件底座的历史证据保持原适用范围，最新结果见 validation 第10节。Q01/Q02 待确认，Q03 于 2026-09-19 确认。更新日期：2026-09-19。分支：`codex/free-living-session-spec`。
+状态：总纲已确认，T1b依据E11收口；当前0.6.4-t2b（30）新增T2b.1纯Kotlin请求协调，147项JVM、17项API31运行测试及构建通过，见validation第11节。正式入口仍为准备流程，真实采集与服务尚未接入；历史真机证据保持原适用版本。Q01/Q02待确认，Q03于2026-09-19确认。更新日期：2026-09-19。分支：`codex/free-living-session-spec`。
 
 本规格服从用户已确认的 [CONSTITUTION.md](../../CONSTITUTION.md) 2.0.0；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。用户已授权按小切片持续实现；Q01/Q02 待确认，Q03 按 2026-09-19 已确认方案实施。
 
@@ -96,7 +96,7 @@ T1b 按 E11 收口：登记、选环保存、一次自动连接、只读查询�
 
 研究者指导完整操作，依据计步器说明统一佩戴。App 显示并记住编号与戒指佩戴位置，后续开始前可确认位置是否仍正确；位置变更影响以后新 session，采集中元数据快照保持不变，途中换位通过异常记录表达。
 
-T1 采用显示名“步数采集”、applicationId `com.nexthci.ringfitness.steps` 和公共目录 `Download/RingFitnessSteps/`，应用私有目录由独立安装身份隔离；当前开发版本为 `0.6.3-t1`。编号采用 3–24 位 ASCII 英文字母或数字，去首尾空格，统一小写；后续 session 的 `participant_id`、`participant_name` 均使用该规范编号。installation ID 标记安装，session UUID 在持久化开始请求时创建，再等待戒指确认实际采集。研究者维护发放表，离线登记只做格式校验。编号更换见 Q01，T1 暂不提供切换入口。
+T1 采用显示名“步数采集”、applicationId `com.nexthci.ringfitness.steps` 和公共目录 `Download/RingFitnessSteps/`，应用私有目录由独立安装身份隔离；当前开发版本为 `0.6.4-t2b`。编号采用 3–24 位 ASCII 英文字母或数字，去首尾空格，统一小写；后续 session 的 `participant_id`、`participant_name` 均使用该规范编号。installation ID 标记安装，session UUID 在持久化开始请求时创建，再等待戒指确认实际采集。研究者维护发放表，离线登记只做格式校验。编号更换见 Q01，T1 暂不提供切换入口。
 
 升级、重开或手机重启保留已有身份与任务；卸载或清除应用数据后的自动任务恢复不在本次范围。原版文件与历史交接资料保留。
 
