@@ -18,7 +18,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import java.util.ArrayDeque
 import java.util.UUID
 
 data class ScannedRing(
@@ -46,15 +45,11 @@ class RingBleClient(
     private val scanner get() = adapter?.bluetoothLeScanner
     private val discoveredDevices = linkedMapOf<String, BluetoothDevice>()
     private val discoveredRings = linkedMapOf<String, ScannedRing>()
-    private val writeQueue = ArrayDeque<ByteArray>()
     private var gatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var ready = false
     private var scanning = false
-    private var writeBusy = false
     private var writeWithResponse = false
-    private var writeInFlight: ByteArray? = null
-    private var writeSubmitFailureCount = 0
     private var selectedDevice: BluetoothDevice? = null
     private var selectedName: String? = null
     private var autoReconnect = false
@@ -62,6 +57,16 @@ class RingBleClient(
     private var imuLowPower = false
     private var reconnectGeneration = 0
     private val reconnectRunnable = Runnable { connectSelectedDevice(isReconnect = true) }
+    private val commandQueue = RingGattCommandQueue(
+        schedule = { delay, action -> mainHandler.postDelayed({ action() }, delay) },
+        write = ::writePacket,
+        onReady = {
+            ready = true
+            listener.onBleState("戒指已连接", true)
+        },
+        onFailure = ::closeFailedControlConnection,
+        trace = { Log.d(TAG, it) },
+    )
 
     private val scanTimeout = Runnable {
         if (!scanning) return@Runnable
@@ -169,9 +174,13 @@ class RingBleClient(
                 gatt.disconnect()
                 return
             }
-            gatt.requestMtu(247)
-            ready = true
-            listener.onBleState("戒指已连接", true)
+            listener.onBleState("正在确认蓝牙传输参数…", false)
+            commandQueue.beginMtu { gatt.requestMtu(247) }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (this@RingBleClient.gatt !== gatt) return
+            commandQueue.onMtuChanged(mtu, status)
         }
 
         @Deprecated("Deprecated in Java")
@@ -199,29 +208,7 @@ class RingBleClient(
             status: Int,
         ) {
             if (this@RingBleClient.gatt !== gatt || characteristic.uuid != writeCharacteristic?.uuid) return
-            if (!writeWithResponse) return
-            Log.d(TAG, "GATT write callback status=$status")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                writeSubmitFailureCount = 0
-                finishWrite()
-                return
-            }
-            val supportsNoResponse = characteristic.properties and
-                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0
-            val failedPacket = synchronized(writeQueue) {
-                val packet = writeInFlight
-                writeInFlight = null
-                writeBusy = false
-                if (packet != null && supportsNoResponse) writeQueue.addFirst(packet)
-                packet
-            }
-            if (failedPacket != null && supportsNoResponse) {
-                writeWithResponse = false
-                mainHandler.postDelayed(::pumpWrites, WRITE_GAP_MS)
-            } else {
-                listener.onBleError("BLE 控制命令写入失败：$status")
-                finishWrite()
-            }
+            commandQueue.onWriteCompleted(status)
         }
     }
 
@@ -283,11 +270,7 @@ class RingBleClient(
         if (!ready && gatt == null) return
         ready = false
         writeCharacteristic = null
-        synchronized(writeQueue) {
-            writeQueue.clear()
-            writeBusy = false
-            writeInFlight = null
-        }
+        commandQueue.reset()
         val currentGatt = gatt
         gatt = null
         currentGatt?.close()
@@ -307,11 +290,7 @@ class RingBleClient(
         ready = false
         reconnectGeneration += 1
         val generation = reconnectGeneration
-        synchronized(writeQueue) {
-            writeQueue.clear()
-            writeBusy = false
-            writeInFlight = null
-        }
+        commandQueue.reset()
         writeCharacteristic = null
         listener.onBleState("正在关闭旧连接并重新连接戒指…", false)
         val currentGatt = gatt
@@ -347,11 +326,7 @@ class RingBleClient(
         mainHandler.removeCallbacks(reconnectRunnable)
         ready = false
         stopScan()
-        synchronized(writeQueue) {
-            writeQueue.clear()
-            writeBusy = false
-            writeInFlight = null
-        }
+        commandQueue.reset()
         val currentGatt = gatt
         gatt = null
         writeCharacteristic = null
@@ -415,44 +390,7 @@ class RingBleClient(
 
     private fun enqueue(packet: ByteArray): Boolean {
         if (!ready || gatt == null || writeCharacteristic == null) return false
-        synchronized(writeQueue) { writeQueue.addLast(packet) }
-        mainHandler.post(::pumpWrites)
-        return true
-    }
-
-    private fun pumpWrites() {
-        val packet = synchronized(writeQueue) {
-            if (writeBusy || writeQueue.isEmpty()) return
-            writeBusy = true
-            writeQueue.removeFirst().also { writeInFlight = it }
-        }
-        val success = writePacket(packet)
-        if (!success) {
-            writeSubmitFailureCount += 1
-            if (writeSubmitFailureCount <= WRITE_SUBMIT_RETRY_LIMIT) {
-                synchronized(writeQueue) {
-                    writeInFlight?.let(writeQueue::addFirst)
-                    writeInFlight = null
-                    writeBusy = false
-                }
-                mainHandler.postDelayed(::pumpWrites, WRITE_SUBMIT_RETRY_MS)
-            } else {
-                writeSubmitFailureCount = 0
-                listener.onBleError("BLE 控制命令连续发送失败")
-                finishWrite()
-            }
-        } else if (!writeWithResponse) {
-            writeSubmitFailureCount = 0
-            mainHandler.postDelayed(::finishWrite, WRITE_GAP_MS)
-        }
-    }
-
-    private fun finishWrite() {
-        synchronized(writeQueue) {
-            writeBusy = false
-            writeInFlight = null
-        }
-        pumpWrites()
+        return commandQueue.enqueue(packet)
     }
 
     private fun writePacket(packet: ByteArray): Boolean {
@@ -464,7 +402,7 @@ class RingBleClient(
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         }
         val command = packet.firstOrNull()?.toInt()?.and(0xFF)
-        if (command == 0x29 || command == 0x32) {
+        if (command == 0x29 || command == 0x2A || command == 0x32) {
             Log.d(
                 TAG,
                 "TX control command=0x${command.toString(16)} " +
@@ -485,7 +423,7 @@ class RingBleClient(
             @Suppress("DEPRECATION")
             currentGatt.writeCharacteristic(characteristic)
         }
-        if (!submitted) Log.w(TAG, "GATT rejected control write submission")
+        Log.d(TAG, "GATT control write accepted=$submitted")
         return submitted
     }
 
@@ -511,12 +449,18 @@ class RingBleClient(
         }
         val device = selectedDevice ?: return false
         mainHandler.removeCallbacks(reconnectRunnable)
+        commandQueue.reset()
         listener.onBleState(
             if (isReconnect) "戒指已断开，正在自动重连 ${selectedName ?: "Ringo"}…"
             else "正在连接 ${selectedName ?: "Ringo"}…",
             false,
         )
-        gatt = device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        // Main-thread callbacks serialize GATT state, the command queue and its timeout handlers.
+        // All existing public calls originate from Activity/Service main-thread handlers.
+        gatt = device.connectGatt(
+            appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE,
+            BluetoothDevice.PHY_LE_1M_MASK, mainHandler,
+        )
         return gatt != null
     }
 
@@ -524,11 +468,7 @@ class RingBleClient(
         reconnectGeneration += 1
         ready = false
         writeCharacteristic = null
-        synchronized(writeQueue) {
-            writeQueue.clear()
-            writeBusy = false
-            writeInFlight = null
-        }
+        commandQueue.reset()
         disconnectedGatt.close()
         if (gatt === disconnectedGatt) gatt = null
         listener.onBleState(
@@ -536,6 +476,21 @@ class RingBleClient(
             false,
         )
         if (autoReconnect) scheduleReconnect()
+    }
+
+    private fun closeFailedControlConnection(message: String) {
+        Log.w(TAG, message)
+        listener.onBleError(message)
+        // The command outcome can be unknown. Close this control channel; upper layers decide
+        // whether to reconnect and reconcile STATUS. Never replay an accepted START here.
+        val failedGatt = gatt
+        ready = false
+        writeCharacteristic = null
+        commandQueue.reset()
+        if (failedGatt != null) {
+            runCatching { failedGatt.disconnect() }
+            handleDisconnected(failedGatt, "蓝牙控制连接已关闭，请重新连接并核对状态")
+        }
     }
 
     private fun scheduleReconnect() {
@@ -556,9 +511,6 @@ class RingBleClient(
         private const val SCAN_TIMEOUT_MS = 10_000L
         private const val RECONNECT_DELAY_MS = 3_000L
         private const val FORCE_DISCONNECT_TIMEOUT_MS = 1_500L
-        private const val WRITE_GAP_MS = 40L
-        private const val WRITE_SUBMIT_RETRY_MS = 120L
-        private const val WRITE_SUBMIT_RETRY_LIMIT = 3
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 }
