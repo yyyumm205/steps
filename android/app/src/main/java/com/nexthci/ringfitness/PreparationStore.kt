@@ -30,7 +30,7 @@ class PreparationStore internal constructor(
 
     fun read(): PreparationSnapshot? = synchronized(processLock) { readLocked() }
 
-    fun register(raw: String): PreparationSnapshot = synchronized(processLock) {
+    fun register(raw: String, placement: RingPlacement? = null): PreparationSnapshot = synchronized(processLock) {
         val trimmed = raw.trim()
         require(participantPattern.matches(trimmed)) { "被试编号需为 3–24 位英文字母或数字" }
         val participantId = trimmed.lowercase(Locale.ROOT)
@@ -39,7 +39,7 @@ class PreparationStore internal constructor(
             require(existing.participantId == participantId) { "此手机已登记编号，更换编号需由研究者处理" }
             return@synchronized existing
         }
-        persist(PreparationSnapshot(participantId, UUID.randomUUID().toString()))
+        persist(PreparationSnapshot(participantId, UUID.randomUUID().toString(), placement = placement))
     }
 
     fun savePlacement(placement: RingPlacement): PreparationSnapshot = update { it.copy(placement = placement) }

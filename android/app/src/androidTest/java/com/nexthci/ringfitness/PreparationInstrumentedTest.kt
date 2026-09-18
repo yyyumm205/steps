@@ -35,7 +35,7 @@ class PreparationInstrumentedTest {
                 scenario.onActivity { activity ->
                     val views = descendants(activity.findViewById(android.R.id.content)).filter { it.isShown }.toList()
                     assertTrue(views.filterIsInstance<TextView>().any {
-                        it.tag == "heading" && it.text.contains("步数采集")
+                        it.tag == "heading" && it.text.toString() in setOf("步数采集", "填写准备信息")
                     })
                     assertFalse(views.filterIsInstance<Button>().any {
                         it.isEnabled && (it.text.startsWith("开始采集") || it.text.contains("登录") || it.text.contains("Oura"))

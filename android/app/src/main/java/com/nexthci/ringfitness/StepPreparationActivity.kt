@@ -13,7 +13,6 @@ import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -33,47 +32,55 @@ import android.widget.TextView
 import java.io.File
 import java.util.concurrent.Executors
 
-/** T1 navigation only. Preparation never starts the legacy capture or upload services. */
+/** Preparation stays separate from capture requests, downloads and uploads. */
 class StepPreparationActivity : Activity() {
-    private enum class Page { REGISTER, PLACEMENT, DEVICE, HOME }
+    private enum class Page { REGISTER, HOME, DEVICES }
+    private enum class HomeAction { PLACEMENT, CONNECT, SETTINGS, DETAILS, NONE }
+    private data class HomeUi(
+        val status: String,
+        val actionText: String,
+        val action: HomeAction,
+        val explanation: String = "",
+        val waiting: Boolean = false,
+    )
     private val main = Handler(Looper.getMainLooper())
     private lateinit var store: PreparationStore
     private lateinit var controller: RingPreparationController
     private var snapshot: PreparationSnapshot? = null
     private var page = Page.REGISTER
     private var restoredPage: Page? = null
-    private var placementFromHome = false
     private var placementDraft = 0
     private var loaded = false
     private var busy = false
     private var storageProblem: String? = null
     private var feedback: String? = null
     private var visible = false
+    private var permissionDenied = false
+    private var autoConnectPending = false
     private var pendingBluetoothAction: (() -> Unit)? = null
     private var scanner: RingBleClient? = null
     private var scanning = false
     private var scanGeneration = 0L
     private var scanMessage: String? = null
     private var timedAttempt = -1L
+    private var placementDialog: AlertDialog? = null
     private lateinit var back: Button
     private lateinit var heading: TextView
     private lateinit var subtitle: TextView
+    private lateinit var details: Button
     private lateinit var scroll: ScrollView
     private lateinit var registration: LinearLayout
     private lateinit var participantInput: EditText
-    private lateinit var placement: LinearLayout
     private lateinit var placementPicker: Spinner
-    private lateinit var device: LinearLayout
-    private lateinit var ringLabel: TextView
-    private lateinit var connectionLabel: TextView
-    private lateinit var deviceAction: Button
-    private lateinit var settingsAction: Button
+    private lateinit var devices: LinearLayout
+    private lateinit var scanStatus: TextView
     private lateinit var results: LinearLayout
     private lateinit var overview: LinearLayout
     private lateinit var participantLabel: TextView
-    private lateinit var placementLabel: TextView
-    private lateinit var homeRingLabel: TextView
+    private lateinit var editPlacement: Button
     private lateinit var homeStatus: TextView
+    private lateinit var homeExplanation: TextView
+    private lateinit var cancelConnection: Button
     private lateinit var message: TextView
     private lateinit var primary: Button
     private val bluetoothReceiver = object : BroadcastReceiver() {
@@ -91,7 +98,8 @@ class StepPreparationActivity : Activity() {
         store = PreparationStore(File(filesDir, "preparation/profile.properties"))
         restoredPage = savedInstanceState?.getString("page")?.let { runCatching { Page.valueOf(it) }.getOrNull() }
         placementDraft = savedInstanceState?.getInt("placement_draft") ?: 0
-        placementFromHome = savedInstanceState?.getBoolean("placement_from_home") ?: false
+        permissionDenied = savedInstanceState?.getBoolean("permission_denied") ?: false
+        autoConnectPending = savedInstanceState == null
         controller = RingPreparationController(AndroidPreparationTransport(this)) { state ->
             if (::primary.isInitialized) updateViews()
             if (state.connecting && state.attemptId != timedAttempt) {
@@ -113,7 +121,10 @@ class StepPreparationActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_EXPORTED)
         else registerReceiver(bluetoothReceiver, filter)
     }
-    override fun onResume() { super.onResume(); if (::primary.isInitialized) updateViews() }
+    override fun onResume() {
+        super.onResume()
+        if (::primary.isInitialized) { updateViews(); prepareOnOpen() }
+    }
     override fun onStop() {
         visible = false
         pendingBluetoothAction = null
@@ -122,12 +133,12 @@ class StepPreparationActivity : Activity() {
         unregisterReceiver(bluetoothReceiver)
         super.onStop()
     }
-    override fun onDestroy() { main.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun onDestroy() { placementDialog?.dismiss(); main.removeCallbacksAndMessages(null); super.onDestroy() }
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString("page", page.name)
         outState.putString("participant_draft", participantInput.text.toString())
         outState.putInt("placement_draft", placementDraft)
-        outState.putBoolean("placement_from_home", placementFromHome)
+        outState.putBoolean("permission_denied", permissionDenied)
         super.onSaveInstanceState(outState)
     }
     @Deprecated("Legacy Android back callback")
@@ -135,16 +146,11 @@ class StepPreparationActivity : Activity() {
 
     private fun goBack() {
         if (busy) return
-        if (page == Page.HOME || snapshot == null) finish() else navigate(Page.HOME)
+        if (page == Page.DEVICES) navigate(Page.HOME) else finish()
     }
     private fun navigate(next: Page) {
         if (busy) return
-        if (page == Page.DEVICE && next != Page.DEVICE) stopScan()
-        if (next == Page.PLACEMENT) {
-            placementFromHome = page == Page.HOME
-            placementDraft = snapshot?.placement?.ordinal?.plus(1) ?: 0
-            placementPicker.setSelection(placementDraft)
-        }
+        if (page == Page.DEVICES && next != Page.DEVICES) stopScan()
         page = next
         feedback = null
         getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(participantInput.windowToken, 0)
@@ -155,7 +161,7 @@ class StepPreparationActivity : Activity() {
     private fun buildPages(draft: String) {
         val frame = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(246, 248, 247))
+            setBackgroundColor(Color.rgb(247, 249, 248))
             setOnApplyWindowInsetsListener { view, insets ->
                 val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.ime())
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
@@ -164,30 +170,37 @@ class StepPreparationActivity : Activity() {
         }
         setContentView(frame)
         val header = section(frame, 20)
-        back = button(header, "返回准备概览", false) { goBack() }.apply { tag = "back" }
-        heading = label(header, "步数采集", 25f).apply { tag = "heading"; setTypeface(null, Typeface.BOLD) }
+        back = button(header, "返回", false) { goBack() }.apply { tag = "back" }
+        val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+        header.addView(titleRow, LinearLayout.LayoutParams(-1, -2))
+        heading = label(titleRow, "步数采集", 25f).apply {
+            tag = "heading"; setTypeface(null, Typeface.BOLD)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        details = button(titleRow, "设备详情", false) { showDetails() }.apply {
+            tag = "details"; textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+        }
         subtitle = label(header, "", 14f)
         scroll = ScrollView(this).apply { isFillViewport = true }
         frame.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), 0, dp(20), dp(12)) }
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), dp(12)) }
         scroll.addView(body)
         registration = section(body)
         label(registration, "被试编号", 16f)
         participantInput = EditText(this).apply {
             tag = "participant_input"
-            hint = "例如 P001"
+            hint = "研究者提供的编号"
             setSingleLine(true)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setText(draft)
         }
         registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2))
-        label(registration, "填写研究者分配的编号，之后会自动记住。", 14f)
-        placement = section(body)
-        label(placement, "戒指戴在哪根手指？", 19f)
+        label(registration, "戒指佩戴位置", 16f).setPadding(0, dp(24), 0, dp(4))
         placementPicker = Spinner(this).apply {
             tag = "placement_picker"
             adapter = ArrayAdapter(this@StepPreparationActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("请选择佩戴位置") + RingPlacement.entries.map { it.displayName })
+                listOf("请选择") + RingPlacement.entries.map { it.displayName })
             setSelection(placementDraft)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onNothingSelected(parent: AdapterView<*>?) = Unit
@@ -197,31 +210,25 @@ class StepPreparationActivity : Activity() {
                 }
             }
         }
-        placement.addView(placementPicker, LinearLayout.LayoutParams(-1, dp(64)))
-        label(placement, "按现在的佩戴位置选择。以后可在准备概览中修改。", 14f)
-        device = section(body)
-        ringLabel = label(device, "", 20f)
-        connectionLabel = label(device, "", 16f)
-        label(device, "让戒指保持有电，并放在手机附近。", 14f)
-        results = section(device)
-        deviceAction = button(device, "搜索其他戒指", false) { deviceSecondaryAction() }
-        settingsAction = button(device, "应用权限设置", false) { openNeededSettings() }
-        button(device, "设备详情", false) { showDetails() }
+        registration.addView(placementPicker, LinearLayout.LayoutParams(-1, dp(64)))
         overview = section(body)
-        participantLabel = label(overview, "", 15f).apply { setPadding(0, dp(4), 0, dp(16)) }
-        val placementCard = card(overview)
-        label(placementCard, "佩戴位置", 13f)
-        placementLabel = label(placementCard, "", 19f)
-        button(placementCard, "修改佩戴位置", false) { navigate(Page.PLACEMENT) }.tag = "edit_placement"
-        val ringCard = card(overview)
-        label(ringCard, "戒指", 13f)
-        homeRingLabel = label(ringCard, "", 19f)
-        homeStatus = label(ringCard, "", 14f)
-        button(ringCard, "连接与设备详情", false) { navigate(Page.DEVICE) }.tag = "open_device"
+        participantLabel = label(overview, "", 15f).apply { tag = "participant_summary" }
+        editPlacement = button(overview, "", false) { showPlacementPicker() }.apply { tag = "edit_placement"; textSize = 15f }
+        homeStatus = label(overview, "", 24f).apply {
+            tag = "device_status"; setTypeface(null, Typeface.BOLD)
+            setPadding(0, dp(36), 0, dp(8))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        homeExplanation = label(overview, "", 15f)
+        cancelConnection = button(overview, "取消连接", false) {
+            controller.disconnect("已取消连接")
+        }.apply { tag = "connection_cancel" }
+        devices = section(body)
+        scanStatus = label(devices, "", 16f)
+        results = section(devices)
         val footer = section(frame, 20)
         message = label(footer, "", 14f).apply { tag = "feedback"; accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
         primary = button(footer, "", true) { primaryAction() }.apply { tag = "primary" }
-        label(footer, "准备版 · 采集功能待开放", 12f)
         updateViews()
     }
 
@@ -238,15 +245,14 @@ class StepPreparationActivity : Activity() {
                     snapshot = it
                     storageProblem = null
                     page = if (it == null) Page.REGISTER else restoredPage?.takeUnless { p -> p == Page.REGISTER } ?: Page.HOME
-                    if (restoredPage != Page.PLACEMENT) placementDraft = it?.placement?.ordinal?.plus(1) ?: 0
-                    placementPicker.setSelection(placementDraft)
-                }.onFailure { storageProblem = "准备信息读取失败，原文件已保留。请联系研究者。" }
+                }.onFailure { storageProblem = "准备信息读取失败，请联系研究者。原信息已保留。" }
                 restoredPage = null
                 updateViews()
+                prepareOnOpen()
             }
         }
     }
-    private fun persist(afterSave: (PreparationSnapshot) -> Unit, write: () -> PreparationSnapshot) {
+    private fun persist(afterSave: (PreparationSnapshot) -> Unit, onFailure: (() -> Unit)? = null, write: () -> PreparationSnapshot) {
         if (busy || storageProblem != null) return
         busy = true
         feedback = null
@@ -257,7 +263,8 @@ class StepPreparationActivity : Activity() {
                 if (isDestroyed) return@post
                 busy = false
                 result.onSuccess { snapshot = it; afterSave(it) }.onFailure {
-                    feedback = if (it is IllegalArgumentException) it.message else "保存未成功，请检查手机空间后重试。"
+                    feedback = if (it is IllegalArgumentException) it.message else "保存失败，请检查手机空间后重试。"
+                    onFailure?.invoke()
                 }
                 updateViews()
             }
@@ -267,104 +274,162 @@ class StepPreparationActivity : Activity() {
         it.connecting || (it.connected && !it.queryTimedOut &&
             (it.healthStatus == null || it.batteryPercent == null || it.firmwareVersion == null))
     }
-    private fun primaryAction() {
-        if (busy || !loaded || storageProblem != null) return
-        when (page) {
-            Page.REGISTER -> {
-                val raw = participantInput.text.toString()
-                persist(afterSave = { navigate(Page.PLACEMENT) }) { store.register(raw) }
+    private fun homeUi(): HomeUi {
+        val state = controller.state
+        val disconnected = state.message in setOf("未连接", "手机蓝牙已关闭", "尚未允许蓝牙权限")
+        return when {
+            snapshot?.placement == null -> HomeUi("补充佩戴位置", "选择佩戴位置", HomeAction.PLACEMENT)
+            requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED } -> {
+                val permission = if (Build.VERSION.SDK_INT >= 31) "蓝牙" else "定位"
+                HomeUi("需要${permission}权限", if (permissionDenied) "打开权限设置" else "允许${permission}权限",
+                    if (permissionDenied) HomeAction.SETTINGS else HomeAction.CONNECT)
             }
-            Page.PLACEMENT -> {
-                val value = RingPlacement.entries.getOrNull(placementDraft - 1) ?: return
-                val next = if (placementFromHome) Page.HOME else Page.DEVICE
-                if (value == snapshot?.placement) navigate(next)
-                else persist(afterSave = { navigate(next) }) { store.savePlacement(value) }
-            }
-            Page.HOME -> when {
-                snapshot?.placement == null -> navigate(Page.PLACEMENT)
-                controller.state.queryTimedOut || !controller.state.canPrepare -> navigate(Page.DEVICE)
-            }
-            Page.DEVICE -> when {
-                scanning || checking() -> Unit
-                controller.state.connected && !controller.state.queryTimedOut -> navigate(Page.HOME)
-                else -> withBluetooth { snapshot?.ring?.let(::connect) ?: scan() }
-            }
+            !bluetoothEnabled() -> HomeUi("手机蓝牙已关闭", "打开蓝牙", HomeAction.SETTINGS)
+            !locationEnabled() -> HomeUi("手机定位已关闭", "打开定位", HomeAction.SETTINGS)
+            state.connecting -> HomeUi("正在连接戒指", "正在连接…", HomeAction.NONE, waiting = true)
+            checking() -> HomeUi("正在检查戒指", "正在检查…", HomeAction.NONE, waiting = true)
+            state.queryTimedOut -> HomeUi("连接检查未完成", "重试连接", HomeAction.CONNECT, state.message)
+            state.connected && !state.canPrepare -> HomeUi(
+                "戒指已连接", "查看设备详情", HomeAction.DETAILS, state.message,
+            )
+            state.canPrepare -> HomeUi("准备完成", "开始采集（待开放）", HomeAction.NONE)
+            else -> HomeUi(
+                if (disconnected) "戒指未连接" else state.message,
+                if (disconnected || state.message == "已取消连接") "连接戒指" else "重试连接",
+                HomeAction.CONNECT,
+            )
         }
     }
+
+    private fun primaryAction() {
+        if (busy || !loaded || storageProblem != null) return
+        feedback = null
+        when (page) {
+            Page.REGISTER -> {
+                val selected = RingPlacement.entries.getOrNull(placementDraft - 1) ?: return
+                val raw = participantInput.text.toString()
+                persist(afterSave = {
+                    navigate(Page.HOME)
+                    if (visible) connectPreparedRing()
+                }) { store.register(raw, selected) }
+            }
+            Page.HOME -> when (homeUi().action) {
+                HomeAction.PLACEMENT -> showPlacementPicker()
+                HomeAction.CONNECT -> connectPreparedRing()
+                HomeAction.SETTINGS -> openNeededSettings()
+                HomeAction.DETAILS -> showDetails()
+                HomeAction.NONE -> Unit
+            }
+            Page.DEVICES -> if (scanning) {
+                stopScan()
+                scanMessage = "已停止搜索"
+                updateViews()
+            } else withBluetooth(::scan)
+        }
+    }
+
+    private fun connectPreparedRing() {
+        autoConnectPending = false
+        withBluetooth {
+            snapshot?.ring?.let(::connect) ?: run { navigate(Page.DEVICES); scan() }
+        }
+    }
+
+    private fun prepareOnOpen() {
+        if (!autoConnectPending || !visible || !loaded || busy) return
+        autoConnectPending = false
+        if (storageProblem != null || snapshot?.placement == null) return
+        val ring = snapshot?.ring ?: return
+        if (requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) return
+        if (bluetoothEnabled() && locationEnabled()) connect(ring)
+    }
+
     private fun updateViews() {
         if (!::primary.isInitialized) return
         val usable = loaded && storageProblem == null
+        val ui = homeUi()
         registration.visibility = if (usable && page == Page.REGISTER) View.VISIBLE else View.GONE
-        placement.visibility = if (usable && page == Page.PLACEMENT) View.VISIBLE else View.GONE
-        device.visibility = if (usable && page == Page.DEVICE) View.VISIBLE else View.GONE
         overview.visibility = if (usable && page == Page.HOME) View.VISIBLE else View.GONE
-        back.visibility = if (usable && snapshot != null && page != Page.HOME) View.VISIBLE else View.GONE
+        devices.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
+        back.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
         back.isEnabled = !busy
-        heading.text = when (page) { Page.REGISTER -> "欢迎使用步数采集"; Page.PLACEMENT -> "确认佩戴位置"; Page.DEVICE -> "连接戒指"; Page.HOME -> "步数采集" }
+        details.visibility = if (usable && page == Page.HOME && ui.action != HomeAction.DETAILS) View.VISIBLE else View.GONE
+        details.isEnabled = !busy && !ui.waiting
+        heading.text = when (page) { Page.REGISTER -> "填写准备信息"; Page.HOME -> "步数采集"; Page.DEVICES -> "选择戒指" }
         subtitle.text = when (page) {
-            Page.REGISTER -> "首次使用 · 登记编号"
-            Page.PLACEMENT -> "${snapshot?.participantId.orEmpty()} · 佩戴信息"
-            Page.DEVICE -> "${snapshot?.participantId.orEmpty()} · 设备检查"
-            Page.HOME -> "采集准备"
+            Page.REGISTER -> "第 1 步 · 填写信息"
+            Page.HOME -> when {
+                snapshot?.placement == null -> "补充准备信息"
+                ui.action == HomeAction.DETAILS || (ui.action == HomeAction.NONE && !ui.waiting) -> "采集准备"
+                else -> "第 2 步 · 连接戒指"
+            }
+            Page.DEVICES -> "点击你的戒指即可连接"
         }
         participantInput.isEnabled = !busy
         placementPicker.isEnabled = !busy
-        participantLabel.text = "被试编号：${snapshot?.participantId.orEmpty()}"
-        placementLabel.text = snapshot?.placement?.displayName ?: "尚未确认"
-        val state = controller.state
-        ringLabel.text = snapshot?.ring?.name ?: "搜索你的戒指"
-        homeRingLabel.text = snapshot?.ring?.name ?: "尚未选择"
-        connectionLabel.text = scanMessage ?: state.message
-        homeStatus.text = if (state.connected) state.message else if (checking()) "正在连接并检查…" else "未连接 · 需要重新检查"
-        deviceAction.visibility = if (snapshot?.ring != null || scanning || checking()) View.VISIBLE else View.GONE
-        deviceAction.text = when { scanning -> "停止搜索"; checking() -> "取消连接检查"; else -> "搜索其他戒指" }
-        deviceAction.isEnabled = !busy
-        settingsAction.text = when {
-            requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED } -> "应用权限设置"
-            !bluetoothEnabled() -> "打开蓝牙设置"
-            !locationEnabled() -> "打开定位设置"
-            else -> "蓝牙设置"
-        }
-        settingsAction.isEnabled = !busy && !scanning && !checking()
+        participantLabel.text = "编号：${snapshot?.participantId.orEmpty()}"
+        editPlacement.text = snapshot?.placement?.let { "${it.displayName} · 修改" } ?: "选择佩戴位置"
+        editPlacement.isEnabled = !busy && !ui.waiting
+        homeStatus.text = ui.status
+        homeExplanation.text = ui.explanation
+        homeExplanation.visibility = if (ui.explanation.isEmpty()) View.GONE else View.VISIBLE
+        cancelConnection.visibility = if (ui.waiting) View.VISIBLE else View.GONE
+        cancelConnection.isEnabled = !busy
+        scanStatus.text = scanMessage ?: "将戒指放在手机附近，点击重新搜索。"
         primary.text = when {
             !loaded -> "正在读取…"
             busy -> "正在保存…"
             storageProblem != null -> "准备信息需要处理"
-            page == Page.REGISTER -> "保存并继续"
-            page == Page.PLACEMENT -> if (placementFromHome) "保存位置" else "保存并继续"
-            page == Page.HOME -> when {
-                snapshot?.placement == null -> "确认佩戴位置"
-                checking() -> "正在检查戒指…"
-                state.queryTimedOut -> "重新检查戒指"
-                state.connected && !state.canPrepare -> "查看待核对事项"
-                !state.canPrepare -> "连接并检查戒指"
-                else -> "开始采集（待开放）"
-            }
-            scanning -> "正在搜索…"
-            checking() -> "正在检查戒指…"
-            state.queryTimedOut -> "重新连接检查"
-            state.connected -> if (state.canPrepare) "完成连接检查" else "返回准备概览"
-            snapshot?.ring == null -> "搜索戒指"
-            else -> "连接戒指"
+            page == Page.REGISTER -> "保存并连接戒指"
+            page == Page.HOME -> ui.actionText
+            scanning -> "停止搜索"
+            else -> "重新搜索"
         }
         primary.isEnabled = usable && !busy && when (page) {
-            Page.PLACEMENT -> placementDraft > 0
-            Page.DEVICE -> !scanning && !checking()
-            Page.HOME -> !checking() && (snapshot?.placement == null || state.queryTimedOut || !state.canPrepare)
-            Page.REGISTER -> true
+            Page.REGISTER -> placementDraft > 0
+            Page.HOME -> ui.action != HomeAction.NONE
+            Page.DEVICES -> true
         }
-        message.text = storageProblem ?: feedback ?: when {
-            !loaded -> "正在读取准备信息"
-            busy -> "保存成功后会自动继续"
-            page == Page.HOME && snapshot?.placement == null -> "下一步：确认戒指的佩戴位置。"
-            page == Page.HOME && checking() -> "正在读取戒指信息，请稍候。"
-            page == Page.HOME && state.queryTimedOut -> "设备信息尚未读全，请重新连接检查。"
-            page == Page.HOME && state.connected && !state.canPrepare -> "戒指状态需要研究者核对，已保留准备信息。"
-            page == Page.HOME && !state.canPrepare -> "下一步：检查戒指连接和状态。"
-            page == Page.HOME -> "准备检查已完成，等待采集版本。"
-            else -> ""
-        }
+        message.text = storageProblem ?: feedback.orEmpty()
         message.visibility = if (message.text.isEmpty()) View.GONE else View.VISIBLE
+        placementDialog?.let { dialog ->
+            dialog.setCancelable(!busy)
+            dialog.setCanceledOnTouchOutside(!busy)
+            dialog.listView.isEnabled = !busy
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !busy
+        }
+    }
+
+    private fun showPlacementPicker() {
+        if (busy || snapshot == null || storageProblem != null || placementDialog?.isShowing == true) return
+        feedback = null
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("佩戴位置")
+            .setSingleChoiceItems(RingPlacement.entries.map { it.displayName }.toTypedArray(), snapshot?.placement?.ordinal ?: -1) { _, index ->
+                if (busy) return@setSingleChoiceItems
+                val chosen = RingPlacement.entries[index]
+                if (chosen == snapshot?.placement) placementDialog?.dismiss()
+                else persist(
+                    afterSave = {
+                        placementDialog?.dismiss()
+                        feedback = "佩戴位置已保存"
+                    },
+                    onFailure = {
+                        placementDialog?.setTitle("保存失败，请重新选择")
+                        placementDialog?.listView?.apply {
+                            clearChoices()
+                            snapshot?.placement?.ordinal?.let { setItemChecked(it, true) }
+                            requestLayout()
+                        }
+                    },
+                ) { store.savePlacement(chosen) }
+            }
+            .setNegativeButton("取消", null)
+            .create()
+        placementDialog = dialog
+        dialog.setOnDismissListener { if (placementDialog === dialog) placementDialog = null }
+        dialog.show()
+        updateViews()
     }
 
     private fun bluetoothEnabled() = getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
@@ -394,18 +459,15 @@ class StepPreparationActivity : Activity() {
         if (requestCode != 10) return
         val action = pendingBluetoothAction
         pendingBluetoothAction = null
-        if (requiredPermissions().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) {
+        permissionDenied = requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (!permissionDenied) {
             if (visible && action != null) withBluetooth(action)
-        } else controller.disconnect("尚未允许蓝牙权限，请在应用权限设置中开启后重试。")
+        } else controller.disconnect("尚未允许蓝牙权限")
+        updateViews()
     }
     private fun requiredPermissions() = if (Build.VERSION.SDK_INT >= 31) {
         listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
     } else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
-    private fun deviceSecondaryAction() {
-        if (busy) return
-        when { scanning -> stopScan(); checking() -> controller.disconnect("已取消检查，可重新连接"); else -> withBluetooth(::scan) }
-        updateViews()
-    }
     private fun scan() {
         stopScan()
         controller.disconnect("未连接")
@@ -429,7 +491,10 @@ class StepPreparationActivity : Activity() {
                         if (!busy && !checking()) {
                             stopScan()
                             controller.disconnect("未连接")
-                            persist(afterSave = { saved -> if (visible) withBluetooth { connect(requireNotNull(saved.ring)) } }) {
+                            persist(afterSave = { saved ->
+                                navigate(Page.HOME)
+                                if (visible) withBluetooth { connect(requireNotNull(saved.ring)) }
+                            }) {
                                 store.selectRing(PreparedRing(ring.address, ring.name))
                             }
                         }
@@ -438,7 +503,7 @@ class StepPreparationActivity : Activity() {
             }
         })
         scanner = client
-        runCatching { client.scanForRings() }.onFailure { stopScan(); controller.disconnect("搜索失败，请检查蓝牙和权限后重试") }
+        runCatching { client.scanForRings() }.onFailure { stopScan(); scanMessage = "搜索失败，请检查蓝牙和权限后重试。" }
         updateViews()
     }
     private fun connect(ring: PreparedRing) { stopScan(); controller.connect(ring) }
@@ -451,6 +516,7 @@ class StepPreparationActivity : Activity() {
         if (::results.isInitialized) results.removeAllViews()
     }
     private fun showDetails() {
+        if (busy || checking()) return
         val state = controller.state
         AlertDialog.Builder(this).setTitle("设备详情").setMessage(
             "戒指：${snapshot?.ring?.name ?: "尚未选择"}\n" +
@@ -460,17 +526,16 @@ class StepPreparationActivity : Activity() {
                 "记录量：${state.healthStatus?.bytes?.let { "$it bytes" } ?: "待查询"}\n" +
                 "记录数：${state.healthStatus?.records ?: "待查询"}\n" +
                 "设备记录编号：${state.healthStatus?.sessionId ?: "待查询"}\n" +
-                "状态码：${state.healthStatus?.errorCode ?: "待查询"}\n\n${state.message}"
-        ).setPositiveButton("关闭", null).show()
+                "状态码：${state.healthStatus?.errorCode ?: "待查询"}"
+        ).setPositiveButton("关闭", null)
+            .setNeutralButton("更换戒指") { _, _ -> withBluetooth { navigate(Page.DEVICES); scan() } }
+            .setNegativeButton("系统设置") { _, _ -> openNeededSettings() }
+            .show()
     }
     private fun section(parent: LinearLayout, padding: Int = 0) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(padding), dp(if (padding > 0) 8 else 0), dp(padding), dp(if (padding > 0) 8 else 0))
         parent.addView(this, LinearLayout.LayoutParams(-1, -2))
-    }
-    private fun card(parent: LinearLayout) = section(parent, 16).apply {
-        background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(12).toFloat() }
-        (layoutParams as LinearLayout.LayoutParams).bottomMargin = dp(12)
     }
     private fun label(parent: LinearLayout, value: String, size: Float) = TextView(this).apply {
         text = value; textSize = size; setTextColor(Color.rgb(30, 49, 45)); setPadding(0, dp(4), 0, dp(4))

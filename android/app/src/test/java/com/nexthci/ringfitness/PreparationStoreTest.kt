@@ -2,6 +2,8 @@ package com.nexthci.ringfitness
 
 import java.io.File
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
@@ -32,6 +34,60 @@ class PreparationStoreTest {
     }
 
     @Test
+    fun firstRegistrationCommitsParticipantAndPlacementTogether() {
+        val file = profileFile()
+        var commits = 0
+        val store = PreparationStore(file) { source, target ->
+            assertNull(PreparationStore(target).read())
+            val pending = requireNotNull(PreparationStore(source).read())
+            assertEquals("p001", pending.participantId)
+            assertEquals(RingPlacement.RIGHT_MIDDLE, pending.placement)
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            commits++
+        }
+
+        val saved = store.register(" P001 ", RingPlacement.RIGHT_MIDDLE)
+
+        assertEquals(1, commits)
+        assertEquals(saved, PreparationStore(file).read())
+        assertEquals("p001", saved.participantId)
+        assertEquals(RingPlacement.RIGHT_MIDDLE, saved.placement)
+        assertEquals(saved.installationId, UUID.fromString(saved.installationId).toString())
+    }
+
+    @Test
+    fun failedCombinedRegistrationLeavesNoPartialProfileAndAllowsEditedRetry() {
+        val file = profileFile()
+        var failCommit = true
+        val store = PreparationStore(file) { source, target ->
+            if (failCommit) throw IOException("simulated rename failure")
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        }
+
+        assertThrows(IOException::class.java) { store.register("P001", RingPlacement.LEFT_INDEX) }
+        assertNull(PreparationStore(file).read())
+        assertFalse(file.exists())
+        assertEquals(0, requireNotNull(file.parentFile).listFiles()!!.size)
+
+        failCommit = false
+        val saved = store.register("P002", RingPlacement.RIGHT_RING)
+        assertEquals("p002", saved.participantId)
+        assertEquals(RingPlacement.RIGHT_RING, saved.placement)
+        assertEquals(saved, PreparationStore(file).read())
+    }
+
+    @Test
+    fun repeatedRegistrationKeepsExistingIncompleteProfileUnchanged() {
+        val file = profileFile()
+        val original = PreparationStore(file).register("P001")
+        val bytes = file.readBytes()
+
+        assertEquals(original, PreparationStore(file).register("P001", RingPlacement.LEFT_INDEX))
+        assertNull(PreparationStore(file).read()!!.placement)
+        assertArrayEquals(bytes, file.readBytes())
+    }
+
+    @Test
     fun reopeningRestoresConfirmedParticipantPlacementAndRing() {
         val file = profileFile()
         val store = PreparationStore(file)
@@ -56,7 +112,7 @@ class PreparationStoreTest {
         store.savePlacement(RingPlacement.LEFT_INDEX)
         val saved = store.selectRing(ring)
         val bytes = file.readBytes()
-        assertEquals(saved, PreparationStore(file).register(" p001 "))
+        assertEquals(saved, PreparationStore(file).register(" p001 ", RingPlacement.RIGHT_RING))
         assertArrayEquals(bytes, file.readBytes())
     }
 
@@ -66,7 +122,7 @@ class PreparationStoreTest {
         val store = PreparationStore(file)
         val original = store.register("P001")
         val bytes = file.readBytes()
-        assertThrows(IllegalArgumentException::class.java) { store.register("P002") }
+        assertThrows(IllegalArgumentException::class.java) { store.register("P002", RingPlacement.RIGHT_RING) }
         assertEquals(original, store.read())
         assertArrayEquals(bytes, file.readBytes())
     }

@@ -1,10 +1,12 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.6.2-t1（versionCode 28）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+当前开发版：**步数采集 0.6.3-t1（versionCode 29）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
 
 本版仅交付采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。开始采集按钮暂未开放；尚不产生 session、计步器参考数、下载或上传。
 
-准备流程分为首次登记、佩戴位置、戒指连接和准备概览。已登记用户重新打开后进入概览；修改位置确认保存后返回，取消保留原值。每页主要操作固定底部，设备信息读取超时可重试，搜索可以取消；设备技术信息收进详情。最新模拟器验证范围见规格的 B20 和验证记录第 9 节。
+首次在同页填写编号和佩戴位置，点击“保存并连接戒指”。一次原子保存成功后按需请求权限并直接搜索；选中戒指保存成功后回首页连接，完成后自动显示结果。修改位置在首页弹窗中选择即保存，成功才更新，失败保留原值并允许重试；取消或选择原值不写入。
+
+已有完整档案冷启动时，权限、蓝牙及必要定位齐备便自动连接一次；条件不足或连接失败时显示恢复动作。自动连接不弹系统授权，不在后台执行；取消、返回、关闭弹窗及页面重建不循环重连。首页共用同一判断显示当前状态和主要操作，电量、固件及 STATUS 未齐时持续显示检查中。技术信息、系统设置和更换戒指位于“设备详情”。本轮测试结果见 [B20 与验证记录](../specs/independent-step-collection/validation.md)，历史版本通过项保留原适用范围。
 
 独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，本版准备页不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
 
@@ -15,6 +17,20 @@
 ```
 
 此命令的 GBK 参数适用于当前 Windows Java 启动器与中文 Gradle 缓存路径的兼容问题，项目文件仍保持 UTF-8；原因见 [基线记录](../docs/android-baseline-20260918.md)。APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。设备测试须另行连接 Android 11+ 手机或模拟器执行 `connectedDebugAndroidTest`；测试 APK 构建成功不代表设备测试通过。
+
+准备导航测试仅在模拟器显式启用，测试前备份准备档案、结束后恢复。连接到指定模拟器，安装上述构建产物后可执行：
+
+```powershell
+$emulatorSerial = '<模拟器序列号>'
+adb -s $emulatorSerial install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s $emulatorSerial install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb -s $emulatorSerial shell pm grant com.nexthci.ringfitness.steps android.permission.BLUETOOTH_SCAN
+adb -s $emulatorSerial shell pm grant com.nexthci.ringfitness.steps android.permission.BLUETOOTH_CONNECT
+adb -s $emulatorSerial shell svc bluetooth enable
+adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.PreparationNavigationInstrumentedTest -e verifyPreparationNavigation true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+以上权限命令适用于API31模拟器；缺少蓝牙条件时，相关用例会明确跳过。测试期间避免同时操作App。测试使用合成档案与可控设备回复检查保存、恢复、等待及重试，真实BLE另用手机和戒指验证。手动复核首次登记后自动搜索、选择后首页状态及强停重开；写失败用可控夹具验证，操作结果同时核对持久档案。具体数量、失败和未覆盖项统一记录在validation。
 
 ## 原版历史说明
 
@@ -58,15 +74,7 @@ ringfitness.enrollmentCode=<worker-enrollment-code>
 
 Polar Android SDK 8.1.0 的 AAR 已从本机 `polar-ble-sdk` 复制到 `app/libs/polar-ble-sdk.aar`，构建不依赖 JitPack。
 
-## 构建
-
-```powershell
-$env:JAVA_HOME='D:\Android Studio\jbr'
-.\gradlew.bat testDebugUnitTest
-.\gradlew.bat assembleDebug
-```
-
-Debug APK：`app/build/outputs/apk/debug/app-debug.apk`。
+当前工作副本的构建方法与 APK 位置见本文开头；原版运行路径仅作历史参考。
 
 从 0.1.6 起，Oura 登录会枚举 Custom Tabs 浏览器并优先选择明确支持账号隔离会话的 Chrome，不再误用 vivo 等不支持该能力的默认浏览器。后端同时执行 RingFitness 用户与 Oura 账号严格一对一校验。
 
