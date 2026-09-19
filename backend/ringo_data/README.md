@@ -11,6 +11,7 @@ python -m backend.ringo_data import --output research-data/imported research-dat
 python -m backend.ringo_data summary --root research-data/imported --output research-data/session-index.csv
 python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported --once
 python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported
+python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.json --once
 python -m pytest backend/ringo_data/tests -q
 ```
 
@@ -21,6 +22,12 @@ python -m pytest backend/ringo_data/tests -q
 默认每 5 秒检查一次，文件的大小、修改时间等属性在两次观察之间保持稳定至少 10 秒后，再复制快照并导入。临时名称、空文件及尚无完整 ZIP 目录的文件继续等待，复制时仍在变化的文件留待下一轮。`--interval-seconds` 和 `--stable-seconds` 调整检查及稳定间隔。`--once` 执行一次观察、稳定等待和批次处理，适合定时任务与复现检查；结果中的 `pending` 表示仍待完成的文件。进程重开后重新检查输入，已导入包保持幂等；单包拒收或冲突不阻塞其他包。每轮在输出目录原子更新 `session-index.csv`，索引失败时保留上一份完整结果。
 
 导入与索引共用 `.import.lock` 操作系统文件锁，活跃并发明确拒绝；进程正常退出或被终止后，系统自动释放锁。锁文件会持续存在，以维持同一个锁对象，请勿在新版运行期间删除。升级前先停止旧版导入器；若遇到只写有 PID 的旧锁文件，确认旧进程已结束后再人工移除该旧锁，随后启动新版。程序不会凭锁文件年龄解锁。`.staging` 和 `.sync-staging` 中因进程终止留下的未发布文件保留为排查依据，原 ZIP 可重新导入。
+
+`cloud-sync` 可使用已登录 Seafile 桌面客户端的本地凭据，读取明确配置的单一资料库目录。复制 [cloud-sync.example.json](cloud-sync.example.json) 到被 Git 忽略的本地配置目录，填写资料库 ID、目录和客户端 `accounts.db` 路径；相对路径以配置所在目录为基准。配置只保存位置与配额，凭据在运行时从账号库只读取得。匹配清华 HTTPS 服务器的登录账号必须恰好一个；多账号时先确认选用账号。上传链接与读取目录需要由研究者核对对应关系。
+
+该命令仅发送 GET，列出指定目录直属文件并下载完整 ZIP；禁止 HTTP、跨域下载与重定向，账号凭据只随同源 API 请求发送，短期下载地址与凭据不进入日志或导入材料。首次使用要求专用空 `local_inbox`，在读取云端前原子保存作用域标记；已有文件却缺少标记时保留原件并暂停，避免将其他实验的文件认领到当前配置。下载使用独立临时文件，按列表长度检查完整性，计算 SHA-256 后原子发布；以内容哈希命名，同名异内容分别保留。既有文件、远端内容和原输入均保持原样。下载回执只保留作用域摘要、文件身份摘要、长度与内容哈希；重跑复核本地内容后跳过已下载文件。自动导入仅接收已登记且长度、哈希复核一致的包，混入的其他文件保持原样。进程在发布 ZIP 后、保存回执前终止时，该包等待同一云端文件重新读回登记，再进入导入。后续导入继续校验 ZIP、rfbin、清单和研究字段。
+
+`cloud-sync --once` 完成一轮下载、稳定等待和导入后退出；省略 `--once` 默认每 60 秒持续检查。一次失败保留其他文件的处理结果，网络恢复后继续重试。`max_files`、`max_response_bytes` 与 `max_archive_bytes` 分别限制单目录列表数量、元数据响应和单包大小；网络请求有等待及按文件大小计算的时限。轮询频次、目录映射及启动方式保存在本机配置；实际云端读取仍须用原包哈希和导入结果验收。
 
 默认限制为 ZIP 512 MiB、总解压 1 GiB、单文件 512 MiB、JSON 1 MiB、256 个条目、压缩比 1000、派生 CSV 总量 2 GiB。CLI 可调整 ZIP、解压及派生总量；Python `Limits` 可逐项配置。这些是资源保护配额，设备支持时长仍依赖实测。
 

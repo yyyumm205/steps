@@ -11,6 +11,7 @@ from pathlib import Path
 from .importer import ArchiveRejected, Limits, import_archive, summarize
 from .schema import ValidationError
 from .sync import DirectorySync
+from .cloud import CloudConfig, CloudSync
 
 
 def main(argv=None):
@@ -34,11 +35,31 @@ def main(argv=None):
     sync.add_argument("--max-archive-mib", type=int, default=512)
     sync.add_argument("--max-expanded-mib", type=int, default=1024)
     sync.add_argument("--max-decoded-mib", type=int, default=2048)
+    cloud = commands.add_parser("cloud-sync", help="read one configured Seafile directory and import its ZIPs")
+    cloud.add_argument("--config", required=True, type=Path)
+    cloud.add_argument("--once", action="store_true", help="download and import one batch, then exit")
     args = parser.parse_args(argv)
     if args.command == "summary":
         rows = summarize(args.root, args.output)
         print(json.dumps({"sessions": len(rows), "daily_total_generated": False}))
         return 0
+    if args.command == "cloud-sync":
+        try:
+            config = CloudConfig.load(args.config)
+            reader = CloudSync(config)
+            if args.once:
+                result = reader.once()
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 2 if result["failed"] else 0
+            while True:
+                print(json.dumps(reader.poll(), ensure_ascii=False), flush=True)
+                time.sleep(config.interval_seconds)
+        except KeyboardInterrupt:
+            return 0
+        except (OSError, ValidationError) as error:
+            reason = str(error) if isinstance(error, ValidationError) else "local cloud configuration or storage is unavailable"
+            print(json.dumps({"status": "cloud_sync_error", "reason": reason}, ensure_ascii=False), file=sys.stderr)
+            return 2
     if min(args.max_archive_mib, args.max_expanded_mib, args.max_decoded_mib) <= 0:
         parser.error("size limits must be positive")
     limits = Limits(archive_bytes=args.max_archive_mib * 1024 ** 2,

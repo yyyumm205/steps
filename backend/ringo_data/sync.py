@@ -24,7 +24,7 @@ def fingerprint(path):
 class DirectorySync:
     """One scanner owns its observations; durable import identities handle restart and duplicates."""
 
-    def __init__(self, incoming, output, *, stable_seconds=10, limits=None, monotonic=time.monotonic):
+    def __init__(self, incoming, output, *, stable_seconds=10, limits=None, monotonic=time.monotonic, include_file=None):
         require(math.isfinite(stable_seconds) and stable_seconds >= 0, "stable seconds must be finite and nonnegative")
         self.incoming, self.output = local_path(incoming), local_path(output)
         require(self.incoming.is_dir(), "incoming sync directory does not exist")
@@ -33,6 +33,7 @@ class DirectorySync:
         self.stable_seconds = stable_seconds
         self.limits = limits or Limits()
         self.monotonic = monotonic
+        self.include_file = include_file
         self.observed = {}
         self.processed = {}
 
@@ -41,7 +42,8 @@ class DirectorySync:
         now, events, present = self.monotonic(), [], set()
         for path in sorted(self.incoming.iterdir()):
             # Sync-client partials such as .name.zip, name.zip.part and name.zip.tmp stay untouched.
-            if path.name.startswith(".") or path.suffix.lower() != ".zip" or path.is_symlink() or not path.is_file():
+            if path.name.startswith(".") or path.suffix.lower() != ".zip" or (
+                    self.include_file is not None and not self.include_file(path.name)) or path.is_symlink() or not path.is_file():
                 continue
             present.add(path.name)
             try:

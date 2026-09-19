@@ -1,0 +1,13 @@
+{
+  "base_url": "https://cloud.tsinghua.edu.cn",
+  "repo_id": "00000000-0000-0000-0000-000000000000",
+  "remote_path": "/",
+  "account_db": "CHANGE_ME/accounts.db",
+  "local_inbox": "inbox",
+  "research_output": "research",
+  "interval_seconds": 60,
+  "stable_seconds": 10,
+  "max_files": 1024,
+  "max_response_bytes": 2097152,
+  "max_archive_bytes": 536870912
+}
