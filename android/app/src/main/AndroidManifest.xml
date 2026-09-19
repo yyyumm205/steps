@@ -30,7 +30,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="步数采集"
+        android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.RingFitness">
         <activity

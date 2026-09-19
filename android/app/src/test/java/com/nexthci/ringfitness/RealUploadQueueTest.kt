@@ -14,6 +14,80 @@ class RealUploadQueueTest {
     @get:Rule val temporary = TemporaryFolder()
     private val link = "https://cloud.tsinghua.edu.cn/u/d/fixture/"
 
+    @Test fun reopeningCreatesMissingTasksWithoutUploadingOrRebindingAnExistingDestination() {
+        val f = Fixture()
+        assertTrue(f.openQueue().restore(link))
+        assertTrue(f.openQueue().restore("https://cloud.tsinghua.edu.cn/u/d/another/"))
+        assertEquals(listOf(f.id), f.queue.queuedIds())
+        assertEquals(link, f.queue.task(f.id)!!.targetLink)
+        assertEquals(SessionTransferStatus.PENDING, f.store.read()!!.transfer.status)
+        assertEquals(0, f.requests)
+        f.queue.run(f.id)
+        assertFalse(f.openQueue().restore(link))
+        assertEquals(1, f.requests)
+    }
+
+    @Test fun reopeningKeepsFailureUntilManualRetryAndRestoresThatRetryAfterAnotherExit() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.failUpload = true
+        f.queue.run(f.id)
+        val failed = f.queue.task(f.id)
+        assertFalse(f.openQueue().restore(link))
+        assertEquals(failed, f.queue.task(f.id))
+        assertEquals(1, f.requests)
+        assertTrue(f.queue.enqueue(f.id, link, true))
+        // The journal still says failed until a worker starts this already requested retry.
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+        assertTrue(f.openQueue().restore(""))
+        assertEquals(listOf(f.id), f.queue.queuedIds())
+        assertEquals(failed!!.archiveSha256, f.queue.task(f.id)!!.archiveSha256)
+        assertEquals(1, f.requests)
+    }
+
+    @Test fun reopeningIsolatesDamagedTaskWhileRecoveringAnotherRecord() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        val damaged = File(f.directory, "upload-tasks/${f.id}.json").apply { writeText("broken") }
+        val other = f.createSavedSession()
+        assertTrue(f.openQueue().restore(link))
+        assertEquals(listOf(other), f.queue.queuedIds())
+        assertEquals("broken", damaged.readText())
+        assertEquals(SessionTransferStatus.FAILED, f.store.read(f.id)!!.transfer.status)
+        assertEquals(0, f.requests)
+    }
+
+    @Test fun reopeningWithoutAnUploadConfigurationKeepsUnboundDataLocal() {
+        val f = Fixture()
+        assertFalse(f.openQueue().restore(""))
+        assertNull(f.queue.task(f.id))
+        assertEquals(SessionTransferStatus.PENDING, f.store.read()!!.transfer.status)
+        assertEquals(0, f.requests)
+    }
+
+    @Test fun missingAttemptedTaskNeverRebindsEvenOnManualRetryAndDoesNotBlockAnotherSession() {
+        for (failed in listOf(false, true)) {
+            val f = Fixture()
+            f.queue.enqueue(f.id, link, false)
+            f.store.markTransferStarted(f.id)
+            if (failed) f.store.markTransferFailed(f.id)
+            check(File(f.directory, "upload-tasks/${f.id}.json").delete())
+            val other = f.createSavedSession()
+            val changedLink = "https://cloud.tsinghua.edu.cn/u/d/another/"
+
+            assertTrue(f.openQueue().restore(changedLink))
+            assertTrue(f.queue.needsLocalReview(f.id))
+            assertNull(f.queue.task(f.id))
+            assertEquals(listOf(other), f.queue.queuedIds())
+            assertThrows(IllegalStateException::class.java) { f.queue.enqueue(f.id, changedLink, true) }
+            assertEquals(1, f.store.read(f.id)!!.transfer.attempts)
+            assertEquals(SessionTransferStatus.FAILED, f.store.read(f.id)!!.transfer.status)
+            assertEquals(0L, f.store.read(f.id)!!.reference!!.steps)
+            assertEquals(0, f.requests)
+            assertNull(f.queue.task(f.id))
+        }
+    }
+
     @Test fun missingConfigurationPreservesPendingAndSendsNothing() {
         val f = Fixture()
         assertFalse(f.queue.enqueue(f.id, "", false))

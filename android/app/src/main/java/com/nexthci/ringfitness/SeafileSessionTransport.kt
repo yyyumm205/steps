@@ -1,11 +1,15 @@
 package com.nexthci.ringfitness
 
 import com.google.gson.JsonParser
+import okhttp3.MediaType
+import okhttp3.MultipartBody
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.Response
+import okio.BufferedSink
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.net.HttpURLConnection
 import java.net.URI
-import java.util.UUID
 
 data class RemoteSessionReceipt(val fileName: String, val fileId: String, val bytes: Long)
 
@@ -15,6 +19,8 @@ fun interface SessionUploadTransport {
 
 /** Upload-link transport shared in shape with the legacy worker; no participant account required. */
 class SeafileSessionTransport : SessionUploadTransport {
+    private val calls = CancellableUploadCall()
+
     override fun upload(link: String, archive: File, cancelled: () -> Boolean): RemoteSessionReceipt {
         val page = validateLink(link)
         checkCancelled(cancelled)
@@ -26,60 +32,59 @@ class SeafileSessionTransport : SessionUploadTransport {
         val metadata = JsonParser.parseString(get(URI("https://$HOST/api/v2.1/upload-links/$token/upload/"), cancelled)).asJsonObject
         val upload = trustedUri(metadata.get("upload_link").asString)
         val destination = URI(upload.toString() + if (upload.rawQuery == null) "?ret-json=1" else "&ret-json=1")
-        val boundary = "----RingFitness${UUID.randomUUID().toString().replace("-", "")}"
         require(archive.name.matches(Regex("ringfitness-session-[a-f0-9-]+\\.zip")))
-        val prefix = ByteArrayOutputStream().apply {
-            for ((key, value) in listOf("parent_dir" to parent, "replace" to "0")) {
-                write("--$boundary\r\nContent-Disposition: form-data; name=\"$key\"\r\n\r\n$value\r\n".toByteArray())
-            }
-            write("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"${archive.name}\"\r\nContent-Type: application/zip\r\n\r\n".toByteArray())
-        }.toByteArray()
-        val suffix = "\r\n--$boundary--\r\n".toByteArray()
-        val connection = open(destination).apply {
-            requestMethod = "POST"; doOutput = true; readTimeout = 120_000
-            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
-            setFixedLengthStreamingMode(prefix.size.toLong() + archive.length() + suffix.size)
-        }
-        try {
-            connection.outputStream.buffered().use { out ->
-                out.write(prefix)
+        val content = object : RequestBody() {
+            override fun contentType() = MediaType.parse("application/zip")
+            override fun contentLength() = archive.length()
+            override fun isOneShot() = true
+            override fun writeTo(sink: BufferedSink) {
                 archive.inputStream().use { input ->
                     val buffer = ByteArray(64 * 1024)
                     while (true) {
                         checkCancelled(cancelled)
                         val count = input.read(buffer)
                         if (count < 0) break
-                        out.write(buffer, 0, count)
+                        sink.write(buffer, 0, count)
                     }
                 }
-                out.write(suffix)
             }
-            checkCancelled(cancelled)
-            check(connection.responseCode in 200..299) { "上传暂未完成（HTTP ${connection.responseCode}）" }
-            return parseReceipt(readLimited(connection), archive.length())
-        } finally { connection.disconnect() }
+        }
+        val multipart = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("parent_dir", parent)
+            .addFormDataPart("replace", "0")
+            .addFormDataPart("file", archive.name, content)
+            .build()
+        // Mark the entire POST one-shot, including on OkHttp versions whose MultipartBody does not
+        // propagate this property from its parts. Recovery belongs to the durable session queue.
+        val body = object : RequestBody() {
+            override fun contentType() = multipart.contentType()
+            override fun contentLength() = multipart.contentLength()
+            override fun isOneShot() = true
+            override fun writeTo(sink: BufferedSink) = multipart.writeTo(sink)
+        }
+        return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()), cancelled) { response ->
+            check(response.isSuccessful) { "上传暂未完成（HTTP ${response.code()}）" }
+            parseReceipt(readLimited(response, cancelled), archive.length())
+        }
     }
 
     private fun get(uri: URI, cancelled: () -> Boolean): String {
         checkCancelled(cancelled)
-        val connection = open(uri)
-        try {
-            check(connection.responseCode in 200..299) { "云盘暂时无法连接（HTTP ${connection.responseCode}）" }
-            checkCancelled(cancelled)
-            return readLimited(connection)
-        } finally { connection.disconnect() }
+        return calls.execute(request(uri).get().build(), 60_000, cancelled) { response ->
+            check(response.isSuccessful) { "云盘暂时无法连接（HTTP ${response.code()}）" }
+            readLimited(response, cancelled)
+        }
     }
 
-    private fun open(uri: URI) = (trustedUri(uri.toString()).toURL().openConnection() as HttpURLConnection).apply {
-        connectTimeout = 20_000; readTimeout = 30_000; instanceFollowRedirects = false
-        setRequestProperty("Accept", "application/json,text/html")
-        setRequestProperty("User-Agent", "RingFitnessSteps/0.7")
-    }
+    private fun request(uri: URI) = Request.Builder().url(trustedUri(uri.toString()).toString())
+        .header("Accept", "application/json,text/html")
+        .header("User-Agent", "RingFitnessSteps/0.7")
 
-    private fun readLimited(connection: HttpURLConnection): String = connection.inputStream.use { input ->
+    private fun readLimited(response: Response, cancelled: () -> Boolean): String = requireNotNull(response.body()).byteStream().use { input ->
         val bytes = ByteArrayOutputStream()
         val buffer = ByteArray(8192)
         while (true) {
+            checkCancelled(cancelled)
             val count = input.read(buffer)
             if (count < 0) break
             require(bytes.size() + count <= 1_048_576) { "云盘响应过大" }
@@ -90,6 +95,13 @@ class SeafileSessionTransport : SessionUploadTransport {
 
     companion object {
         private const val HOST = "cloud.tsinghua.edu.cn"
+        /** Network-attempt budget: two minutes overhead plus 16 KiB/s for the actual archive size.
+         * This bounds one retryable transfer; it does not restrict the duration of a capture. */
+        internal fun uploadDeadlineMillis(bytes: Long): Long {
+            require(bytes >= 0)
+            val seconds = bytes / 16_384 + if (bytes % 16_384 == 0L) 0 else 1
+            return if (seconds > (Long.MAX_VALUE - 120_000) / 1000) Long.MAX_VALUE else 120_000 + seconds * 1000
+        }
         internal fun validateLink(value: String): URI = trustedUri(value).also {
             require(it.path.matches(Regex("/u/d/[A-Za-z0-9]+/?")) && it.query == null) { "请检查实验上传配置" }
         }

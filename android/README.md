@@ -1,54 +1,46 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.6.7-t2p（versionCode 33）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+当前开发版：**步数采集 0.7.2-recovery（versionCode 36）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
 
-正式设备入口继续提供采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。真实开始采集仍待接入，现有真机证据覆盖准备功能。
+## 当前可运行范围
 
-T2-P提供同一原生App中的完整流程演示。Debug版本从准备页右上角“更多 → 流程演示（模拟）”进入，填写独立体验编号和佩戴位置，即可操作开始、结束、填写步数、本地保存和模拟传输。准备页主要操作保持连接戒指；开发演示为菜单中的独立入口。日常重新打开时，已完成任务显示在首页，未完成任务优先恢复；“演示选项”提供确认超时、保存失败、下载失败、上传失败和断连等受控场景。
+正常入口已接通：首次登记编号与佩戴位置、选择/连接戒指、等待真实开始确认、后台采集、停止确认、整段计步器读数保存、原始文件下载校验、冻结ZIP和清华云盘上传。准备档案与采集记录使用独立App私有目录；单一前台采集服务管理BLE，独立上传服务管理网络任务。页面依据真实保存、设备证据和回执呈现结果。
 
-0.6.6按任务进度显示首页标题与操作，例如“待填写步数 → 填写步数”；返回首页保持后台任务，查看进度恢复原任务页面。采集中显示带日期的开始时间，沿用该段记录的时区。填数页保留必要字段与稳定读数提示，有效0继续正常保存。对应验证见E16，前版完整流程证据仍保留于E15。
+0.7.2在打开准备页时恢复待上传队列，无需先连接戒指。queued/sending及已手动重试的任务继续等待网络；明确失败在原记录中手动重试，保持同一session、目标和冻结包。真机短采、本地保全、云盘人工读回与Python处理分别见E18/E19，恢复及自动目录读取见[验证记录E20](../specs/independent-step-collection/validation.md#19-启动上传恢复与自动目录读取2026-09-19e20)。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
 
-0.6.7统一既有全流程页面和系统控件主题：灰色背景、米白卡片、鼠尾草绿状态区域、深青主操作与深蓝文字。配色、对比度和交互尺寸统一维护于[最小视觉约定](../specs/independent-step-collection/requirements.md#完整流程与最小视觉约定2026-09-19)。本轮覆盖登记、连接、首页、采集、填数、传输及恢复页面，并保留清楚的模拟标记；存储、导航和设备逻辑沿用现有实现。构建、页面复测与未覆盖项统一记入E17，真实本地采集闭环仍为下一项工作。
+Debug从“更多 → 流程演示（模拟）”进入完整交互演示，复用原生页面、协调器与持久化规则，设备、信号和传输使用替身；演示目录与正式记录隔离。Release不提供该入口。页面色彩、字号、容器和主要操作沿用功能规格的最小视觉规则。
 
-演示复用原生页面、采集请求协调器和持久化账本；参考数字实际落盘，文件实际校验，退出或重开可恢复同一记录。设备状态、信号文件及上传回执由测试替身生成，全程显示模拟标记。演示入口仅存在于Debug构建，Activity不向其他应用导出；数据位于应用私有的`files/collection-demo/`，与正式准备信息和实验记录隔离。演示不发真实BLE命令、不访问云盘，也不生成可供实验分析的`.rfbin`；真实采集边界保持未知。
+当前已验证的是限定设备上的短段技术链路。戒指时钟偏差、实际样本与参考时段对应、完整采集/下载故障矩阵及逐级长时继续验收，最长支持时长尚未确定。云端自动读取、试用版本与测试者独立操作以执行计划和最新证据为准。[被试操作说明](../docs/participant-guide.md)为待发放前核对的草稿。
 
-T2b.1协调器已用于演示中的开始/停止路径。正式BLE适配、单一前台采集服务与原始记录下载按T2b.2/T2c/T2d接入，真实上传和后端按T2e/T3验证。真实协议缺少请求nonce/boot ID，跨连接或进程恢复继续保留待核对规则；演示设备自身持久保存的session身份只用于测试恢复，不能作为真实戒指恢复的证据。
+## 构建与本地配置
 
-首次在同页填写编号和佩戴位置，点击“保存并连接戒指”。一次原子保存成功后按需请求权限并直接搜索；选中戒指保存成功后回首页连接，完成后自动显示结果。修改位置在首页弹窗中选择即保存，成功才更新，失败保留原值并允许重试；取消或选择原值不写入。
+使用JDK 21、Android SDK 36及工程Gradle wrapper，最低Android版本为11。手机真实上传位置仅配置在Git忽略的`local.properties`中，键为`ringfitness.activityUploadLink`；研究端读取须指向同一云盘目录。准备与采集入口采用本地编号，旧平台登录和睡眠授权退出独立流程。
 
-已有完整档案冷启动时，权限、蓝牙及必要定位齐备便自动连接一次；条件不足或连接失败时显示恢复动作。自动连接不弹系统授权，不在后台执行；取消、返回、关闭弹窗及页面重建不循环重连。首页共用同一判断显示当前状态和主要操作，电量、固件及 STATUS 未齐时持续显示检查中。技术信息、系统设置和更换戒指位于“设备详情”。本轮测试结果见 [B20 与验证记录](../specs/independent-step-collection/validation.md)，历史版本通过项保留原适用范围。
-
-独立入口不需要旧平台注册、Oura 或 enrollment code。实际上传配置继续保存在 Git 忽略的 `local.properties`，准备页和流程演示均不使用它。私有准备档案由独立应用身份隔离；后续公共数据目录统一为 `Download/RingFitnessSteps/`。
-
-构建使用 JDK 21 和 Android SDK 36。在 `android` 目录执行：
+从`android`目录执行：
 
 ```powershell
-.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease '-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK' --console=plain
+.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease --console=plain
 ```
 
-此命令的 GBK 参数适用于当前 Windows Java 启动器与中文 Gradle 缓存路径的兼容问题，项目文件仍保持 UTF-8；原因见 [基线记录](../docs/android-baseline-20260918.md)。APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。设备测试须另行连接 Android 11+ 手机或模拟器执行 `connectedDebugAndroidTest`；测试 APK 构建成功不代表设备测试通过。
+Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`；Release构建当前生成未签名产物。中文Windows启动器存在编码兼容问题时，可追加`'-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK'`，项目文件继续使用UTF-8，依据见[基线记录](../docs/android-baseline-20260918.md)。测试APK构建、设备测试运行与真实设备验收分别记录。
 
-准备导航测试仅在模拟器显式启用，测试前备份准备档案、结束后恢复。连接到指定模拟器，安装上述构建产物后可执行：
+## 页面与恢复验证
+
+模拟器用于页面、输入、导航、本地保存和受控异常。安装Debug及对应AndroidTest APK，在指定模拟器上运行：
 
 ```powershell
-$emulatorSerial = '<模拟器序列号>'
-adb -s $emulatorSerial install -r app/build/outputs/apk/debug/app-debug.apk
-adb -s $emulatorSerial install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-adb -s $emulatorSerial shell pm grant com.nexthci.ringfitness.steps android.permission.BLUETOOTH_SCAN
-adb -s $emulatorSerial shell pm grant com.nexthci.ringfitness.steps android.permission.BLUETOOTH_CONNECT
-adb -s $emulatorSerial shell svc bluetooth enable
-adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.PreparationNavigationInstrumentedTest -e verifyPreparationNavigation true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
+adb -s <emulator-serial> shell am instrument -w -e class com.nexthci.ringfitness.PreparationNavigationInstrumentedTest,com.nexthci.ringfitness.CollectionFlowInstrumentedTest,com.nexthci.ringfitness.RealCollectionBridgeInstrumentedTest -e verifyPreparationNavigation true -e verifyCollectionFlow true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-以上权限命令适用于API31模拟器；缺少蓝牙条件时，相关用例会明确跳过。测试期间避免同时操作App。测试使用合成档案与可控设备回复检查保存、恢复、等待及重试，真实BLE另用手机和戒指验证。手动复核首次登记后自动搜索、选择后首页状态及强停重开；写失败用可控夹具验证，操作结果同时核对持久档案。具体数量、失败和未覆盖项统一记录在validation。
+准备导航用例要求模拟器具备已授权的蓝牙条件；缺少前置会明确跳过。测试数据在隔离空间，执行期间保持App不受手动操作干扰。BLE协议、真实采集、下载与长时由手机和戒指另行取证。
 
-完整流程的原生页面测试使用独立缓存目录，显式启用后执行；测试替身无需实体戒指或网络，不覆盖默认演示档案：
+`recoveryQa`仅用于对已核对副本注入上传故障，独立应用ID为`com.nexthci.ringfitness.steps.recoveryqa`，显示“步数采集·恢复验证”。它与正常安装的数据隔离，使用同一上传实现：
 
 ```powershell
-adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.CollectionFlowInstrumentedTest -e verifyCollectionFlow true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
+.\gradlew.bat -Pringfitness.recoveryQa=true assembleRecoveryQa assembleRecoveryQaAndroidTest --console=plain
 ```
 
-0.6.5-t2p的验证通过范围为193项JVM测试、25项API31 Android测试（完整流程8项及已有17项），以及上述四项Gradle任务。正常路径另经模拟器实际操作，核对562步、同一session、合成文件哈希和模拟回执；故障与恢复范围及限制见[验证记录E15](../specs/independent-step-collection/validation.md)。真实采集、实验云盘上传读回、后端和长时能力继续单独验收。
+`UploadRecoveryInstrumentedTest`默认跳过，执行需显式`verifyUploadRecovery=true`、独立包名、已审阅的本地marker和原包SHA。调度检查要求离线且BLE权限拒绝，手动重试另指定session；具体准备、方法与已验证故障范围见E20。保持正式安装、凭据和实验记录完整，测试结束恢复设备原网络设置。每次交付按相关规格补运行结果，历史通过项保留原版本范围。
 
 ## 原版历史说明
 

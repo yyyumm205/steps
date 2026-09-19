@@ -26,8 +26,9 @@ android {
         applicationId = "com.nexthci.ringfitness.steps"
         minSdk = 30
         targetSdk = 36
-        versionCode = 35
-        versionName = "0.7.1-upload"
+        versionCode = 36
+        versionName = "0.7.2-recovery"
+        manifestPlaceholders["appLabel"] = "步数采集"
 
         buildConfigField("String", "PUBLIC_DATA_DIRECTORY", "\"RingFitnessSteps\"")
 
@@ -44,6 +45,13 @@ android {
     }
 
     buildTypes {
+        create("recoveryQa") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".recoveryqa"
+            versionNameSuffix = "-qa"
+            manifestPlaceholders["appLabel"] = "步数采集·恢复验证"
+            matchingFallbacks += "debug"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -51,6 +59,13 @@ android {
                 "proguard-rules.pro",
             )
         }
+    }
+
+    // Separate installation and app-private data for deliberate process/network failures.
+    testBuildType = if (providers.gradleProperty("ringfitness.recoveryQa").orNull == "true") "recoveryQa" else "debug"
+    sourceSets.getByName("recoveryQa") {
+        java.srcDir("src/debug/java")
+        manifest.srcFile("src/debug/AndroidManifest.xml")
     }
 
     buildFeatures {
@@ -80,6 +95,7 @@ dependencies {
     implementation("com.google.flatbuffers:flatbuffers-java:25.2.10")
     implementation("commons-io:commons-io:2.11.0")
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
+    implementation("com.squareup.okhttp3:okhttp:3.14.9")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
     implementation("com.google.code.gson:gson:2.11.0")
     testImplementation("junit:junit:4.13.2")

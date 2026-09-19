@@ -34,12 +34,32 @@ class RealUploadQueue(
 ) {
     private val folder = File(directory, "upload-tasks")
 
+    /** Reopening the app resumes durable work, including a manual retry queued before exit. */
+    fun restore(configuredLink: String): Boolean {
+        var pending = false
+        store.listSessions().filter { session ->
+            session.transfer.status != SessionTransferStatus.COMPLETE &&
+                session.localData?.files?.let { it.isNotEmpty() && it.none { file -> file.simulated } } == true
+        }.forEach { session ->
+            try {
+                pending = enqueue(session.sessionId, configuredLink, retry = false) || pending
+            } catch (_: Exception) {
+                // Keep a damaged binding untouched while allowing other records to recover.
+                runCatching { markFailed(session.sessionId) }
+            }
+        }
+        return pending
+    }
+
     fun enqueue(sessionId: String, configuredLink: String, retry: Boolean): Boolean = synchronized(taskLock) {
         val session = requireNotNull(store.read(sessionId))
         require(session.localData != null && session.reference != null && session.localData.files.none { it.simulated })
         if (session.transfer.status == SessionTransferStatus.COMPLETE) return false
         var task = read(sessionId)
         if (task == null) {
+            check(session.transfer.status == SessionTransferStatus.PENDING && session.transfer.attempts == 0) {
+                "上传记录需要检查，已保留本地数据"
+            }
             if (configuredLink.isBlank()) return false
             SeafileSessionTransport.validateLink(configuredLink)
             task = RealUploadTask(sessionId = sessionId, targetLink = configuredLink, targetSha256 = digest(configuredLink))
@@ -125,7 +145,14 @@ class RealUploadQueue(
 
     /** Also reports damaged task metadata without replacing its destination binding. */
     fun needsLocalReview(sessionId: String): Boolean = synchronized(taskLock) {
-        try { read(sessionId)?.failureStage == "preparation" } catch (_: Exception) { true }
+        try {
+            val task = read(sessionId)
+            if (task != null) task.failureStage == "preparation"
+            else store.read(sessionId)?.let { session ->
+                session.localData != null && session.transfer.status != SessionTransferStatus.COMPLETE &&
+                    (session.transfer.status != SessionTransferStatus.PENDING || session.transfer.attempts != 0)
+            } == true
+        } catch (_: Exception) { true }
     }
 
     private fun markFailed(sessionId: String) {

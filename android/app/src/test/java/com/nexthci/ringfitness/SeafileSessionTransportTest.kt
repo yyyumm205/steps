@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SeafileSessionTransportTest {
+    @Test fun attemptDeadlineScalesWithBytesWithoutSettingACaptureDurationLimit() {
+        assertEquals(120_000L, SeafileSessionTransport.uploadDeadlineMillis(0))
+        assertEquals(121_000L, SeafileSessionTransport.uploadDeadlineMillis(16_384))
+        assertEquals(122_000L, SeafileSessionTransport.uploadDeadlineMillis(16_385))
+        assertTrue(SeafileSessionTransport.uploadDeadlineMillis(1024L * 1024 * 1024) >
+            SeafileSessionTransport.uploadDeadlineMillis(1024L * 1024))
+        assertTrue(SeafileSessionTransport.uploadDeadlineMillis(Long.MAX_VALUE) > 0)
+        assertThrows(IllegalArgumentException::class.java) { SeafileSessionTransport.uploadDeadlineMillis(-1) }
+    }
+
     @Test fun onlyTheExplicitHttpsUploadLinkIsAccepted() {
         assertEquals("cloud.tsinghua.edu.cn", SeafileSessionTransport.validateLink("https://cloud.tsinghua.edu.cn/u/d/fixture/").host)
         listOf("http://cloud.tsinghua.edu.cn/u/d/fixture/", "https://example.org/u/d/fixture/",

@@ -22,6 +22,23 @@ object RealUploadScheduler {
     private val inFlight = UploadFlightOwners()
     private val coordination = UploadJobCoordination()
     private val enqueueWorker by lazy { Executors.newSingleThreadExecutor() }
+    private val restoring = AtomicBoolean(false)
+
+    /** Upload recovery is independent of preparation permissions and BLE service ownership. */
+    fun restore(context: Context) {
+        if (!restoring.compareAndSet(false, true)) return
+        val application = context.applicationContext
+        enqueueWorker.execute {
+            try {
+                if (queue(application).restore(BuildConfig.ACTIVITY_UPLOAD_LINK.trim())) schedule(application)
+            } catch (error: Exception) {
+                Log.e("RingFitnessUpload", "Saved upload tasks could not be restored", error)
+            } finally {
+                restoring.set(false)
+                notifyChanged()
+            }
+        }
+    }
 
     fun enqueue(context: Context, sessionId: String, retry: Boolean = false) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -35,6 +52,10 @@ object RealUploadScheduler {
             return
         }
         if (!queue(context).enqueue(sessionId, BuildConfig.ACTIVITY_UPLOAD_LINK.trim(), retry)) return
+        schedule(context)
+    }
+
+    private fun schedule(context: Context) {
         val application = context.applicationContext
         main.post {
             // Enqueue and finish decisions share this main-thread protocol. File I/O has completed.

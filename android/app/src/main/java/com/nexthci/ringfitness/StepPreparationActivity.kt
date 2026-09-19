@@ -103,6 +103,7 @@ class StepPreparationActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        RealUploadScheduler.restore(applicationContext)
         window.setDecorFitsSystemWindows(false)
         store = PreparationStore(File(filesDir, "preparation/profile.properties"))
         collectionJournal = File(filesDir, "collection-real/session.json")
