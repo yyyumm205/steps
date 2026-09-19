@@ -1,6 +1,6 @@
 # 独立计步实验 App：自由活动 session 需求
 
-状态：总纲2.1.0已确认；T1b、T2-P和配色按E11、E15–E17收口。E18/E19已完成两段真实本地保存、手机上传、人工网页读回及Python导入；E20已验证启动上传恢复、既有真实包的自动云端取回、导入去重及本机定时运行。0.7.3-start-recovery的未确认开始请求归档、真机重开及原包保全按E21通过。当前0.7.4-start-timing补齐启动等待、有限只读复查及重新检查路径，验证按E22执行；最近设备证据仍为-16，新采集保持禁用。未来新采集上传后的自动到达、跨整机重启调度、时间对齐、完整故障矩阵、日汇总及长时能力继续验收。Q01/Q02待确认，Q03已确认。更新日期：2026-09-19。分支：`codex/free-living-session-spec`。
+状态：总纲2.1.0已确认；T1b、T2-P和配色按E11、E15–E17收口。E18/E19已完成两段真实本地保存、手机上传、人工网页读回及Python导入；E20已验证启动上传恢复、既有真实包的自动云端取回、导入去重及本机定时运行。0.7.3-start-recovery的未确认开始请求归档、真机重开及原包保全按E21通过。0.7.4-start-timing已原位安装，初查、重新检查及强停重开均完成有限只读复查，四次文件对照通过，见E22；设备持续返回-16，新采集保持禁用，实际START时序仍待设备恢复后验证。未来新采集上传后的自动到达、跨整机重启调度、时间对齐、完整故障矩阵、日汇总及长时能力继续验收。Q01/Q02待确认，Q03已确认。更新日期：2026-09-19。分支：`codex/free-living-session-spec`。
 
 本规格服从用户已确认的 [CONSTITUTION.md](../../CONSTITUTION.md) 2.1.0；项目使命、技术栈和总体路线由总纲唯一维护。实施切片见 [plan.md](plan.md)，验收见 [validation.md](validation.md)，旧设计与源码影响见 [change-review.md](change-review.md)。用户已授权按小切片持续实现；Q01/Q02 待确认，Q03 按 2026-09-19 已确认方案实施。
 
@@ -157,7 +157,7 @@ Debug准备页通过右上角“更多 → 流程演示（模拟）”显式进�
 
 研究者指导完整操作，依据计步器说明统一佩戴。App 显示并记住编号与戒指佩戴位置，后续开始前可确认位置是否仍正确；位置变更影响以后新 session，采集中元数据快照保持不变，途中换位通过异常记录表达。
 
-应用显示名为“步数采集”，applicationId为`com.nexthci.ringfitness.steps`；真实session和rfbin保存在独立应用私有目录，演示目录另行隔离。既有公共导出目录`Download/RingFitnessSteps/`保持独立命名；当前开发版本为`0.7.3-start-recovery`。编号采用3–24位ASCII英文字母或数字，去首尾空格并统一小写；session的`participant_id`、`participant_name`均使用该规范编号。installation ID标记安装，session UUID在持久化开始请求时创建，再等待戒指确认采集。研究者维护发放表，离线登记只做格式校验。编号更换见Q01，当前保持固定编号。
+应用显示名为“步数采集”，applicationId为`com.nexthci.ringfitness.steps`；真实session和rfbin保存在独立应用私有目录，演示目录另行隔离。既有公共导出目录`Download/RingFitnessSteps/`保持独立命名；当前开发版本为`0.7.4-start-timing`。编号采用3–24位ASCII英文字母或数字，去首尾空格并统一小写；session的`participant_id`、`participant_name`均使用该规范编号。installation ID标记安装，session UUID在持久化开始请求时创建，再等待戒指确认采集。研究者维护发放表，离线登记只做格式校验。编号更换见Q01，当前保持固定编号。
 
 升级、重开或手机重启保留已有身份与任务；卸载或清除应用数据后的自动任务恢复不在本次范围。原版文件与历史交接资料保留。
 
