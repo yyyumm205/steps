@@ -9,10 +9,18 @@
 ```powershell
 python -m backend.ringo_data import --output research-data/imported research-data/incoming/session.zip
 python -m backend.ringo_data summary --root research-data/imported --output research-data/session-index.csv
+python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported --once
+python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported
 python -m pytest backend/ringo_data/tests -q
 ```
 
-`import` 支持一次传入多份 ZIP，同批副本保持幂等。标准输出逐包报告 `imported`、`already_imported` 或 `conflict`；任何冲突或拒收使退出码为 2，其他包继续处理。输出目录应由同一受控进程写入；`.import.lock` 防止并发覆盖。进程被强制结束后，先确认没有导入器运行，再人工移除遗留锁；`.staging` 中的未发布目录保留为排查依据，原 ZIP 可重新导入。
+`import` 支持一次传入多份 ZIP，同批副本保持幂等。标准输出逐包报告 `imported`、`already_imported` 或 `conflict`；任何冲突或拒收使退出码为 2，其他包继续处理。
+
+`sync` 监测清华云盘客户端已同步到本机的输入目录，只读取该目录直属的最终 `.zip` 文件。输入目录保持只读；研究产物写入独立输出目录，两者不得重合或互相嵌套。云盘客户端负责下载及同步，本命令负责导入；客户端账号和目录映射保存在本地配置。
+
+默认每 5 秒检查一次，文件的大小、修改时间等属性在两次观察之间保持稳定至少 10 秒后，再复制快照并导入。临时名称、空文件及尚无完整 ZIP 目录的文件继续等待，复制时仍在变化的文件留待下一轮。`--interval-seconds` 和 `--stable-seconds` 调整检查及稳定间隔。`--once` 执行一次观察、稳定等待和批次处理，适合定时任务与复现检查；结果中的 `pending` 表示仍待完成的文件。进程重开后重新检查输入，已导入包保持幂等；单包拒收或冲突不阻塞其他包。每轮在输出目录原子更新 `session-index.csv`，索引失败时保留上一份完整结果。
+
+导入与索引共用 `.import.lock` 操作系统文件锁，活跃并发明确拒绝；进程正常退出或被终止后，系统自动释放锁。锁文件会持续存在，以维持同一个锁对象，请勿在新版运行期间删除。升级前先停止旧版导入器；若遇到只写有 PID 的旧锁文件，确认旧进程已结束后再人工移除该旧锁，随后启动新版。程序不会凭锁文件年龄解锁。`.staging` 和 `.sync-staging` 中因进程终止留下的未发布文件保留为排查依据，原 ZIP 可重新导入。
 
 默认限制为 ZIP 512 MiB、总解压 1 GiB、单文件 512 MiB、JSON 1 MiB、256 个条目、压缩比 1000、派生 CSV 总量 2 GiB。CLI 可调整 ZIP、解压及派生总量；Python `Limits` 可逐项配置。这些是资源保护配额，设备支持时长仍依赖实测。
 

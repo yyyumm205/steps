@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -93,18 +94,35 @@ def sync_tree(directory):
 def import_lock(root):
     root.mkdir(parents=True, exist_ok=True)
     lock = root / ".import.lock"
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as error:
-        raise ValidationError("import is locked; confirm no importer is running before removing a stale .import.lock") from error
-    try:
-        with os.fdopen(fd, "w") as stream:
-            stream.write(str(os.getpid()))
-            stream.flush()
-            os.fsync(stream.fileno())
-        yield
-    finally:
-        lock.unlink()
+    # Keep one stable inode: unlinking a released lock can split concurrent owners across files.
+    # The OS releases this lock on process exit, including an unexpected termination.
+    with lock.open("a+b") as stream:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise ValidationError("import is locked by an active importer; retry after it finishes") from error
+        try:
+            stream.seek(0)
+            marker = stream.read(128)
+            require(marker in (b"", b"ringfitness-os-lock-v1\n"),
+                    "legacy import is locked; stop old importers and explicitly remove their .import.lock before upgrading")
+            if not marker:
+                stream.write(b"ringfitness-os-lock-v1\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def inspect_zip(archive, limits):
@@ -241,8 +259,20 @@ def decode_archive(stage, manifest, limits):
     return quality
 
 
+def read_import_receipt(destination):
+    receipt = object_value(strict_json((destination / "import.json").read_bytes()), "existing import receipt")
+    require({"session_id", "zip_sha256", "artifacts"} <= set(receipt), "existing import receipt fields missing")
+    require(type(receipt["session_id"]) is str and receipt["session_id"], "existing import identity is invalid")
+    require(type(receipt["zip_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", receipt["zip_sha256"]),
+            "existing archive hash is invalid")
+    artifacts = object_value(receipt["artifacts"], "existing artifact hashes")
+    require(all(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) for value in artifacts.values()),
+            "existing artifact hash is invalid")
+    return receipt
+
+
 def existing_result(destination, session_id, digest):
-    receipt = strict_json((destination / "import.json").read_bytes())
+    receipt = read_import_receipt(destination)
     require(receipt.get("session_id") == session_id, "existing import identity is inconsistent")
     require(sha256(destination / "source.zip") == receipt.get("zip_sha256"), "existing archive checksum mismatch")
     artifacts = object_value(receipt.get("artifacts"), "existing artifact hashes")
@@ -325,14 +355,28 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
 
 def summarize(root: Path, output: Path):
     """Session index only: unknown coverage never becomes a daily total."""
+    root, output = local_path(root), local_path(output)
+    reserved = [root / name for name in (".import.lock", "sessions", "conflicts", "rejected", ".staging", ".sync-staging")]
+    require(output != root and all(output != path and path not in output.parents for path in reserved),
+            "summary output cannot replace the import lock or preserved research artifacts")
+    with import_lock(root):
+        return _summarize_locked(root, output)
+
+
+def _summarize_locked(root: Path, output: Path):
     rows, raw_owners = [], {}
     root = local_path(root)
     for directory in sorted((root / "sessions").glob("*")):
         if not directory.is_dir():
             continue
         manifest = validate_manifest(strict_json((directory / "manifest.json").read_bytes()))
-        quality = strict_json((directory / "quality.json").read_bytes())
-        receipt = strict_json((directory / "import.json").read_bytes())
+        quality = object_value(strict_json((directory / "quality.json").read_bytes()), "existing quality report")
+        require({"analysis_status", "analysis_reasons"} <= set(quality), "existing quality report fields missing")
+        require(quality["analysis_status"] == "pending_review", "existing analysis status is invalid")
+        require(type(quality["analysis_reasons"]) is list and
+                all(type(reason) is str and reason for reason in quality["analysis_reasons"]),
+                "existing analysis reasons are invalid")
+        receipt = read_import_receipt(directory)
         existing_result(directory, manifest["session_id"], receipt["zip_sha256"])
         for entry in manifest["files"]:
             if entry["role"] == "raw":
@@ -356,8 +400,17 @@ def summarize(root: Path, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     fields = ["session_id", "participant_id", "ground_truth_steps", "ground_truth_status", "started_at_ms",
               "ended_at_ms", "analysis_status", "daily_aggregation_eligible", "analysis_reasons"]
-    with output.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
+    fd, name = tempfile.mkstemp(prefix=".session-index-", suffix=".tmp", dir=output.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        sync_directory(output.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
     return rows

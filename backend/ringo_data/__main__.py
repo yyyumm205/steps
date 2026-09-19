@@ -2,12 +2,15 @@
 
 import argparse
 import json
+import math
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 
 from .importer import ArchiveRejected, Limits, import_archive, summarize
 from .schema import ValidationError
+from .sync import DirectorySync
 
 
 def main(argv=None):
@@ -22,6 +25,15 @@ def main(argv=None):
     summary = commands.add_parser("summary", help="write one reference row per admitted session")
     summary.add_argument("--root", required=True, type=Path)
     summary.add_argument("--output", required=True, type=Path)
+    sync = commands.add_parser("sync", help="automatically import stable ZIPs from a local cloud-sync directory")
+    sync.add_argument("--incoming", required=True, type=Path)
+    sync.add_argument("--output", required=True, type=Path)
+    sync.add_argument("--once", action="store_true", help="observe, wait for stability, then process one batch and exit")
+    sync.add_argument("--interval-seconds", type=float, default=5)
+    sync.add_argument("--stable-seconds", type=float, default=10)
+    sync.add_argument("--max-archive-mib", type=int, default=512)
+    sync.add_argument("--max-expanded-mib", type=int, default=1024)
+    sync.add_argument("--max-decoded-mib", type=int, default=2048)
     args = parser.parse_args(argv)
     if args.command == "summary":
         rows = summarize(args.root, args.output)
@@ -33,6 +45,26 @@ def main(argv=None):
                     expanded_bytes=args.max_expanded_mib * 1024 ** 2,
                     entry_bytes=args.max_expanded_mib * 1024 ** 2,
                     decoded_bytes=args.max_decoded_mib * 1024 ** 2)
+    if args.command == "sync":
+        if not math.isfinite(args.interval_seconds) or args.interval_seconds <= 0:
+            parser.error("interval seconds must be finite and positive")
+        try:
+            scanner = DirectorySync(args.incoming, args.output, stable_seconds=args.stable_seconds, limits=limits)
+            first = scanner.scan()
+            print(json.dumps(first, ensure_ascii=False), flush=True)
+            if args.once:
+                time.sleep(args.stable_seconds)
+                result = scanner.scan()
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                return 2 if result["failed"] else 0
+            while True:
+                time.sleep(args.interval_seconds)
+                print(json.dumps(scanner.scan(), ensure_ascii=False), flush=True)
+        except KeyboardInterrupt:
+            return 0
+        except (OSError, ValidationError) as error:
+            print(json.dumps({"status": "sync_error", "reason": str(error)}, ensure_ascii=False), file=sys.stderr)
+            return 2
     failed = False
     for archive in args.archives:
         try:

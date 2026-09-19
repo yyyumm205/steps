@@ -340,7 +340,7 @@ def test_interrupted_publish_leaves_no_partial_session_and_retry_succeeds(tmp_pa
     with pytest.raises(OSError, match="interruption"):
         import_archive(source, tmp_path / "out")
     assert not list((tmp_path / "out" / "sessions").glob("*"))
-    assert source.exists() and not (tmp_path / "out" / ".import.lock").exists()
+    assert source.exists() and (tmp_path / "out" / ".import.lock").read_bytes() == b"ringfitness-os-lock-v1\n"
     monkeypatch.setattr(importer, "publish", original)
     assert import_archive(source, tmp_path / "out").status == "imported"
 
