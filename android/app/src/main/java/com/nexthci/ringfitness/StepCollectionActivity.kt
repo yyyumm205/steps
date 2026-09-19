@@ -277,6 +277,7 @@ abstract class StepCollectionActivity : Activity() {
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
         state.connecting -> HomeTask("本次采集", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
+        state.preservingExisting -> HomeTask("准备戒指", "正在保存已有数据", "保存中…", "保存完成后即可开始。")
         state.checkingDevice -> HomeTask("采集准备", "正在检查戒指", "检查中…")
         state.canStart -> HomeTask("开始这一段", "采集准备", "开始采集", "佩戴好设备，站定后将计步器清零。")
         state.session == null -> HomeTask("采集准备", "戒指暂未就绪", "重新检查", state.error)

@@ -144,7 +144,7 @@ class RingPreparationController(
     private fun describe(status: HealthMessage.Status): String = when {
         status.errorCode != 0 -> "戒指状态异常（错误码 ${status.errorCode}），请联系研究者核对"
         status.collecting -> "戒指正在采集，请联系研究者核对当前记录"
-        status.bytes > 0 || status.records > 0 -> "戒指已有记录待核对，请联系研究者处理"
+        status.bytes > 0 || status.records > 0 -> "进入后自动保存戒指中的已有数据"
         status.bytes < 0 || status.records < 0 -> "戒指状态数据异常，请重新查询"
         else -> "戒指状态已确认，可以完成采集准备"
     }

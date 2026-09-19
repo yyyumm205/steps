@@ -394,6 +394,103 @@ class FreeLivingSessionStoreTest {
         assertThrows(IOException::class.java) { openStore(file).read() }
     }
 
+    @Test fun chargingRecoveryRetainsTheOriginalErrorAndEvidenceAfterReopen() {
+        val file = file()
+        val baseline = chargingBaseline()
+        val requested = openStore(file).requestStart(preparation, t, "UTC", baseline)
+        val reopened = openStore(file).read()!!
+        assertEquals(requested, reopened)
+        assertEquals(-16, reopened.startBaseline!!.status.errorCode)
+        assertEquals(baseline.chargingRecoveryEvidence, reopened.startBaseline.chargingRecoveryEvidence)
+        assertEquals(5, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            openStore(file).confirmStart(requested.sessionId, address, status(true).copy(errorCode = -16), t + 100)
+        }
+        assertEquals(requested, openStore(file).read())
+        val confirmed = openStore(file).confirmStart(requested.sessionId, address, status(true), t + 100)
+        openStore(file).requestStop(requested.sessionId, t + 200)
+        assertThrows(IllegalArgumentException::class.java) {
+            openStore(file).confirmStop(requested.sessionId, address, status(false).copy(errorCode = -16), t + 300)
+        }
+        assertEquals(confirmed.startBaseline, openStore(file).read()!!.startBaseline)
+    }
+
+    @Test fun recoveryBaselineRejectsMissingStaleOrContradictoryEvidenceBeforeWriting() {
+        val baseline = chargingBaseline()
+        val evidence = baseline.chargingRecoveryEvidence!!
+        val invalid = listOf(
+            baseline.copy(chargingRecoveryEvidence = null),
+            baseline.copy(status = baseline.status.copy(collecting = true)),
+            baseline.copy(status = baseline.status.copy(errorCode = 0)),
+            baseline.copy(status = baseline.status.copy(errorCode = -15)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(statusErrorReason = 2)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(batteryChargeStatus = 1)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(batteryReceivedAtMs = t - 5001)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(checkedAtMs = t - 1)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(statusReceivedAtMs = t - 1)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(batteryConnectionGeneration = 2)),
+            baseline.copy(chargingRecoveryEvidence = evidence.copy(statusConnectionGeneration = 0, batteryConnectionGeneration = 0)),
+        )
+        invalid.forEach { value ->
+            val file = file()
+            assertThrows(IllegalArgumentException::class.java) { openStore(file).requestStart(preparation, t, "UTC", value) }
+            assertFalse(file.exists())
+        }
+    }
+
+    @Test fun corruptedRecoveryEvidenceIsRejectedWithoutOverwritingTheJournal() {
+        val changes: List<(JsonObject) -> Unit> = listOf(
+            { it.remove("charging_recovery_evidence") },
+            { it.add("charging_recovery_evidence", com.google.gson.JsonNull.INSTANCE) },
+            { it.getAsJsonObject("charging_recovery_evidence").addProperty("status_error_reason", 2) },
+            { it.getAsJsonObject("charging_recovery_evidence").addProperty("battery_received_at_ms", (t - 5001)) },
+            { it.getAsJsonObject("charging_recovery_evidence").addProperty("battery_charge_status", "0") },
+            { it.getAsJsonObject("charging_recovery_evidence").addProperty("unexpected", true) },
+        )
+        changes.forEach { change ->
+            val file = file()
+            openStore(file).requestStart(preparation, t, "UTC", chargingBaseline())
+            editPayloadWithUpdatedDigest(file) { change(it.getAsJsonObject("start_baseline")) }
+            val before = file.readBytes()
+            assertThrows(IOException::class.java) { openStore(file).read() }
+            assertArrayEquals(before, file.readBytes())
+        }
+    }
+
+    @Test fun journalVersionFourRemainsReadableAndMigratesWithoutInventingRecoveryEvidence() {
+        val file = file()
+        val baseline = DeviceStartBaseline(HealthMessage.Status(false, 0, 0, 0, 0), emptyList(), t)
+        val requested = openStore(file).requestStart(preparation, t, "UTC", baseline)
+        val envelope = JsonParser.parseString(file.readText()).asJsonObject
+        envelope.addProperty("journal_version", 4)
+        file.writeText(envelope.toString())
+        editPayloadWithUpdatedDigest(file) { it.getAsJsonObject("start_baseline").remove("charging_recovery_evidence") }
+        assertEquals(requested, openStore(file).read())
+        openStore(file).confirmStart(requested.sessionId, address, status(true), t + 100)
+        val migrated = JsonParser.parseString(file.readText()).asJsonObject
+        assertEquals(5, migrated["journal_version"].asInt)
+        assertTrue(migrated.getAsJsonObject("session").getAsJsonObject("start_baseline")["charging_recovery_evidence"].isJsonNull)
+        assertNull(openStore(file).read()!!.startBaseline!!.chargingRecoveryEvidence)
+    }
+
+    @Test fun unconfirmedRecoveryAttemptCanArchiveOnlyTheUnchangedIdleBaseline() {
+        val file = file()
+        val store = openStore(file)
+        val baseline = chargingBaseline()
+        val requested = store.requestStart(preparation, t, "UTC", baseline)
+        val observation = HealthRecordObservation(address, 1, baseline.status.copy(errorCode = 0), t + 100, emptyList())
+        val archived = store.archiveStartAttempt(requested.sessionId, observation, t + 200, "连接检查")
+        assertFalse(archived.isPending)
+        assertEquals(-16, archived.startBaseline!!.status.errorCode)
+        assertEquals(archived, openStore(file).read())
+    }
+
+    private fun chargingBaseline() = DeviceStartBaseline(HealthMessage.Status(false, 0, 0, -16, 0), emptyList(), t,
+        ChargingRecoveryEvidence(statusErrorReason = 1, batteryChargeStatus = 0,
+            batteryReceivedAtMs = t - 100, statusReceivedAtMs = t, checkedAtMs = t,
+            statusConnectionGeneration = 1, batteryConnectionGeneration = 1))
+
     private fun file(): File = File(temporary.newFolder(), "active-session.json")
     // Windows cannot open a directory FileChannel. JVM tests exercise the journal contract;
     // the separate Android instrumented test uses the production directory-sync implementation.

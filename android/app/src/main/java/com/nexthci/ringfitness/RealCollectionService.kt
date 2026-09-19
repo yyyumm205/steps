@@ -77,7 +77,12 @@ class RealCollectionService : Service() {
                                 }
                             }
                             override fun onSensorPacket(packet: SensorPacket) {
-                                if (active() && packet is SensorPacket.Health) submit { it.onHealth(generation, packet) }
+                                if (!active()) return
+                                when (packet) {
+                                    is SensorPacket.Health -> submit { it.onHealth(generation, packet) }
+                                    is SensorPacket.Battery -> submit { it.onBattery(generation, packet) }
+                                    else -> Unit
+                                }
                             }
                             override fun onBleError(message: String) {
                                 if (active()) submit { it.onDisconnected(generation, message) }
@@ -89,6 +94,7 @@ class RealCollectionService : Service() {
                     }
                     override fun disconnect() { onMain(allowDestroyed = true) { closeClient() } }
                     override fun queryStatus() = command("STATUS") { it.requestHealthStatus() }
+                    override fun queryBattery() = command("BATTERY") { it.requestBattery() }
                     override fun queryRecords() = command("LIST") { it.requestHealthSessions() }
                     override fun start() = command("START") { it.startHealth() }
                     override fun stop() = command("STOP") { it.stopHealth() }
@@ -169,7 +175,7 @@ class RealCollectionService : Service() {
     }
 
     private fun updateForeground(state: CollectionFlowState) {
-        val active = state.session?.isPending == true
+        val active = state.session?.isPending == true || state.preservingExisting
         wakeLock?.let { lock ->
             if (active && !lock.isHeld) lock.acquire()
             if (!active && lock.isHeld) lock.release()
@@ -177,6 +183,7 @@ class RealCollectionService : Service() {
         val text = when {
             state.connecting -> "正在连接戒指"
             !state.connected && active -> "连接中断，正在保留本次记录"
+            state.preservingExisting -> "正在保存戒指中的已有数据"
             state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
             state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
             state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)

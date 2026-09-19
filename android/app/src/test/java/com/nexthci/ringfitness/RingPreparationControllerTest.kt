@@ -51,7 +51,7 @@ class RingPreparationControllerTest {
         val controller = readyController(transport)
         transport.listener.onPacket(health(bytes = 32))
         assertFalse(controller.state.canPrepare)
-        assertTrue(controller.state.message.contains("已有记录待核对"))
+        assertEquals("进入后自动保存戒指中的已有数据", controller.state.message)
         transport.listener.onPacket(health(records = 1))
         assertFalse(controller.state.canPrepare)
         assertFalse(controller.state.message.contains("未下载"))

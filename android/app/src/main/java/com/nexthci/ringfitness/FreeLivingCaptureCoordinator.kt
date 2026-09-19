@@ -5,6 +5,7 @@ import java.util.Locale
 
 /** Acceptance means queued locally, not acknowledged by the ring. No download commands belong here. */
 interface HealthControlPort {
+    fun queryBattery(): Boolean = false
     fun queryStatus(): Boolean
     fun queryRecords(): Boolean
     fun start(): Boolean
@@ -14,6 +15,7 @@ interface HealthControlPort {
 interface CaptureClock {
     fun nowEpochMs(): Long
     fun timeZoneId(): String
+    fun nowElapsedMs(): Long = System.nanoTime() / 1_000_000L
 }
 
 enum class CaptureControlPhase {
@@ -78,8 +80,11 @@ class FreeLivingCaptureCoordinator(
         val id: Long,
         val generation: Long,
         val purpose: Purpose,
+        val startedAtElapsedMs: Long,
         var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
+        var batteryRequestedAtMs: Long? = null,
+        var observation: HealthRecordObservation? = null,
     )
     private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String,
         val allowedExisting: ExistingRecordAuthorization?)
@@ -106,6 +111,7 @@ class FreeLivingCaptureCoordinator(
     private var startWait: StartWait? = null
     private var startPollCount = 0
     private var closed = false
+    private var chargingRecoveryDeadline: Long? = null
 
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
     fun restore() = dispatch { if (!restored) readJournal() }
@@ -199,7 +205,8 @@ class FreeLivingCaptureCoordinator(
             if (waiting.stage == StartWaitStage.BEFORE_START) {
                 val before = baseline
                 val consistent = before != null && packet.receivedEpochMs > 0 && when (val message = packet.message) {
-                    is HealthMessage.Status -> message == before.status
+                    is HealthMessage.Status -> message == before.status &&
+                        (session?.startBaseline?.chargingRecoveryEvidence == null || packet.statusErrorReason == 1)
                     is HealthMessage.ListItem -> message in before.records
                     is HealthMessage.ListEnd -> message.count == before.records.size
                     else -> false
@@ -225,10 +232,21 @@ class FreeLivingCaptureCoordinator(
             return@dispatch
         }
         if (active.generation != connectionGeneration) return@dispatch
+        if (active.observation != null) {
+            val consistent = when (val message = packet.message) {
+                is HealthMessage.Status -> message == active.status?.message && packet.statusErrorReason == active.status?.statusErrorReason
+                is HealthMessage.ListItem -> message in active.records
+                is HealthMessage.ListEnd -> message.count == active.records.size
+                else -> false
+            }
+            if (!consistent) invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
+            return@dispatch
+        }
         when (val message = packet.message) {
             is HealthMessage.Status -> {
                 if (active.status != null) {
-                    if (active.purpose == Purpose.ARCHIVE_START && message != active.status?.message) {
+                    if ((active.purpose == Purpose.ARCHIVE_START || active.purpose == Purpose.PREFLIGHT) &&
+                        (message != active.status?.message || packet.statusErrorReason != active.status?.statusErrorReason)) {
                         invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
                     }
                     return@dispatch
@@ -256,11 +274,36 @@ class FreeLivingCaptureCoordinator(
                 }
                 val observation = HealthRecordObservation(requireNotNull(address), connectionGeneration,
                     statusPacket.message as HealthMessage.Status, statusPacket.receivedEpochMs, active.records.toList())
+                if (active.purpose == Purpose.PREFLIGHT && ChargingStartCompatibility.isCandidate(observation.status, statusPacket.statusErrorReason)) {
+                    active.observation = observation
+                    active.batteryRequestedAtMs = clock.nowEpochMs()
+                    send(port::queryBattery)
+                    return@dispatch
+                }
                 round = null
-                completeRound(active.purpose, observation)
+                completeRound(active.purpose, observation, statusPacket.statusErrorReason)
             }
             else -> Unit
         }
+    }
+
+    fun onBattery(connectionGeneration: Long, packet: SensorPacket.Battery) = dispatch {
+        if (connectionGeneration != generation) return@dispatch
+        if (startWait?.stage == StartWaitStage.BEFORE_START && session?.startBaseline?.chargingRecoveryEvidence != null) {
+            if (packet.chargeStatus != 0) invalidateRound(CaptureControlIssue.DEVICE_ERROR)
+            return@dispatch
+        }
+        val active = round ?: return@dispatch
+        val observed = active.observation ?: return@dispatch
+        if (clock.nowElapsedMs() - active.startedAtElapsedMs !in 0..ChargingStartCompatibility.FRESHNESS_MS) {
+            invalidateRound(CaptureControlIssue.QUERY_TIMEOUT); return@dispatch
+        }
+        val evidence = ChargingStartCompatibility.evidence(requireNotNull(active.status), packet, connectionGeneration,
+            requireNotNull(active.batteryRequestedAtMs), clock.nowEpochMs())
+        if (evidence == null) { invalidateRound(CaptureControlIssue.DEVICE_ERROR); return@dispatch }
+        chargingRecoveryDeadline = active.startedAtElapsedMs + ChargingStartCompatibility.FRESHNESS_MS
+        round = null
+        completeRound(active.purpose, observed, active.status?.statusErrorReason, evidence)
     }
 
     /** Host schedules this using elapsed time, never by comparing wall-clock timestamps. */
@@ -273,7 +316,7 @@ class FreeLivingCaptureCoordinator(
         val connectedGeneration = generation ?: return
         if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
         if (purpose == Purpose.START) startPollCount++
-        round = Round(++operation, connectedGeneration, purpose)
+        round = Round(++operation, connectedGeneration, purpose, clock.nowElapsedMs())
         publish(when (purpose) {
             Purpose.PREFLIGHT, Purpose.INSPECT, Purpose.ARCHIVE_START -> CaptureControlPhase.CHECKING
             Purpose.START -> CaptureControlPhase.STARTING
@@ -282,7 +325,8 @@ class FreeLivingCaptureCoordinator(
         send(port::queryStatus)
     }
 
-    private fun completeRound(purpose: Purpose, observed: HealthRecordObservation) {
+    private fun completeRound(purpose: Purpose, observed: HealthRecordObservation, statusReason: Int? = null,
+        chargingRecovery: ChargingRecoveryEvidence? = null) {
         if (purpose == Purpose.ARCHIVE_START) {
             val reason = archiveReason ?: return
             archiveReason = null
@@ -299,7 +343,7 @@ class FreeLivingCaptureCoordinator(
             }
             return
         }
-        if (purpose == Purpose.START && startPollCount < START_POLL_LIMIT && unchangedIdleBaseline(observed)) {
+        if (purpose == Purpose.START && startPollCount < START_POLL_LIMIT && unchangedIdleBaseline(observed, statusReason)) {
             // A complete idle reply may precede firmware readiness. Recheck only that same
             // baseline; an unfamiliar record or collecting error keeps the protective exit.
             waitForStart(StartWaitStage.BEFORE_STATUS, START_POLL_INTERVAL_MS, observed) {
@@ -307,7 +351,7 @@ class FreeLivingCaptureCoordinator(
             }
             return
         }
-        if (observed.status.errorCode != 0) {
+        if (observed.status.errorCode != 0 && !(purpose == Purpose.PREFLIGHT && chargingRecovery != null)) {
             clearAssociation()
             review(CaptureControlIssue.DEVICE_ERROR, observed)
             return
@@ -324,11 +368,16 @@ class FreeLivingCaptureCoordinator(
                 val existing = try { store.readPending() } catch (_: Exception) { storageFailure(); return }
                 if (existing != null) { session = existing; publishRestored(); return }
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
-                    DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs)) } ?: return
+                    DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs, chargingRecovery)) } ?: return
                 baseline = observed
                 startPollCount = 0
                 check(saved.phase == FreeLivingSessionPhase.START_REQUESTED)
                 waitForStart(StartWaitStage.BEFORE_START, START_SETTLE_DELAY_MS) {
+                    if (chargingRecovery != null && (clock.nowElapsedMs() > (chargingRecoveryDeadline ?: Long.MIN_VALUE) ||
+                            runCatching { chargingRecovery.copy(checkedAtMs = clock.nowEpochMs()).validate(observed.status, observed.statusReceivedAtMs) }.isFailure)) {
+                        invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
+                        return@waitForStart
+                    }
                     if (send(port::start)) {
                         // This delay starts at local enqueue, not at confirmed device execution.
                         waitForStart(StartWaitStage.BEFORE_STATUS, START_FIRST_POLL_DELAY_MS) {
@@ -344,11 +393,13 @@ class FreeLivingCaptureCoordinator(
         }
     }
 
-    private fun unchangedIdleBaseline(observed: HealthRecordObservation): Boolean {
+    private fun unchangedIdleBaseline(observed: HealthRecordObservation, reason: Int?): Boolean {
         val before = baseline ?: return false
+        if (session?.startBaseline?.chargingRecoveryEvidence != null && observed.status.errorCode != 0 &&
+            !ChargingStartCompatibility.isCandidate(observed.status, reason)) return false
         return !observed.status.collecting && observed.address == before.address &&
             observed.connectionGeneration == before.connectionGeneration &&
-            observed.status.copy(errorCode = 0) == before.status &&
+            observed.status.copy(errorCode = 0) == before.status.copy(errorCode = 0) &&
             observed.records.size == before.records.size && observed.records.toSet() == before.records.toSet()
     }
 
@@ -503,6 +554,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun clearAssociation() {
+        chargingRecoveryDeadline = null
         startWait = null
         startPollCount = 0
         round = null

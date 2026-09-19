@@ -36,6 +36,7 @@ class RealCollectionController(
             session.startedAtMs ?: 0L, session.endedAtMs ?: 0L)
     },
     private val uploads: RealUploadPort? = null,
+    private val backups: DeviceRecordBackupStore = DeviceRecordBackupStore(File(directory, "device-backups")),
 ) : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
     private var profile: PreparationSnapshot? = null
@@ -50,6 +51,9 @@ class RealCollectionController(
     private var operation = 0L
     private var lastIdle: HealthRecordObservation? = null
     private var downloader: RealSessionDownload? = null
+    private var backupDownloader: RealSessionDownload? = null
+    private var backupObservation: HealthRecordObservation? = null
+    private var backupRecord: HealthMessage.ListItem? = null
     private var downloadTimeout = 0L
     private var reconnectCount = 0
     private var closed = false
@@ -59,7 +63,9 @@ class RealCollectionController(
     private var readinessWait: Long? = null
     private data class Inspection(val id: Long, val attempt: Int = 1,
         val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
-        val records: MutableList<HealthMessage.ListItem> = mutableListOf())
+        val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
+        var batteryRequestedAtMs: Long? = null, var observation: HealthRecordObservation? = null,
+        val startedAtElapsedMs: Long)
 
     @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploads != null,
         connected = false, connecting = true, busy = true, hasProfile = true)
@@ -165,6 +171,31 @@ class RealCollectionController(
 
     fun onHealth(connection: Long, packet: SensorPacket.Health) = safely {
         if (closed || connection != generation || !connected) return@safely
+        val backup = backupDownloader
+        if (backup != null && query == null) {
+            when (val message = packet.message) {
+                is HealthMessage.DataChunk -> { backup.append(message); scheduleBackupTimeout() }
+                is HealthMessage.ReadEnd -> {
+                    if (backup.checkpoint(message)) {
+                        val completed = backup.finish(message)
+                        backups.accept(requireNotNull(profile?.ring).address, requireNotNull(backupRecord), completed, clock.nowEpochMs())
+                        backupDownloader = null; backupRecord = null; downloadTimeout++
+                        backup.close()
+                        runCatching { backup.releaseTemporary() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+                        // DATA has no record ID. A fresh GATT generation separates the next
+                        // record's bytes from any late notifications belonging to this backup.
+                        connect()
+                    } else {
+                        // Each window rechecks the same frozen record before resuming READ.
+                        inspect()
+                    }
+                }
+                is HealthMessage.Status -> require(!message.collecting &&
+                    message.copy(errorCode = 0) == backupObservation?.status?.copy(errorCode = 0)) { "戒指记录发生变化，请重新检查" }
+                else -> Unit
+            }
+            return@safely
+        }
         val download = downloader
         if (download != null) {
             when (val message = packet.message) {
@@ -194,12 +225,24 @@ class RealCollectionController(
                 coordinator.state.phase == CaptureControlPhase.AWAITING_REFERENCE && store.readPending()?.reference != null) inspect()
             return@safely
         }
+        if (round.observation != null) {
+            val consistent = when (val message = packet.message) {
+                is HealthMessage.Status -> message == round.status?.message && packet.statusErrorReason == round.status?.statusErrorReason
+                is HealthMessage.ListItem -> message in round.records
+                is HealthMessage.ListEnd -> message.count == round.records.size
+                else -> false
+            }
+            check(consistent) { "戒指状态发生变化，请重新检查" }
+            return@safely
+        }
         when (val message = packet.message) {
             is HealthMessage.Status -> {
                 require(message.sessionId in 0..65535 && message.bytes in 0..0xFFFF_FFFFL &&
                     message.records in 0..0xFFFF_FFFFL && packet.receivedEpochMs > 0) { "戒指状态需要重新核对" }
                 if (round.status != null) {
-                    require(round.status?.message == message) { "戒指状态发生变化，请重新检查" }
+                    require(round.status?.message == message && round.status?.statusErrorReason == packet.statusErrorReason) {
+                        "戒指状态发生变化，请重新检查"
+                    }
                     return@safely
                 }
                 round.status = packet
@@ -221,7 +264,14 @@ class RealCollectionController(
                 recordDiagnostic(observation)
                 val current = store.readPending()
                 if (current == null) {
-                    finishReadinessInspection(round, observation)
+                    if (backupObservation != null) {
+                        continueExistingBackup(observation)
+                    } else if (ChargingStartCompatibility.isCandidate(observation.status, statusPacket.statusErrorReason)) {
+                        query = round
+                        round.observation = observation
+                        round.batteryRequestedAtMs = clock.nowEpochMs()
+                        check(port.queryBattery()) { "未能读取充电状态，请重新连接" }
+                    } else finishReadinessInspection(round, observation)
                 } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null) {
                     beginDownload(current, observation)
                 }
@@ -230,10 +280,32 @@ class RealCollectionController(
         }
     }
 
+    fun onBattery(connection: Long, packet: SensorPacket.Battery) = safely {
+        if (closed || connection != generation || !connected) return@safely
+        val round = query
+        val observed = round?.observation
+        if (observed == null) {
+            coordinator.onBattery(connection, packet)
+            if (lastIdle != null && packet.chargeStatus != 0 && store.readPending() == null && downloader == null && backupObservation == null) {
+                lastIdle = null
+                publish(CollectionPage.RECOVERY, "请将戒指取出充电盒后重试")
+            }
+            return@safely
+        }
+        query = null
+        val recovery = ChargingStartCompatibility.evidence(requireNotNull(round.status), packet, connection,
+            requireNotNull(round.batteryRequestedAtMs), clock.nowEpochMs())
+        if (recovery == null || clock.nowElapsedMs() - round.startedAtElapsedMs !in 0..ChargingStartCompatibility.FRESHNESS_MS) {
+            lastIdle = null
+            publish(CollectionPage.RECOVERY, if (packet.chargeStatus != null && packet.chargeStatus != 0)
+                "请将戒指取出充电盒后重试" else "充电状态尚未确认，请重新检查戒指")
+        } else finishReadinessInspection(round, observed, recovery)
+    }
+
     override fun register(participantId: String, placement: RingPlacement) = Unit // Preparation owns registration.
 
     override fun start() = safely {
-        if (!state.canStart || connecting || query != null || readinessWait != null || downloader != null || saving) return@safely
+        if (!state.canStart || connecting || query != null || readinessWait != null || downloader != null || backupObservation != null || saving) return@safely
         browsingHome = false; lastIdle = null
         coordinator.refresh()
         coordinator.requestStart(requireNotNull(profile), authorizedExisting())
@@ -281,7 +353,7 @@ class RealCollectionController(
 
     override fun retry() = safely {
         browsingHome = false
-        if (saving || downloader != null || query != null || readinessWait != null ||
+        if (saving || downloader != null || backupObservation != null || query != null || readinessWait != null ||
             coordinator.state.timeoutOperationId != null || coordinator.state.settling) {
             publish(taskPage ?: CollectionPage.RECOVERY, taskError); return@safely
         }
@@ -375,7 +447,7 @@ class RealCollectionController(
     private fun inspect(attempt: Int = 1, errorBaseline: HealthRecordObservation? = null) {
         if (query != null || readinessWait != null || downloader != null || !connected) return
         val id = ++operation
-        query = Inspection(id, attempt, errorBaseline)
+        query = Inspection(id, attempt, errorBaseline, startedAtElapsedMs = clock.nowElapsedMs())
         if (store.readPending()?.reference != null) publish(CollectionPage.DOWNLOADING)
         else publish(CollectionPage.HOME)
         check(port.queryStatus()) { "查询未完成，请重新连接" }
@@ -388,7 +460,8 @@ class RealCollectionController(
         }
     }
 
-    private fun finishReadinessInspection(round: Inspection, observed: HealthRecordObservation) {
+    private fun finishReadinessInspection(round: Inspection, observed: HealthRecordObservation,
+        chargingRecovery: ChargingRecoveryEvidence? = null) {
         lastIdle = null
         val baseline = round.errorBaseline
         val unchanged = baseline == null || (observed.address == baseline.address &&
@@ -399,7 +472,20 @@ class RealCollectionController(
             publish(CollectionPage.RECOVERY, "戒指记录需要核对，请联系研究者")
             return
         }
-        if (observed.status.errorCode == 0) {
+        if (observed.status.errorCode == 0 || chargingRecovery != null) {
+            if (observed.records.isNotEmpty() && !store.hasPreservedDeviceRecords(observed.address, observed.records)) {
+                val approved = authorizedExisting()
+                if (approved?.ringAddress != observed.address || approved.status != observed.status ||
+                    approved.records.toSet() != observed.records.toSet()) {
+                    require(observed.records.all { it.unixMs > 0 && it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 } &&
+                        observed.records.any { it.sessionId == observed.status.sessionId && it.bytes == observed.status.bytes && it.records == observed.status.records }) {
+                        "戒指记录信息不完整，请联系研究者"
+                    }
+                    backupObservation = observed
+                    continueExistingBackup(observed)
+                    return
+                }
+            }
             lastIdle = observed
             taskPage = null; taskError = null
             publish(CollectionPage.HOME)
@@ -419,6 +505,44 @@ class RealCollectionController(
             if (!closed && connected && generation == connection && readinessWait == token) safely {
                 readinessWait = null
                 inspect(round.attempt + 1, baseline ?: observed)
+            }
+        }
+    }
+
+    private fun continueExistingBackup(observed: HealthRecordObservation) {
+        val original = requireNotNull(backupObservation)
+        require(observed.connectionGeneration == original.connectionGeneration && observed.address == original.address &&
+            !observed.status.collecting && observed.status.errorCode in setOf(0, -16) &&
+            observed.status.copy(errorCode = 0) == original.status.copy(errorCode = 0) &&
+            observed.records.size == original.records.size && observed.records.toSet() == original.records.toSet()) {
+            "戒指记录发生变化，已保存的内容会保留，请重新检查"
+        }
+        if (backupDownloader == null) {
+            val next = observed.records.firstOrNull { !store.hasPreservedDeviceRecords(observed.address, listOf(it)) }
+            if (next == null) {
+                backupObservation = null
+                taskPage = null; taskError = null
+                inspect() // Fresh STATUS and, when needed, BATTERY before exposing start again.
+                return
+            }
+            backupRecord = next
+            backupDownloader = backups.open(observed.address, next)
+        }
+        browsingHome = true
+        taskPage = null; taskError = null
+        publish(CollectionPage.HOME)
+        check(port.read(requireNotNull(backupRecord).sessionId, requireNotNull(backupDownloader).nextOffset, 16_384)) {
+            "保存中断，请重新连接戒指后继续"
+        }
+        scheduleBackupTimeout()
+    }
+
+    private fun scheduleBackupTimeout() {
+        val id = ++downloadTimeout
+        scheduler.schedule(30_000) {
+            if (!closed && backupDownloader != null && query == null && id == downloadTimeout) safely {
+                port.disconnect()
+                onDisconnected(generation, "保存中断，请重新连接戒指后继续")
             }
         }
     }
@@ -465,7 +589,9 @@ class RealCollectionController(
         downloadTimeout++
         val previous = downloader
         downloader = null
-        previous?.close()
+        val previousBackup = backupDownloader
+        backupDownloader = null; backupObservation = null; backupRecord = null
+        try { previous?.close() } finally { previousBackup?.close() }
     }
 
     fun close() {
@@ -483,7 +609,7 @@ class RealCollectionController(
     }
 
     /** Called on the serial owner executor before committing a UI-requested release. */
-    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && downloader == null &&
+    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && downloader == null && backupObservation == null &&
         coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
 
     private fun publish(page: CollectionPage, error: String? = null) {
@@ -493,17 +619,18 @@ class RealCollectionController(
         val visible = if (browsingHome) CollectionPage.HOME else page
         val idle = lastIdle
         val checkingDevice = pending == null && connected && (query != null || readinessWait != null)
-        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null
+        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && backupObservation == null
         state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
             hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
             placement = (pending?.preparation ?: profile)?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
-            busy = connecting || query != null || readinessWait != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
+            preservingExisting = backupObservation != null,
+            busy = connecting || query != null || readinessWait != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
-            canRetry = !connecting && query == null && readinessWait == null && downloader == null && !coordinator.state.settling,
+            canRetry = !connecting && query == null && readinessWait == null && downloader == null && backupObservation == null && !coordinator.state.settling,
             canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,

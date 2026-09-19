@@ -94,6 +94,58 @@ class FreeLivingSessionPackageTest {
         assertEquals(2, f.store.read()!!.transfer.attempts)
     }
 
+    @Test fun recoveryPackageVersionsOnlyTheNewEvidenceAndKeepsSuccessfulRepliesStrict() {
+        val evidence = ChargingRecoveryEvidence(statusErrorReason = 1, batteryChargeStatus = 0,
+            batteryReceivedAtMs = t - 100, statusReceivedAtMs = t, checkedAtMs = t,
+            statusConnectionGeneration = 1, batteryConnectionGeneration = 1)
+        val f = fixture(recoveryEvidence = evidence)
+        val frozen = f.packager.freeze(f.session)
+        val before = frozen.file.readBytes()
+        val m = manifest(frozen)
+        assertEquals(3, m["version"].asInt)
+        assertEquals(1, m["step_schema_version"].asInt)
+        assertEquals("daily_activity_v2", m["activity_schema"].asString)
+        assertEquals(-16, m.getAsJsonObject("start_baseline").getAsJsonObject("status")["error_code"].asInt)
+        val recovery = m.getAsJsonObject("start_baseline").getAsJsonObject("charging_recovery_evidence")
+        assertEquals(1, recovery["status_error_reason"].asInt)
+        assertEquals(0, recovery["battery_charge_status"].asInt)
+        assertEquals(t - 100, recovery["battery_received_at_ms"].asLong)
+        assertEquals(t, recovery["status_received_at_ms"].asLong)
+        assertEquals(t, recovery["checked_at_ms"].asLong)
+        assertEquals(1, recovery["status_connection_generation"].asInt)
+        assertEquals(1, recovery["battery_connection_generation"].asInt)
+        assertEquals(0, m.getAsJsonObject("start_status_evidence")["error_code"].asInt)
+        assertEquals(0, m.getAsJsonObject("stop_status_evidence")["error_code"].asInt)
+        assertFalse(m.has("start_attempt_archive"))
+        assertEquals(evidence, openStore(f.directory).read()!!.startBaseline!!.chargingRecoveryEvidence)
+        assertArrayEquals(before, packager(f.directory, openStore(f.directory)).freeze(f.session).file.readBytes())
+    }
+
+    @Test fun upgradingVersionFourJournalPreservesExistingFrozenPackageBytes() {
+        val f = fixture()
+        val journal = File(f.directory, "session.json")
+        val envelope = JsonParser.parseString(journal.readText()).asJsonObject
+        envelope.addProperty("journal_version", 4)
+        val payload = envelope.getAsJsonObject("session")
+        payload.getAsJsonObject("start_baseline").remove("charging_recovery_evidence")
+        val hashed = JsonObject().apply {
+            add("session", payload)
+            add("archived_sessions", envelope["archived_sessions"])
+        }
+        envelope.addProperty("sha256", sha(hashed.toString().toByteArray(Charsets.UTF_8)))
+        journal.writeText(envelope.toString())
+        val frozen = f.packager.freeze(f.session)
+        val before = frozen.file.readBytes()
+        val m = manifest(frozen)
+        assertEquals(2, m["version"].asInt)
+        assertFalse(m.getAsJsonObject("start_baseline").has("charging_recovery_evidence"))
+        assertFalse(m.has("start_attempt_archive"))
+        f.store.markTransferStarted(f.session.sessionId)
+        assertEquals(5, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
+        assertArrayEquals(before, packager(f.directory, openStore(f.directory)).freeze(f.session).file.readBytes())
+        assertEquals(m, manifest(f.packager.freeze(f.session)))
+    }
+
     @Test fun multipleRawFilesAndEvidenceShareOneReferenceAtTheRoot() {
         val f = fixture(rawCount = 2, withEvidence = true)
         val frozen = f.packager.freeze(f.session)
@@ -215,13 +267,15 @@ class FreeLivingSessionPackageTest {
 
     private fun fixture(reference: SessionReference = SessionReference(ReferenceStatus.VALID, 73, t + 3000),
         rawCount: Int = 1, withEvidence: Boolean = false, simulated: Boolean = false,
+        recoveryEvidence: ChargingRecoveryEvidence? = null,
         transform: (ByteArray) -> ByteArray = { it }): Fixture {
         val directory = temporary.newFolder()
         val store = openStore(directory)
         val payloads = (0 until rawCount).map { imu(it * 40L + 1000) }
         val record = HealthMessage.ListItem(7, payloads.sumOf { it.size }.toLong(), rawCount.toLong(), 900, t)
         val started = store.requestStart(preparation, t, "Asia/Shanghai",
-            DeviceStartBaseline(HealthMessage.Status(false, 0, 0, 0, 6), emptyList(), t))
+            DeviceStartBaseline(HealthMessage.Status(false, 0, 0, if (recoveryEvidence == null) 0 else -16, 6),
+                emptyList(), t, recoveryEvidence))
         val collecting = HealthMessage.Status(true, record.bytes, record.records, 0, 7)
         store.confirmStart(started.sessionId, preparation.ring!!.address, collecting, t + 1,
             recordEvidence = DeviceRecordEvidence(record, collecting, t + 1))

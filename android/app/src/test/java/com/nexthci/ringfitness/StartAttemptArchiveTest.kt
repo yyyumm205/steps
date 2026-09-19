@@ -147,6 +147,8 @@ class StartAttemptArchiveTest {
         envelope.addProperty("journal_version", 3)
         envelope.getAsJsonObject("session").remove("start_attempt_archive")
         envelope.getAsJsonArray("archived_sessions").forEach { it.asJsonObject.remove("start_attempt_archive") }
+        (listOf(envelope.getAsJsonObject("session")) + envelope.getAsJsonArray("archived_sessions").map { it.asJsonObject })
+            .forEach { it.get("start_baseline").takeUnless { value -> value.isJsonNull }?.asJsonObject?.remove("charging_recovery_evidence") }
         val data = JsonObject().apply {
             add("session", envelope.get("session")); add("archived_sessions", envelope.get("archived_sessions"))
         }
@@ -154,7 +156,7 @@ class StartAttemptArchiveTest {
         f.journal.writeText(envelope.toString())
         assertEquals(f.pending, f.open().readPending())
         f.archive()
-        assertEquals(4, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(5, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(manifest, f.open().manifestSnapshot(f.saved.sessionId))
     }
 

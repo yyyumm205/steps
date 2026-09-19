@@ -33,6 +33,26 @@ import org.junit.runner.RunWith
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
 
+    @Test fun preservingOldDeviceDataShowsOneWaitingTaskWithoutInventingReferenceSuccess() = withFlow {
+        launch().use { scenario ->
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME, isSimulation = false,
+                hasProfile = true, participantId = "preview001", placement = RingPlacement.RIGHT_INDEX,
+                preservingExisting = true, connected = true, busy = true))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("准备戒指", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertEquals("正在保存已有数据", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertFalse(tagged<Button>(activity, "flow_primary").isEnabled)
+            }
+            fixture.state = fixture.state.copy(preservingExisting = false, busy = false, canStart = true)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("开始这一段", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertTrue(tagged<Button>(activity, "flow_primary").isEnabled)
+            }
+        }
+    }
+
     @Test fun endStartAttemptRequiresAnExplicitReasonAndWaitsForTheOwnerResult() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)

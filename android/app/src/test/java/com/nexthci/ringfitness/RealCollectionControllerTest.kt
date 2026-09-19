@@ -24,6 +24,172 @@ class RealCollectionControllerTest {
     private fun collecting() = HealthMessage.Status(true, initialRecord.bytes, initialRecord.records, 0, 7)
     private fun stopped() = HealthMessage.Status(false, finalRecord.bytes, finalRecord.records, 0, 7)
 
+    @Test fun unknownIdleRecordIsBackedUpAutomaticallyWithoutCreatingResearchData() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            f.owner.initialize(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertTrue(f.owner.state.preservingExisting)
+            assertTrue(f.owner.state.busy)
+            assertFalse(f.owner.state.canStart)
+            assertFalse(f.owner.canReleaseIfIdle())
+            assertEquals(listOf(Read(7, 0, 16_384)), f.port.reads)
+            f.owner.start()
+            assertEquals(0, f.port.count("start"))
+            f.finishDownload()
+            f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            f.observe(stopped(), listOf(finalRecord))
+            assertTrue(f.owner.state.canStart)
+            assertFalse(f.owner.state.preservingExisting)
+            assertNull(f.store.read())
+            assertTrue(f.owner.state.records.isEmpty())
+            assertTrue(uploads.requests.isEmpty())
+            assertTrue(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertTrue(f.owner.state.canStart)
+            assertEquals(1, f.port.reads.size)
+            f.owner.start(); f.observe(stopped(), listOf(finalRecord))
+            val newRecord = initialRecord.copy(uptimeMs = 2000, unixMs = epoch + 60000)
+            f.observe(collecting(), listOf(newRecord))
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertEquals(1, f.port.count("start"))
+        }
+    }
+
+    @Test fun interruptedUnknownRecordBackupResumesOnlyItsVerifiedPrefixAfterReopen() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        assertFalse(f.owner.state.preservingExisting)
+        assertNull(f.store.read())
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(firstPacket.size.toLong(), f.port.reads.last().offset)
+        f.health(HealthMessage.DataChunk(firstPacket.size.toLong(), payload.copyOfRange(firstPacket.size, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord)); f.observe(stopped(), listOf(finalRecord))
+        assertTrue(f.owner.state.canStart)
+        assertTrue(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+        assertEquals(0, f.port.count("start"))
+    }
+
+    @Test fun changedRecordDuringBackupCannotBeMixedIntoAnotherWindow() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = epoch + 1)))
+        assertFalse(f.owner.state.canStart)
+        assertFalse(f.owner.state.preservingExisting)
+        assertEquals(1, f.port.reads.size)
+        assertFalse(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+        assertNull(f.store.read())
+        assertTrue(File(f.directory, "device-backups").walkTopDown().any { it.extension == "part" && it.length() > 0 })
+    }
+
+    @Test fun differentDeviceRecordsUseNewConnectionsAndRejectLateBytesFromThePreviousRecord() = Fixture().use { f ->
+        val second = finalRecord.copy(sessionId = 8, uptimeMs = 3000, unixMs = epoch + 1000)
+        val secondBytes = payload.copyOf().apply { this[lastIndex] = (this[lastIndex] + 1).toByte() }
+        val records = listOf(finalRecord, second)
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), records)
+        val firstGeneration = f.port.generation
+        f.finishDownload()
+        assertTrue(f.port.generation > firstGeneration)
+        f.owner.onConnected(f.port.generation); f.observe(stopped(), records)
+        assertEquals(8, f.port.reads.last().sessionId)
+        f.owner.onHealth(firstGeneration, SensorPacket.Health(HealthMessage.DataChunk(0, payload), ++f.clock.now))
+        f.owner.onHealth(firstGeneration, SensorPacket.Health(HealthMessage.ReadEnd(payload.size.toLong(), true), ++f.clock.now))
+        assertFalse(f.store.hasPreservedDeviceRecords(ring.address, listOf(second)))
+        f.health(HealthMessage.DataChunk(0, secondBytes))
+        f.health(HealthMessage.ReadEnd(secondBytes.size.toLong(), true))
+        f.owner.onConnected(f.port.generation); f.observe(stopped(), records)
+        assertTrue(f.owner.state.canStart)
+        assertEquals(2, f.port.reads.size)
+        assertTrue(f.store.hasPreservedDeviceRecords(ring.address, records))
+        val rawBytes = File(f.directory, "device-backups").walkTopDown().filter { it.extension == "rfbin" }
+            .map { it.readBytes().drop(HealthRawV2.HEADER_SIZE) }.toList()
+        assertTrue(rawBytes.contains(payload.toList())); assertTrue(rawBytes.contains(secondBytes.toList()))
+        assertNull(f.store.read())
+    }
+
+    @Test fun chargingRecoveryReadinessIsRecheckedOnStartAndCompletesTheNormalSavePath() = Fixture().use { f ->
+        f.owner.initialize()
+        f.owner.onConnected(f.port.generation)
+        f.observe(idle().copy(errorCode = -16), reason = 1)
+        assertFalse(f.owner.state.canStart)
+        assertEquals(1, f.port.count("battery"))
+        f.battery()
+        assertTrue(f.owner.state.canStart)
+        assertNull(f.store.read())
+        f.owner.start()
+        f.observe(idle().copy(errorCode = -16), reason = 1)
+        assertEquals(2, f.port.count("battery"))
+        assertEquals(0, f.port.count("start"))
+        f.battery()
+        assertEquals(1, f.port.count("start"))
+        assertEquals(-16, f.store.readPending()!!.startBaseline!!.status.errorCode)
+        f.observe(collecting(), listOf(initialRecord))
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        f.owner.stop()
+        f.observe(stopped(), listOf(finalRecord))
+        f.owner.saveReference("0", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.finishDownload()
+        val saved = f.store.read()!!
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(0L, saved.reference!!.steps)
+        assertEquals(3, f.store.manifestSnapshot(saved.sessionId).get("version").asInt)
+        assertEquals(1, f.port.count("start"))
+        f.reopen()
+        assertEquals(saved, f.store.read())
+    }
+
+    @Test fun chargingOrOldBatteryCannotUnlockReadinessAndNoCachedBatteryAuthorizesStart() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.battery() // Unsolicited/cached battery before the current STATUS round.
+        f.observe(idle().copy(errorCode = -16), reason = 1)
+        assertFalse(f.owner.state.canStart)
+        f.owner.onBattery(f.port.generation - 1, SensorPacket.Battery(4100, 100, 0, ++f.clock.now))
+        assertFalse(f.owner.state.canStart)
+        f.battery(1)
+        assertFalse(f.owner.state.canStart)
+        assertEquals("请将戒指取出充电盒后重试", f.owner.state.error)
+        assertEquals(0, f.port.count("start"))
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(idle().copy(errorCode = -16), reason = 1); f.battery()
+        assertTrue(f.owner.state.canStart)
+        f.owner.start()
+        f.observe(idle().copy(errorCode = -16), reason = 1); f.battery(1)
+        assertEquals(0, f.port.count("start")); assertNull(f.store.read())
+    }
+
+    @Test fun changedStatusReasonDuringListCannotUnlockStart() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.owner.onHealth(f.port.generation, SensorPacket.Health(idle().copy(errorCode = -16), ++f.clock.now, 1))
+        f.owner.onHealth(f.port.generation, SensorPacket.Health(idle().copy(errorCode = -16), ++f.clock.now, 2))
+        f.health(HealthMessage.ListEnd(0)); f.battery()
+        assertFalse(f.owner.state.canStart); assertNull(f.store.read())
+        assertEquals(0, f.port.count("start"))
+    }
+
+    @Test fun batteryNotificationsDoNotReplaceAnActiveDownloadPage() = Fixture().use { f ->
+        f.reachReference(); f.owner.saveReference("17", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+        for (charge in listOf(null, 1, 2)) {
+            f.battery(charge)
+            assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+        }
+        f.finishDownload()
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+    }
+
     @Test fun aCompleteInspectionIsRequiredBeforeStartAndStartRequiresDeviceConfirmation() = Fixture().use { f ->
         f.owner.initialize()
         assertTrue(f.owner.state.connecting)
@@ -662,6 +828,11 @@ class RealCollectionControllerTest {
         f.owner.onConnected(f.port.generation)
         assertEquals(4, f.port.count("status"))
         f.observe(stopped(), listOf(finalRecord))
+        // This legacy fixture has no durable device fingerprint; preserve the unassigned record first.
+        assertTrue(f.owner.state.preservingExisting)
+        f.finishDownload()
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord)); f.observe(stopped(), listOf(finalRecord))
         assertTrue(f.owner.state.canStart)
         assertEquals(saved, f.store.read())
         assertArrayEquals(before, File(f.directory, "session.json").readBytes())
@@ -764,7 +935,8 @@ class RealCollectionControllerTest {
                         failDownloadSyncAfterLocalCommit = false
                         throw IOException("注入已保存后的清理同步失败")
                     }
-                }) }, uploads = uploads)
+                }) }, uploads = uploads,
+            backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}))
 
         fun seedLocal(simulated: Boolean = false): FreeLivingSession {
             val session = store.requestStart(preparation.read()!!, ++clock.now, "Asia/Shanghai")
@@ -812,11 +984,13 @@ class RealCollectionControllerTest {
             assertEquals("errors=$errors", CollectionPage.REFERENCE, owner.state.page)
         }
 
-        fun observe(status: HealthMessage.Status, records: List<HealthMessage.ListItem> = emptyList()) {
-            health(status)
+        fun observe(status: HealthMessage.Status, records: List<HealthMessage.ListItem> = emptyList(), reason: Int? = null) {
+            owner.onHealth(port.generation, SensorPacket.Health(status, ++clock.now, reason))
             records.forEach(::health)
             health(HealthMessage.ListEnd(records.size))
         }
+
+        fun battery(charge: Int? = 0) = owner.onBattery(port.generation, SensorPacket.Battery(4100, 100, charge, ++clock.now))
 
         fun observeUnconfirmedStart(status: HealthMessage.Status, records: List<HealthMessage.ListItem> = emptyList()) {
             repeat(3) { attempt ->
@@ -866,6 +1040,7 @@ class RealCollectionControllerTest {
         }
         override fun disconnect() { calls += "disconnect" }
         override fun queryStatus() = send("status")
+        override fun queryBattery() = send("battery")
         override fun queryRecords() = send("list")
         override fun start() = send("start")
         override fun stop() = send("stop")
