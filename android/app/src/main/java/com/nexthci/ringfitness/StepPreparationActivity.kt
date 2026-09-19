@@ -10,8 +10,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
-import android.content.res.ColorStateList
-import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -22,7 +20,6 @@ import android.provider.Settings
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -45,6 +42,7 @@ class StepPreparationActivity : Activity() {
         val waiting: Boolean = false,
     )
     private val main = Handler(Looper.getMainLooper())
+    private val ui by lazy { QuietUi(this) }
     private lateinit var store: PreparationStore
     private lateinit var controller: RingPreparationController
     private var snapshot: PreparationSnapshot? = null
@@ -97,6 +95,7 @@ class StepPreparationActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setDecorFitsSystemWindows(false)
         store = PreparationStore(File(filesDir, "preparation/profile.properties"))
         restoredPage = savedInstanceState?.getString("page")?.let { runCatching { Page.valueOf(it) }.getOrNull() }
         placementDraft = savedInstanceState?.getInt("placement_draft") ?: 0
@@ -164,7 +163,7 @@ class StepPreparationActivity : Activity() {
     private fun buildPages(draft: String) {
         val frame = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.rgb(247, 249, 248))
+            setBackgroundColor(ui.background)
             setOnApplyWindowInsetsListener { view, insets ->
                 val bars = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.ime())
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
@@ -173,25 +172,28 @@ class StepPreparationActivity : Activity() {
         }
         setContentView(frame)
         val header = section(frame, 20)
-        back = button(header, "返回", false) { goBack() }.apply { tag = "back" }
+        back = link(header, "返回") { goBack() }.apply {
+            tag = "back"
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+        }
         val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
         header.addView(titleRow, LinearLayout.LayoutParams(-1, -2))
-        heading = label(titleRow, "步数采集", 25f).apply {
+        heading = label(titleRow, "步数采集", 28f).apply {
             tag = "heading"; setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
-        details = button(titleRow, if (BuildConfig.DEBUG) "更多" else "设备详情", false) {
+        details = link(titleRow, if (BuildConfig.DEBUG) "更多" else "设备详情") {
             if (BuildConfig.DEBUG) showMore() else showDetails()
         }.apply {
-            tag = "details"; textSize = 13f
+            tag = "details"; textSize = 14f
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
-        subtitle = label(header, "", 14f)
+        subtitle = label(header, "", 14f).apply { setTextColor(ui.secondary) }
         scroll = ScrollView(this).apply { isFillViewport = true }
         frame.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), dp(12)) }
         scroll.addView(body)
-        registration = section(body)
+        registration = ui.card(body)
         label(registration, "被试编号", 16f)
         participantInput = EditText(this).apply {
             tag = "participant_input"
@@ -199,13 +201,13 @@ class StepPreparationActivity : Activity() {
             setSingleLine(true)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setText(draft)
+            ui.styleInput(this)
         }
-        registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2))
+        registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         label(registration, "戒指佩戴位置", 16f).setPadding(0, dp(24), 0, dp(4))
         placementPicker = Spinner(this).apply {
             tag = "placement_picker"
-            adapter = ArrayAdapter(this@StepPreparationActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("请选择") + RingPlacement.entries.map { it.displayName })
+            adapter = ui.placementAdapter(listOf("请选择") + RingPlacement.entries.map { it.displayName })
             setSelection(placementDraft)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onNothingSelected(parent: AdapterView<*>?) = Unit
@@ -215,21 +217,25 @@ class StepPreparationActivity : Activity() {
                 }
             }
         }
-        registration.addView(placementPicker, LinearLayout.LayoutParams(-1, dp(64)))
+        placementPicker.minimumHeight = dp(56)
+        registration.addView(placementPicker, LinearLayout.LayoutParams(-1, -2))
         overview = section(body)
-        participantLabel = label(overview, "", 15f).apply { tag = "participant_summary" }
-        editPlacement = button(overview, "", false) { showPlacementPicker() }.apply { tag = "edit_placement"; textSize = 15f }
-        homeStatus = label(overview, "", 24f).apply {
+        val profileCard = ui.card(overview)
+        participantLabel = label(profileCard, "", 16f).apply { tag = "participant_summary" }
+        editPlacement = link(profileCard, "") { showPlacementPicker() }.apply { tag = "edit_placement" }
+        val connectionCard = ui.card(overview, ui.statusSurface)
+        homeStatus = label(connectionCard, "", 28f).apply {
             tag = "device_status"; setTypeface(null, Typeface.BOLD)
-            setPadding(0, dp(36), 0, dp(8))
+            setPadding(0, 0, 0, dp(8))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
-        homeExplanation = label(overview, "", 15f)
-        cancelConnection = button(overview, "取消连接", false) {
+        homeExplanation = label(connectionCard, "", 16f)
+        cancelConnection = link(connectionCard, "取消连接") {
             controller.disconnect("已取消连接")
-        }.apply { tag = "connection_cancel" }
+        }.apply { tag = "connection_cancel"; setTextColor(ui.ink) }
         devices = section(body)
-        scanStatus = label(devices, "", 16f)
+        val scanCard = ui.card(devices)
+        scanStatus = label(scanCard, "", 16f)
         results = section(devices)
         val footer = section(frame, 20)
         message = label(footer, "", 14f).apply { tag = "feedback"; accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
@@ -560,25 +566,18 @@ class StepPreparationActivity : Activity() {
         setPadding(dp(padding), dp(if (padding > 0) 8 else 0), dp(padding), dp(if (padding > 0) 8 else 0))
         parent.addView(this, LinearLayout.LayoutParams(-1, -2))
     }
-    private fun label(parent: LinearLayout, value: String, size: Float) = TextView(this).apply {
-        text = value; textSize = size; setTextColor(Color.rgb(30, 49, 45)); setPadding(0, dp(4), 0, dp(4))
-        parent.addView(this, LinearLayout.LayoutParams(-1, -2))
+    private fun label(parent: LinearLayout, value: String, size: Float) = ui.text(parent, value, size).apply {
+        setPadding(0, dp(4), 0, dp(4))
     }
-    private fun button(parent: LinearLayout, value: String, prominent: Boolean, action: () -> Unit) = Button(this).apply {
-        text = value; textSize = 16f; isAllCaps = false; minHeight = dp(48)
-        if (prominent) {
-            backgroundTintList = ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
-                intArrayOf(Color.rgb(210, 218, 214), Color.rgb(26, 92, 73)))
-            setTextColor(Color.WHITE)
-        } else {
-            backgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
-            setTextColor(Color.rgb(26, 75, 61))
-            gravity = android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
-            elevation = 0f
-            stateListAnimator = null
-        }
-        setOnClickListener { action() }
-        parent.addView(this, LinearLayout.LayoutParams(-1, -2))
+    private fun button(parent: LinearLayout, value: String, prominent: Boolean, action: () -> Unit) =
+        ui.button(parent, value, primary = prominent, action = action)
+    private fun link(parent: LinearLayout, value: String, action: () -> Unit) = ui.button(parent, value, action = action).apply {
+        background = ui.linkBackground()
+        minHeight = dp(48)
+        minimumHeight = dp(48)
+        gravity = android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
+        setPadding(0, dp(12), 0, dp(12))
+        (layoutParams as LinearLayout.LayoutParams).topMargin = 0
     }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     companion object { private val disk = Executors.newSingleThreadExecutor() }

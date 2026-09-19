@@ -1,12 +1,14 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.6.6-t2p（versionCode 32）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
+当前开发版：**步数采集 0.6.7-t2p（versionCode 33）**，应用 ID 为 `com.nexthci.ringfitness.steps`。基于原版 0.5.3 继续开发，规格见 [独立采集规格](../specs/independent-step-collection/requirements.md)。
 
 正式设备入口继续提供采集准备：离线登记编号、记住六种戒指佩戴位置、选择和连接戒指、查询电量/固件/采集状态。重新打开后保留准备信息，连接状态重新核对。发现正在采集或已有设备记录时提示研究者处理。真实开始采集仍待接入，现有真机证据覆盖准备功能。
 
 T2-P提供同一原生App中的完整流程演示。Debug版本从准备页右上角“更多 → 流程演示（模拟）”进入，填写独立体验编号和佩戴位置，即可操作开始、结束、填写步数、本地保存和模拟传输。准备页主要操作保持连接戒指；开发演示为菜单中的独立入口。日常重新打开时，已完成任务显示在首页，未完成任务优先恢复；“演示选项”提供确认超时、保存失败、下载失败、上传失败和断连等受控场景。
 
 0.6.6按任务进度显示首页标题与操作，例如“待填写步数 → 填写步数”；返回首页保持后台任务，查看进度恢复原任务页面。采集中显示带日期的开始时间，沿用该段记录的时区。填数页保留必要字段与稳定读数提示，有效0继续正常保存。对应验证见E16，前版完整流程证据仍保留于E15。
+
+0.6.7统一既有全流程页面和系统控件主题：灰色背景、米白卡片、鼠尾草绿状态区域、深青主操作与深蓝文字。配色、对比度和交互尺寸统一维护于[最小视觉约定](../specs/independent-step-collection/requirements.md#完整流程与最小视觉约定2026-09-19)。本轮覆盖登记、连接、首页、采集、填数、传输及恢复页面，并保留清楚的模拟标记；存储、导航和设备逻辑沿用现有实现。构建、页面复测与未覆盖项统一记入E17，真实本地采集闭环仍为下一项工作。
 
 演示复用原生页面、采集请求协调器和持久化账本；参考数字实际落盘，文件实际校验，退出或重开可恢复同一记录。设备状态、信号文件及上传回执由测试替身生成，全程显示模拟标记。演示入口仅存在于Debug构建，Activity不向其他应用导出；数据位于应用私有的`files/collection-demo/`，与正式准备信息和实验记录隔离。演示不发真实BLE命令、不访问云盘，也不生成可供实验分析的`.rfbin`；真实采集边界保持未知。
 
@@ -40,7 +42,7 @@ adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.P
 
 以上权限命令适用于API31模拟器；缺少蓝牙条件时，相关用例会明确跳过。测试期间避免同时操作App。测试使用合成档案与可控设备回复检查保存、恢复、等待及重试，真实BLE另用手机和戒指验证。手动复核首次登记后自动搜索、选择后首页状态及强停重开；写失败用可控夹具验证，操作结果同时核对持久档案。具体数量、失败和未覆盖项统一记录在validation。
 
-完整流程的8项原生页面测试使用独立缓存目录，显式启用后执行；测试替身无需实体戒指或网络，不覆盖默认演示档案：
+完整流程的原生页面测试使用独立缓存目录，显式启用后执行；测试替身无需实体戒指或网络，不覆盖默认演示档案：
 
 ```powershell
 adb -s $emulatorSerial shell am instrument -w -e class com.nexthci.ringfitness.CollectionFlowInstrumentedTest -e verifyCollectionFlow true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner

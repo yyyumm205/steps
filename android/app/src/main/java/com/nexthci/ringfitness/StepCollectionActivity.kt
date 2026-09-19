@@ -10,11 +10,9 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -51,6 +49,7 @@ abstract class StepCollectionActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.setDecorFitsSystemWindows(false)
         ui = QuietUi(this)
         flow = provideFlow()
         stepsDraft = savedInstanceState?.getString("steps").orEmpty()
@@ -136,19 +135,19 @@ abstract class StepCollectionActivity : Activity() {
         val returnButton = ui.button(row, if (state.page == CollectionPage.HOME) "退出演示" else "首页", tag = "flow_back") { back() }
         returnButton.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         returnButton.minHeight = ui.dp(48); returnButton.minimumHeight = ui.dp(48)
-        returnButton.background = ui.shape(ui.background)
+        returnButton.background = ui.linkBackground()
         returnButton.gravity = Gravity.START or Gravity.CENTER_VERTICAL
         if (state.isSimulation) {
             val options = ui.button(row, "演示选项", tag = "flow_options") { showOptions() }
             options.layoutParams = LinearLayout.LayoutParams(-2, -2)
             options.minHeight = ui.dp(48); options.minimumHeight = ui.dp(48)
-            options.background = ui.shape(ui.background)
+            options.background = ui.linkBackground()
         }
         if (state.isSimulation) {
             ui.text(header, "流程演示 · 设备与传输为模拟", 13f).apply {
                 tag = "demo_marker"
-                background = ui.shape(ui.softPurple, 12)
-                setTextColor(ui.purpleInk)
+                background = ui.shape(ui.ink, 12)
+                setTextColor(ui.surface)
                 setPadding(ui.dp(12), ui.dp(9), ui.dp(12), ui.dp(9))
             }
         }
@@ -185,7 +184,6 @@ abstract class StepCollectionActivity : Activity() {
     private fun action(footer: LinearLayout, text: String, enabled: Boolean = true, block: () -> Unit): Button =
         ui.button(footer, text, primary = true, tag = "flow_primary", action = block).apply {
             isEnabled = enabled
-            alpha = if (enabled) 1f else 0.5f
         }
 
     private fun registration(body: LinearLayout, footer: LinearLayout) {
@@ -199,10 +197,10 @@ abstract class StepCollectionActivity : Activity() {
         ui.gap(card, 10)
         placementPicker = Spinner(this).apply {
             tag = "flow_placement"
-            adapter = ArrayAdapter(this@StepCollectionActivity, android.R.layout.simple_spinner_dropdown_item,
-                listOf("请选择") + RingPlacement.entries.map { it.displayName })
+            adapter = ui.placementAdapter(listOf("请选择") + RingPlacement.entries.map { it.displayName })
             setSelection(placementDraft)
-            card.addView(this, LinearLayout.LayoutParams(-1, ui.dp(56)))
+            minimumHeight = ui.dp(56)
+            card.addView(this, LinearLayout.LayoutParams(-1, -2))
         }
         action(footer, "保存并继续") {
             rememberDrafts()
@@ -217,9 +215,9 @@ abstract class StepCollectionActivity : Activity() {
     private fun home(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val task = homeTask(state)
         title(body, task.title)
-        val ready = ui.card(body, ui.softGreen)
+        val ready = ui.card(body, if (state.canStart) ui.statusSurface else ui.surface)
         ui.text(ready, task.status, 24f, bold = true).tag = "home_task_status"
-        task.hint?.let { ui.gap(ready, 12); ui.text(ready, it, muted = true) }
+        task.hint?.let { ui.gap(ready, 12); ui.text(ready, it) }
         val profile = ui.card(body)
         detail(profile, "被试编号", state.participantId)
         ui.gap(profile, 18)
@@ -288,12 +286,16 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun collecting(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         title(body, "正在采集")
-        val card = ui.card(body, ui.softGreen)
-        ui.text(card, "本次记录时长", 14f, muted = true)
+        val card = ui.card(body, ui.statusSurface)
+        ui.text(card, "本次记录时长", 14f)
         ui.gap(card, 18)
-        elapsedLabel = ui.text(card, "00:00:00", 44f, bold = true).apply { tag = "flow_elapsed" }
+        elapsedLabel = ui.text(card, "00:00:00", 44f, bold = true).apply {
+            tag = "flow_elapsed"
+            maxLines = 1
+            setAutoSizeTextTypeUniformWithConfiguration(24, 44, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+        }
         ui.gap(card, 24)
-        ui.text(card, "开始时间", 14f, muted = true)
+        ui.text(card, "开始时间", 14f)
         ui.gap(card, 8)
         ui.text(card, startDateTime(state.session), 18f, bold = true).tag = "flow_started_at"
         val device = ui.card(body)
@@ -317,7 +319,7 @@ abstract class StepCollectionActivity : Activity() {
             else -> "正在把本次读数保存在手机。"
         })
         val card = ui.card(body)
-        card.addView(ProgressBar(this), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply { gravity = Gravity.CENTER })
+        card.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply { gravity = Gravity.CENTER })
         action(footer, "$heading…", false) {}
     }
 
@@ -355,10 +357,10 @@ abstract class StepCollectionActivity : Activity() {
         val complete = state.page == CollectionPage.COMPLETE
         title(body, if (complete) "这一段已保存" else "正在整理记录",
             if (complete) "本次记录已经保存在手机。" else "步数已保存，请稍等片刻。")
-        val summary = ui.card(body, ui.softGreen)
+        val summary = ui.card(body, ui.statusSurface)
         ui.text(summary, state.savedSteps?.let { "$it 步" } ?: "未提供读数", 36f, bold = true).tag = "saved_reference"
         ui.gap(summary, 14)
-        ui.text(summary, if (state.referenceStatus == "unreliable") "已附上异常说明" else "本次计步器读数", 14f, muted = true)
+        ui.text(summary, if (state.referenceStatus == "unreliable") "已附上异常说明" else "本次计步器读数", 14f)
         val progress = ui.card(body)
         detail(progress, "计步器读数", "已保存")
         ui.gap(progress, 20)
@@ -369,7 +371,7 @@ abstract class StepCollectionActivity : Activity() {
             CollectionPage.UPLOADING -> "正在上传…"
             else -> "等待下载完成"
         })
-        if (!complete) progress.addView(ProgressBar(this), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
+        if (!complete) progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
             topMargin = ui.dp(20); gravity = Gravity.CENTER
         })
         action(footer, "返回首页") { flow.home() }

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RingFitness" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/quiet_accent</item>
+        <item name="android:colorControlActivated">@color/quiet_accent</item>
+        <item name="android:colorControlNormal">@color/quiet_accent</item>
+        <item name="android:colorControlHighlight">@color/quiet_ripple</item>
+        <item name="android:colorBackground">@color/quiet_surface</item>
+        <item name="android:colorBackgroundFloating">@color/quiet_surface</item>
+        <item name="android:windowBackground">@color/quiet_background</item>
+        <item name="android:textColorPrimary">@color/quiet_ink</item>
+        <item name="android:textColorSecondary">@color/quiet_secondary</item>
+        <item name="android:textColorHint">@color/quiet_secondary</item>
+        <item name="android:textColorLink">@color/quiet_accent</item>
+        <item name="android:statusBarColor">@color/quiet_background</item>
+        <item name="android:navigationBarColor">@color/quiet_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+        <item name="android:alertDialogTheme">@style/Theme.RingFitness.Dialog</item>
+        <item name="android:popupMenuStyle">@style/Widget.RingFitness.PopupMenu</item>
+    </style>
+    <style name="Theme.RingFitness.Dialog" parent="android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:colorAccent">@color/quiet_accent</item>
+        <item name="android:colorControlActivated">@color/quiet_accent</item>
+        <item name="android:colorControlNormal">@color/quiet_accent</item>
+        <item name="android:colorBackground">@color/quiet_surface</item>
+        <item name="android:colorBackgroundFloating">@color/quiet_surface</item>
+        <item name="android:textColorPrimary">@color/quiet_ink</item>
+        <item name="android:textColorSecondary">@color/quiet_secondary</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="Widget.RingFitness.PopupMenu" parent="android:style/Widget.Material.Light.PopupMenu">
+        <item name="android:popupBackground">@drawable/quiet_popup</item>
+    </style>
+</resources>

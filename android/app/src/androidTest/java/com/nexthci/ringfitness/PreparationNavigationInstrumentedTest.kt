@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.AlertDialog
 import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.SystemClock
 import android.view.View
@@ -51,6 +52,7 @@ class PreparationNavigationInstrumentedTest {
         launch().use { scenario ->
             awaitHeading(scenario, "填写准备信息")
             assertMinimalDebugActions(scenario)
+            captureReviewScreen(scenario, "registration")
             replaceStore(scenario, countingStore(profile, commits))
             typeParticipant(scenario, "NAV001")
             scenario.onActivity { activity ->
@@ -61,6 +63,7 @@ class PreparationNavigationInstrumentedTest {
             assertFalse("Drafts must not create a partial profile", profile.exists())
             click(scenario, "primary")
             awaitHeading(scenario, "选择戒指")
+            captureReviewScreen(scenario, "search")
             val prepared = requireNotNull(PreparationStore(profile).read())
             assertEquals("nav001", prepared.participantId)
             assertEquals(RingPlacement.RIGHT_RING, prepared.placement)
@@ -74,6 +77,7 @@ class PreparationNavigationInstrumentedTest {
                 assertFalse(tagged<Button>(activity, "back").isShown)
             }
             assertNoEnabledCaptureOrLegacyEntry(scenario)
+            captureReviewScreen(scenario, "home")
         }
         val original = profile.readBytes()
         launch().use { reopened ->
@@ -97,6 +101,7 @@ class PreparationNavigationInstrumentedTest {
                     tagged<Button>(activity, "primary").isEnabled
             }
             awaitHeading(scenario, "填写准备信息")
+            captureReviewScreen(scenario, "invalid_registration")
             scenario.onActivity { activity ->
                 assertEquals("!", tagged<EditText>(activity, "participant_input").text.toString())
                 assertEquals(RingPlacement.RIGHT_RING.ordinal + 1,
@@ -117,6 +122,7 @@ class PreparationNavigationInstrumentedTest {
             replaceStore(scenario, countingStore(profile, commits))
             click(scenario, "edit_placement")
             awaitDialog(scenario)
+            captureReviewScreen(scenario, "placement")
             scenario.onActivity { activity ->
                 val dialog = requireNotNull(placementDialog(activity))
                 assertEquals(RingPlacement.RIGHT_RING.ordinal, dialog.listView.checkedItemPosition)
@@ -184,6 +190,7 @@ class PreparationNavigationInstrumentedTest {
             }
             awaitHeading(scenario, "填写准备信息")
             assertFalse(profile.exists())
+            captureReviewScreen(scenario, "save_failure")
             scenario.onActivity { activity ->
                 assertEquals("NAVRETRY", tagged<EditText>(activity, "participant_input").text.toString())
                 assertEquals(RingPlacement.LEFT_RING.ordinal + 1,
@@ -218,6 +225,7 @@ class PreparationNavigationInstrumentedTest {
                 assertTrue(descendants(requireNotNull(dialog.window).decorView).filterIsInstance<TextView>()
                     .any { it.isShown && it.text.toString() == "保存失败，请重新选择" })
             }
+            captureReviewScreen(scenario, "placement_retry")
             replaceStore(scenario, PreparationStore(profile))
             chooseDialogPlacement(scenario, RingPlacement.LEFT_RING)
             awaitDialogClosed(scenario)
@@ -356,6 +364,7 @@ class PreparationNavigationInstrumentedTest {
             }
             assertArrayEquals(original, profile.readBytes())
             assertNoEnabledCaptureOrLegacyEntry(scenario)
+            captureReviewScreen(scenario, "ready")
         }
     }
 
@@ -470,6 +479,7 @@ class PreparationNavigationInstrumentedTest {
                     explanation.textSize < status.textSize)
             }
             assertVisibleText(scenario, "采集准备")
+            captureReviewScreen(scenario, "device_records")
             assertArrayEquals(original, profile.readBytes())
             assertNoEnabledCaptureOrLegacyEntry(scenario)
             assertEquals(listOf("battery", "info", "status"), transport.queries)
@@ -524,6 +534,29 @@ class PreparationNavigationInstrumentedTest {
             check(File(backup, "recovery.txt").delete())
             check(backup.delete())
         }
+    }
+
+    private fun captureReviewScreen(scenario: ActivityScenario<StepPreparationActivity>, page: String) {
+        if (InstrumentationRegistry.getArguments().getString("captureFlowScreens") != "true") return
+        require(page.matches(Regex("[a-z_]+")))
+        // Screenshots should show the settled page, including the soft-keyboard transition.
+        SystemClock.sleep(800)
+        val frameDrawn = CountDownLatch(1)
+        scenario.onActivity { activity ->
+            val root = placementDialog(activity)?.takeIf { it.isShowing }?.window?.decorView
+                ?: activity.window.decorView
+            root.viewTreeObserver.registerFrameCommitCallback { frameDrawn.countDown() }
+            root.invalidate()
+        }
+        assertTrue("The review page must be drawn before its screenshot", frameDrawn.await(5, TimeUnit.SECONDS))
+        instrumentation.waitForIdleSync()
+        val screenshot = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+        try {
+            FileOutputStream(File(instrumentation.targetContext.cacheDir, "prep-review-$page.png")).use {
+                assertTrue(screenshot.compress(Bitmap.CompressFormat.PNG, 100, it))
+                it.fd.sync()
+            }
+        } finally { screenshot.recycle() }
     }
 
     private fun writeDurably(file: File, bytes: ByteArray) {

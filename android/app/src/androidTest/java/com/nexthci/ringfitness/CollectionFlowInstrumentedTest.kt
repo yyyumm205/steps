@@ -34,12 +34,15 @@ class CollectionFlowInstrumentedTest {
 
     @Test fun complete562PathSavesRealFilesAndReceiptThenReopensTheSameResult() = withFlow { handle ->
         launch().use { scenario ->
+            awaitHeading(scenario, "准备开始")
+            captureReviewScreen(scenario, "registration")
             register(scenario)
             captureReviewScreen(scenario, "home")
             val id = reachReference(scenario, handle, capture = true)
             type(scenario, "flow_steps", "562")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
+            captureReviewScreen(scenario, "complete")
             scenario.onActivity { activity ->
                 assertEquals("562 步", tagged<TextView>(activity, "saved_reference").text.toString())
                 assertTrue(tagged<TextView>(activity, "demo_marker").isShown)
@@ -67,6 +70,7 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "开始这一段")
             scenario.onActivity { assertEquals("开始采集", tagged<Button>(it, "flow_primary").text.toString()) }
+            captureReviewScreen(scenario, "history")
         }
     }
 
@@ -96,6 +100,7 @@ class CollectionFlowInstrumentedTest {
                 chooseReferenceKind(scenario, kind)
                 if (kind == "unreliable") type(scenario, "flow_steps", "562")
                 type(scenario, "flow_reason", if (kind == "missing") "计步器意外清零" else "忘记清零")
+                captureReviewScreen(scenario, "reference_$kind")
                 click(scenario, "flow_primary")
                 awaitHeading(scenario, "这一段已保存")
                 val saved = session(handle)
@@ -131,6 +136,7 @@ class CollectionFlowInstrumentedTest {
                     taggedOrNull<EditText>(activity, "flow_steps") != null
             }
             scenario.onActivity { assertEquals("562", tagged<EditText>(it, "flow_steps").text.toString()) }
+            captureReviewScreen(scenario, "save_failure")
             assertEquals(id, session(handle).sessionId)
             assertNull(session(handle).reference)
             assertNull(session(handle).localData)
@@ -192,6 +198,7 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_back")
             awaitHeading(scenario, "待填写步数")
             scenario.onActivity { assertEquals("填写步数", tagged<Button>(it, "flow_primary").text.toString()) }
+            captureReviewScreen(scenario, "reference_pending_home")
         }
         launch().use { reopened ->
             awaitHeading(reopened, "待填写步数")
@@ -217,8 +224,10 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一步未完成")
             assertEquals(SessionTransferStatus.FAILED, session(handle).transfer.status)
+            captureReviewScreen(scenario, "upload_failure")
             click(scenario, "flow_back")
             awaitHeading(scenario, "开始这一段")
+            captureReviewScreen(scenario, "upload_retry_home")
             val second = reachReference(scenario, handle)
             assertNotEquals(first, second)
             lateinit var originalInput: EditText
@@ -256,6 +265,7 @@ class CollectionFlowInstrumentedTest {
             val original = session(handle)
             handle.flow.disconnect()
             awaitHeading(scenario, "还需要确认一下")
+            captureReviewScreen(scenario, "disconnected")
             assertEquals(original, session(handle))
             click(scenario, "flow_back")
             awaitHeading(scenario, "本次采集")
@@ -263,6 +273,7 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("戒指连接中断", tagged<TextView>(it, "home_task_status").text.toString())
                 assertEquals("重新连接", tagged<Button>(it, "flow_primary").text.toString())
             }
+            captureReviewScreen(scenario, "reconnect_home")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "正在采集")
             scenario.onActivity { assertTrue(tagged<Button>(it, "flow_primary").isEnabled) }
@@ -285,6 +296,7 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("正在采集", tagged<TextView>(it, "home_task_status").text.toString())
                 assertEquals("查看采集", tagged<Button>(it, "flow_primary").text.toString())
             }
+            captureReviewScreen(scenario, "collecting_home")
             assertEquals(original, session(handle))
             assertNull(session(handle).stopRequestedAtMs)
             scenario.recreate()
@@ -317,6 +329,7 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("重试下载", tagged<Button>(it, "flow_primary").text.toString())
                 assertTrue(tagged<Button>(it, "flow_primary").isEnabled)
             }
+            captureReviewScreen(scenario, "download_retry_home")
             val saved = session(handle)
             assertEquals(id, saved.sessionId)
             assertEquals(562L, saved.reference!!.steps)
@@ -376,6 +389,7 @@ class CollectionFlowInstrumentedTest {
             awaitHeading(scenario, "还需要确认一下")
             assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, session(handle).phase)
             assertNull(session(handle).stopConfirmedAtMs)
+            captureReviewScreen(scenario, "stop_unconfirmed")
             click(scenario, "preserve_reference")
             awaitHeading(scenario, "本次走了多少步？")
             click(scenario, "flow_back")
@@ -384,6 +398,7 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("结束状态待确认", tagged<TextView>(it, "home_task_status").text.toString())
                 assertEquals("先填写步数", tagged<Button>(it, "flow_primary").text.toString())
             }
+            captureReviewScreen(scenario, "stop_unconfirmed_home")
             val beforeReturn = session(handle)
             assertNull(beforeReturn.stopConfirmedAtMs)
             assertFalse(handle.flow.state.canStart)
@@ -446,16 +461,46 @@ class CollectionFlowInstrumentedTest {
         click(scenario, "flow_primary")
         awaitHeading(scenario, "本次走了多少步？")
         if (capture) captureReviewScreen(scenario, "reference")
+        if (capture && InstrumentationRegistry.getArguments().getString("captureFlowScreens") == "true") {
+            scenario.onActivity { activity ->
+                val input = tagged<EditText>(activity, "flow_steps")
+                input.requestFocus()
+                activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                    .showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+            }
+            await(scenario, "reference keyboard visible") {
+                it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+            }
+            captureReviewScreen(scenario, "reference_keyboard")
+            scenario.onActivity { activity ->
+                val root = activity.window.decorView
+                val ime = root.rootWindowInsets.getInsets(android.view.WindowInsets.Type.ime()).bottom
+                val button = tagged<Button>(activity, "flow_primary")
+                val visible = android.graphics.Rect()
+                assertTrue("The save action remains visible above the keyboard", button.getGlobalVisibleRect(visible))
+                assertEquals(button.height, visible.height())
+                assertTrue(visible.bottom <= root.height - ime)
+                activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                    .hideSoftInputFromWindow(button.windowToken, 0)
+            }
+            await(scenario, "reference keyboard hidden") {
+                !it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+            }
+        }
         assertEquals(id, session(handle).sessionId)
         return id
     }
 
     private fun captureReviewScreen(scenario: ActivityScenario<DemoCollectionActivity>, page: String) {
         if (InstrumentationRegistry.getArguments().getString("captureFlowScreens") != "true") return
-        require(page in setOf("home", "collecting", "reference"))
+        require(page.matches(Regex("[a-z_]+")))
+        // Let dialog dimming and IME transitions settle before committing the review frame.
+        SystemClock.sleep(800)
         val frameDrawn = CountDownLatch(1)
         scenario.onActivity { activity ->
-            val root = activity.window.decorView
+            val dialog = StepCollectionActivity::class.java.getDeclaredField("dialog").apply { isAccessible = true }
+                .get(activity) as AlertDialog?
+            val root = dialog?.takeIf { it.isShowing }?.window?.decorView ?: activity.window.decorView
             root.viewTreeObserver.registerFrameCommitCallback { frameDrawn.countDown() }
             root.invalidate()
         }
@@ -472,6 +517,7 @@ class CollectionFlowInstrumentedTest {
 
     private fun chooseReferenceKind(scenario: ActivityScenario<DemoCollectionActivity>, kind: String) {
         click(scenario, "reference_options")
+        captureReviewScreen(scenario, "reference_options")
         scenario.onActivity { activity ->
             val dialog = StepCollectionActivity::class.java.getDeclaredField("dialog").apply { isAccessible = true }
                 .get(activity) as AlertDialog

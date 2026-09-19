@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="quiet_background">#EAE7E7</color>
+    <color name="quiet_surface">#F9F8EB</color>
+    <color name="quiet_status">#76B39D</color>
+    <color name="quiet_accent">#155E63</color>
+    <color name="quiet_ink">#132238</color>
+    <!-- Neutral tones derived from ink over the ivory surface. -->
+    <color name="quiet_secondary">#535E6A</color>
+    <color name="quiet_outline">#868D92</color>
+    <color name="quiet_ripple">#24155E63</color>
+    <color name="quiet_on_accent_ripple">#33F9F8EB</color>
+</resources>

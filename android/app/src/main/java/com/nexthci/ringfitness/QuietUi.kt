@@ -6,24 +6,27 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.graphics.drawable.StateListDrawable
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 
 /** Small shared native-view vocabulary for the collection task. */
 internal class QuietUi(private val context: Context) {
-    val background = Color.rgb(247, 249, 248)
-    val ink = Color.rgb(30, 49, 45)
-    val secondary = Color.rgb(92, 111, 105)
-    val accent = Color.rgb(23, 107, 85)
-    val surface = Color.WHITE
-    val softGreen = Color.rgb(228, 240, 234)
-    val softPurple = Color.rgb(239, 235, 249)
-    val purpleInk = Color.rgb(92, 76, 129)
-    val error = Color.rgb(151, 57, 49)
+    val background = context.getColor(R.color.quiet_background)
+    val ink = context.getColor(R.color.quiet_ink)
+    val secondary = context.getColor(R.color.quiet_secondary)
+    val accent = context.getColor(R.color.quiet_accent)
+    val surface = context.getColor(R.color.quiet_surface)
+    val statusSurface = context.getColor(R.color.quiet_status)
+    val outline = context.getColor(R.color.quiet_outline)
+    val error = ink
 
     fun dp(value: Int) = (value * context.resources.displayMetrics.density).toInt()
     fun shape(color: Int, radius: Int = 24, border: Int? = null) = GradientDrawable().apply {
@@ -63,9 +66,15 @@ internal class QuietUi(private val context: Context) {
         minHeight = dp(56)
         minimumHeight = dp(56)
         setPadding(dp(18), dp(12), dp(18), dp(12))
-        setTextColor(if (primary) Color.WHITE else accent)
-        background = RippleDrawable(ColorStateList.valueOf(Color.argb(35, 23, 107, 85)),
-            shape(if (primary) accent else softGreen, 18), null)
+        setTextColor(ColorStateList(arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
+            intArrayOf(secondary, if (primary) surface else accent)))
+        val states = StateListDrawable().apply {
+            addState(intArrayOf(-android.R.attr.state_enabled), shape(this@QuietUi.background, 18, outline))
+            addState(intArrayOf(android.R.attr.state_focused), shape(if (primary) accent else surface, 18, ink))
+            addState(intArrayOf(), shape(if (primary) accent else surface, 18, if (primary) null else accent))
+        }
+        background = RippleDrawable(ColorStateList.valueOf(context.getColor(
+            if (primary) R.color.quiet_on_accent_ripple else R.color.quiet_ripple)), states, shape(surface, 18))
         elevation = 0f
         stateListAnimator = null
         gravity = Gravity.CENTER
@@ -76,14 +85,52 @@ internal class QuietUi(private val context: Context) {
     fun input(parent: LinearLayout, hintText: String, inputTag: String, numeric: Boolean = false): EditText = EditText(context).apply {
         tag = inputTag
         hint = hintText
-        setTextColor(ink)
-        setHintTextColor(secondary)
-        textSize = if (numeric) 44f else 18f
         inputType = if (numeric) android.text.InputType.TYPE_CLASS_NUMBER else
             android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         setSingleLine(true)
-        setPadding(dp(16), dp(14), dp(16), dp(14))
-        background = shape(this@QuietUi.background, 16, Color.rgb(213, 224, 219))
+        styleInput(this, numeric)
         parent.addView(this, LinearLayout.LayoutParams(-1, -2))
     }
+
+    fun styleInput(input: EditText, numeric: Boolean = false) = input.apply {
+        setTextColor(ink)
+        setHintTextColor(secondary)
+        textSize = if (numeric) 32f else 18f
+        minimumHeight = dp(56)
+        setPadding(dp(16), dp(14), dp(16), dp(14))
+        background = StateListDrawable().apply {
+            addState(intArrayOf(android.R.attr.state_focused), shape(surface, 16, accent).apply { setStroke(dp(2), accent) })
+            addState(intArrayOf(), shape(surface, 16, outline))
+        }
+        backgroundTintList = null
+    }
+
+    fun linkBackground() = RippleDrawable(ColorStateList.valueOf(context.getColor(R.color.quiet_ripple)),
+        shape(Color.TRANSPARENT, 12), shape(surface, 12))
+
+    fun placementAdapter(labels: List<String>) = object : ArrayAdapter<String>(context,
+        android.R.layout.simple_spinner_dropdown_item, labels) {
+        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View =
+            styleRow(super.getView(position, convertView, parent), false)
+        override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View =
+            styleRow(super.getDropDownView(position, convertView, parent), true)
+        private fun styleRow(view: View, dropdown: Boolean): View = (view as TextView).apply {
+            layoutParams = layoutParams?.apply { height = ViewGroup.LayoutParams.WRAP_CONTENT }
+            setTextColor(ink)
+            textSize = 16f
+            setSingleLine(false)
+            minimumHeight = dp(48)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = if (dropdown) StateListDrawable().apply {
+                for (state in listOf(android.R.attr.state_checked, android.R.attr.state_selected,
+                    android.R.attr.state_focused, android.R.attr.state_pressed, android.R.attr.state_activated)) {
+                    addState(intArrayOf(state), shape(statusSurface, 8))
+                }
+                addState(intArrayOf(), shape(surface, 8))
+            } else shape(surface, 8)
+        }
+    }
+
+    fun progress() = ProgressBar(context).apply { indeterminateTintList = ColorStateList.valueOf(accent) }
 }
