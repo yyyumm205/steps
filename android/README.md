@@ -30,6 +30,8 @@ Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`；Release构建当前
 
 ## 页面与恢复验证
 
+已有账本和原文件均保全的空闲戒指可运行`IdleRingDiagnosticInstrumentedTest`。该测试默认跳过，只有显式传入`-e verifyIdleRingDiagnostic true`才查询指定戒指；只发送STATUS/LIST，并逐轮核对本地文件。需先确认没有待处理采集并关闭生产App服务，仅选择该测试方法运行。卸载重装或换机后缺少原账本时会拒绝执行，具体前置条件与结果见E22。
+
 模拟器用于页面、输入、导航、本地保存和受控异常。安装Debug及对应AndroidTest APK，在指定模拟器上运行：
 
 ```powershell
