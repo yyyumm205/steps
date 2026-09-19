@@ -33,7 +33,9 @@ python -m pytest backend/ringo_data/tests -q
 
 ## 输入与输出
 
-新入口接收 `version=2`、`step_schema_version=1`、`rfbin_version=2`、`daily_activity_v2/free_living`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
+新入口接收 `version=2/3`、`step_schema_version=1`、`rfbin_version=2`、`daily_activity_v2/free_living`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
+
+普通记录沿用版本 2，其开始基线必须为空闲且 `error_code=0`。版本 3 专门保存充电错误兼容路径：开始基线保留真实的空闲状态和 `error_code=-16`，并要求 `start_baseline.charging_recovery_evidence` 同时证明原因是 `charging`、电量接口报告未充电、两条回复来自同一次连接且在检查时均不超过 5 秒。证据保存原因码、电量充电状态、两条回复的接收时间与连接代次、检查时间；STATUS 接收时间必须等于基线观察时间。缺失、过期或相互矛盾的证据拒收。版本 2 不接受此兼容字段；所有版本的成功开始、停止与下载记录证据仍要求 `error_code=0`。兼容证据随原清单保留，冻结旧包保持原字节内容。
 
 校验包括严格整数类型、有效零步/缺失/不可靠参考、明确停止、记录指纹与开始基线、原始头部、记录数、载荷 CRC32、整文件 SHA-256、sidecar 对应关系，以及 ZIP 路径、重复条目和资源配额。参考原因保存在原 manifest 中；每个 session 的 `reference.csv` 只有一行，整段总数关联所有原始文件。软件可导入同一 session 的多个片段文件并标记重叠待核对；设备多文件能力仍待实测。
 

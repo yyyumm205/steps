@@ -72,14 +72,39 @@ def safe_name(name):
     return name
 
 
-def validate_status(value, name):
+def validate_status(value, name, *, allow_charging_error=False):
     value = object_value(value, name)
     require(type(value.get("collecting")) is bool, f"invalid collecting: {name}")
     for key in ("bytes", "records"):
         integer(value.get(key), f"{name}.{key}", maximum=MAX_UINT)
     integer(value.get("device_session_id"), f"{name}.device_session_id", maximum=65535)
-    integer(value.get("error_code"), f"{name}.error_code", maximum=255)
+    error = integer(value.get("error_code"), f"{name}.error_code",
+                    minimum=-16 if allow_charging_error else 0, maximum=255)
+    require(error >= 0 or error == -16, f"unsupported negative error: {name}")
     return value
+
+
+def validate_charging_recovery(baseline):
+    evidence = object_value(baseline.get("charging_recovery_evidence"), "charging recovery evidence")
+    require(set(evidence) == {
+        "status_error_reason", "battery_charge_status", "battery_received_at_ms",
+        "status_received_at_ms", "checked_at_ms", "status_connection_generation",
+        "battery_connection_generation",
+    }, "charging recovery evidence fields mismatch")
+    require(integer(evidence["status_error_reason"], "charging error reason") == 1,
+            "charging recovery requires charging reason")
+    require(integer(evidence["battery_charge_status"], "battery charge status") == 0,
+            "charging recovery requires an idle battery response")
+    for key in ("battery_received_at_ms", "status_received_at_ms", "checked_at_ms",
+                "status_connection_generation", "battery_connection_generation"):
+        integer(evidence[key], key, 1)
+    require(evidence["status_received_at_ms"] == baseline["observed_at_ms"],
+            "charging recovery STATUS is not the baseline observation")
+    require(evidence["status_connection_generation"] == evidence["battery_connection_generation"],
+            "charging recovery responses came from different connections")
+    for key in ("battery_received_at_ms", "status_received_at_ms"):
+        require(0 <= evidence["checked_at_ms"] - evidence[key] <= 5000,
+                "charging recovery response is stale or from the future")
 
 
 def validate_record(value, name):
@@ -108,7 +133,9 @@ def validate_manifest(value):
         "device_record_evidence", "device_association_invalidated", "files",
     }
     require(set(m) == required, "manifest fields do not match activity schema v2")
-    for key, expected in (("version", 2), ("step_schema_version", 1), ("rfbin_version", 2)):
+    version = integer(m["version"], "version")
+    require(version in (2, 3), "unsupported version")
+    for key, expected in (("step_schema_version", 1), ("rfbin_version", 2)):
         require(integer(m[key], key) == expected, f"unsupported {key}")
     require(m["simulated"] is False, "simulated archives require the isolated demo path")
     fixed = {"capture_purpose": "daily_activity", "activity_schema": "daily_activity_v2",
@@ -214,10 +241,15 @@ def validate_manifest(value):
         require(all(m[key][counter] <= record[counter] for counter in ("bytes", "records")),
                 "device record counters moved backwards")
     baseline = object_value(m["start_baseline"], "start_baseline")
-    baseline_status = validate_status(baseline.get("status"), "baseline status")
-    require(baseline_status["collecting"] is False and baseline_status["error_code"] == 0,
+    baseline_status = validate_status(baseline.get("status"), "baseline status", allow_charging_error=version == 3)
+    require(baseline_status["collecting"] is False and baseline_status["error_code"] == (-16 if version == 3 else 0),
             "invalid start baseline")
     integer(baseline.get("observed_at_ms"), "baseline observation time", 1)
+    if version == 3:
+        validate_charging_recovery(baseline)
+    else:
+        require("charging_recovery_evidence" not in baseline,
+                "charging recovery evidence requires manifest version 3")
     require(type(baseline.get("records")) is list and len(baseline["records"]) <= 255, "invalid baseline records")
     for item in baseline["records"]:
         validate_record(item, "baseline record")
