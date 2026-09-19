@@ -132,7 +132,12 @@ abstract class StepCollectionActivity : Activity() {
         val header = ui.column(root, 20).apply { setPadding(ui.dp(20), ui.dp(4), ui.dp(20), ui.dp(4)) }
         val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(row)
-        val returnButton = ui.button(row, if (state.page == CollectionPage.HOME) "退出演示" else "首页", tag = "flow_back") { back() }
+        val returnLabel = when {
+            state.page != CollectionPage.HOME -> "首页"
+            state.isSimulation -> "退出演示"
+            else -> "返回"
+        }
+        val returnButton = ui.button(row, returnLabel, tag = "flow_back") { back() }
         returnButton.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         returnButton.minHeight = ui.dp(48); returnButton.minimumHeight = ui.dp(48)
         returnButton.background = ui.linkBackground()
@@ -164,7 +169,12 @@ abstract class StepCollectionActivity : Activity() {
                 accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
             }
         }
-        if (!state.hasProfile && !state.busy) registration(body, footer)
+        if (!state.hasProfile && state.busy) {
+            title(body, "正在读取记录")
+            body.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply { gravity = Gravity.CENTER })
+            action(footer, "请稍等…", false) {}
+        }
+        else if (!state.hasProfile) registration(body, footer, state)
         else when (state.page) {
             CollectionPage.HOME -> home(body, footer, state)
             CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING -> waiting(body, footer, state)
@@ -186,12 +196,12 @@ abstract class StepCollectionActivity : Activity() {
             isEnabled = enabled
         }
 
-    private fun registration(body: LinearLayout, footer: LinearLayout) {
-        title(body, "准备开始", "填好信息，就可以体验一次完整记录。")
+    private fun registration(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
+        title(body, "准备开始", if (state.isSimulation) "填好信息，就可以体验一次完整记录。" else null)
         val card = ui.card(body)
         ui.text(card, "被试编号", bold = true)
         ui.gap(card, 12)
-        participantInput = ui.input(card, "例如 demo001", "flow_participant").apply { setText(participantDraft) }
+        participantInput = ui.input(card, if (state.isSimulation) "例如 demo001" else "填写被试编号", "flow_participant").apply { setText(participantDraft) }
         ui.gap(card, 24)
         ui.text(card, "戒指佩戴位置", bold = true)
         ui.gap(card, 10)
@@ -223,7 +233,7 @@ abstract class StepCollectionActivity : Activity() {
         ui.gap(profile, 18)
         detail(profile, "佩戴位置", state.placement?.displayName ?: "待填写")
         ui.gap(profile, 18)
-        detail(profile, "戒指", if (state.connected) "已连接" else "连接已中断")
+        detail(profile, "戒指", connectionLabel(state))
         val recentRecords = state.records.filter { it.localComplete }.takeLast(3).reversed()
         if (recentRecords.isNotEmpty()) {
             ui.text(body, "最近记录", 16f, bold = true)
@@ -239,13 +249,13 @@ abstract class StepCollectionActivity : Activity() {
                     else -> "已保存 · 等待上传"
                 }, 14f, muted = true)
                 if (record.referenceStatus == "unreliable") { ui.gap(card, 8); ui.text(card, "读数有异常", 14f, muted = true) }
-                if (!record.transferInFlight && record.transferStatus != "complete") {
+                if (state.uploadAvailable && !record.transferInFlight && record.transferStatus != "complete") {
                     ui.button(card, if (record.transferStatus == "pending") "上传记录" else "重试上传",
                         tag = "retry_upload_${record.sessionId}") { flow.retryUpload(record.sessionId) }
                 }
             }
         }
-        action(footer, task.action, !state.busy) {
+        action(footer, task.action, !state.busy && !state.connecting) {
             when {
                 !state.connected -> flow.reconnect()
                 state.canStart -> flow.start()
@@ -258,6 +268,7 @@ abstract class StepCollectionActivity : Activity() {
     private data class HomeTask(val title: String, val status: String, val action: String, val hint: String? = null)
 
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
+        state.connecting -> HomeTask("本次采集", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
         state.canStart -> HomeTask("开始这一段", "采集准备", "开始采集", "佩戴好设备，站定后将计步器清零。")
         else -> when (state.taskPage) {
@@ -271,7 +282,9 @@ abstract class StepCollectionActivity : Activity() {
             CollectionPage.DOWNLOADING -> HomeTask("正在下载数据", "步数已保存", "查看下载")
             CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
             CollectionPage.ERROR -> when {
-                state.session?.localData != null -> HomeTask("待上传记录", "数据已保存在手机", "重试上传")
+                state.session?.localData != null -> if (state.uploadAvailable)
+                    HomeTask("待上传记录", "数据已保存在手机", "重试上传")
+                else HomeTask("本次记录", "数据已保存在手机", "查看记录")
                 state.session?.reference != null && state.session.stopConfirmedAtMs != null ->
                     HomeTask("待下载数据", "步数已保存", "重试下载")
                 else -> HomeTask("本次采集", "记录需要检查", "重新检查")
@@ -299,7 +312,7 @@ abstract class StepCollectionActivity : Activity() {
         ui.gap(card, 8)
         ui.text(card, startDateTime(state.session), 18f, bold = true).tag = "flow_started_at"
         val device = ui.card(body)
-        detail(device, "戒指", if (state.connected) "已连接" else "连接已中断")
+        detail(device, "戒指", connectionLabel(state))
         ui.gap(device, 16)
         detail(device, "佩戴位置", state.placement?.displayName ?: "—")
         ui.text(footer, "站定后结束，再查看计步器读数。", 14f, muted = true)
@@ -347,7 +360,7 @@ abstract class StepCollectionActivity : Activity() {
             else -> "读数有问题？"
         }, tag = "reference_options") { showReferenceOptions(uncertain) }
         if (uncertain) { ui.gap(body, 14); ui.text(body, "还未确认结束，可以先记下读数。", 14f, muted = true) }
-        action(footer, "保存并上传", !state.busy) {
+        action(footer, if (state.uploadAvailable) "保存并上传" else "保存本次记录", !state.busy) {
             rememberDrafts(); hideKeyboard()
             flow.saveReference(stepsDraft, referenceKind, if (referenceKind == "valid") "" else reasonDraft)
         }
@@ -355,20 +368,41 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun transfer(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val complete = state.page == CollectionPage.COMPLETE
-        title(body, if (complete) "这一段已保存" else "正在整理记录",
-            if (complete) "本次记录已经保存在手机。" else "步数已保存，请稍等片刻。")
+        val session = state.session
+        val reference = session?.reference
+        val localComplete = session?.localData?.files?.let { files ->
+            files.isNotEmpty() && files.all { it.simulated == state.isSimulation }
+        } == true
+        val uploaded = localComplete && session?.transfer?.status == SessionTransferStatus.COMPLETE &&
+            session.transfer.receipt?.let { it.sessionId == session.sessionId && it.simulated == state.isSimulation } == true
+        title(body, when {
+            complete && localComplete -> "这一段已保存"
+            complete -> "记录尚未完整保存"
+            else -> "正在整理记录"
+        }, when {
+            localComplete -> "本次记录已经保存在手机。"
+            reference != null -> "步数已保存，请稍等片刻。"
+            else -> "正在核对本次记录。"
+        })
         val summary = ui.card(body, ui.statusSurface)
-        ui.text(summary, state.savedSteps?.let { "$it 步" } ?: "未提供读数", 36f, bold = true).tag = "saved_reference"
+        ui.text(summary, reference?.steps?.let { "$it 步" } ?: if (reference != null) "未提供读数" else "待保存读数",
+            36f, bold = true).tag = "saved_reference"
         ui.gap(summary, 14)
-        ui.text(summary, if (state.referenceStatus == "unreliable") "已附上异常说明" else "本次计步器读数", 14f)
+        ui.text(summary, if (reference?.status == ReferenceStatus.UNRELIABLE) "已附上异常说明" else "本次计步器读数", 14f)
         val progress = ui.card(body)
-        detail(progress, "计步器读数", "已保存")
+        detail(progress, "计步器读数", if (reference != null) "已保存" else "待保存")
         ui.gap(progress, 20)
-        detail(progress, "戒指数据", if (state.page == CollectionPage.DOWNLOADING) "正在下载…" else "已保存")
+        detail(progress, "戒指数据", when {
+            localComplete -> "已保存"
+            state.page == CollectionPage.DOWNLOADING -> "正在下载…"
+            else -> "待下载"
+        })
         ui.gap(progress, 20)
-        detail(progress, if (state.isSimulation) "模拟上传" else "上传", when (state.page) {
-            CollectionPage.COMPLETE -> "已完成"
-            CollectionPage.UPLOADING -> "正在上传…"
+        detail(progress, if (state.isSimulation) "模拟上传" else "上传", when {
+            uploaded -> "已完成"
+            !state.uploadAvailable -> "待上传"
+            state.page == CollectionPage.UPLOADING && localComplete -> "正在上传…"
+            localComplete -> "待上传"
             else -> "等待下载完成"
         })
         if (!complete) progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
@@ -380,16 +414,27 @@ abstract class StepCollectionActivity : Activity() {
     private fun recovery(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val session = state.session
         val needsStop = session != null && session.stopConfirmedAtMs == null
-        title(body, if (needsStop) "还需要确认一下" else "这一步未完成",
-            if (needsStop) "连接恢复后，重新检查戒指状态。" else "已保存的内容会保留，可以重试。")
+        title(body, when {
+            session == null -> "连接尚未完成"
+            needsStop -> "还需要确认一下"
+            else -> "这一步未完成"
+        }, when {
+            session == null -> "请将戒指放在手机附近后重试。"
+            needsStop -> "连接恢复后，重新检查戒指状态。"
+            else -> "已保存的内容会保留，可以重试。"
+        })
         val card = ui.card(body)
-        detail(card, "本次记录", "已保留")
-        ui.gap(card, 18)
-        detail(card, "计步器读数", state.savedSteps?.let { "$it 步" } ?: if (state.referenceStatus != null) "已记录原因" else "待填写")
+        if (session == null) detail(card, "戒指", connectionLabel(state)) else {
+            detail(card, "本次记录", "已保留")
+            ui.gap(card, 18)
+            detail(card, "计步器读数", session.reference?.steps?.let { "$it 步" }
+                ?: if (session.reference != null) "已记录原因" else "待填写")
+        }
         if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
             ui.button(body, "先记下步数", tag = "preserve_reference") { flow.enterReference() }
         }
-        action(footer, if (!state.connected) "重新连接" else if (needsStop) "重新检查" else "重试", state.canRetry && !state.busy) {
+        action(footer, if (state.connecting) "连接中…" else if (!state.connected) "重新连接" else if (needsStop) "重新检查" else "重试",
+            state.canRetry && !state.busy && !state.connecting) {
             if (!state.connected) flow.reconnect() else flow.retry()
         }
     }
@@ -399,9 +444,16 @@ abstract class StepCollectionActivity : Activity() {
         parent.addView(row, LinearLayout.LayoutParams(-1, -2))
         ui.text(row, key, 14f, muted = true).layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         ui.text(row, value, 16f, bold = true).apply {
+            tag = "flow_detail_$key"
             gravity = Gravity.END
             layoutParams = LinearLayout.LayoutParams(0, -2, 1.2f)
         }
+    }
+
+    private fun connectionLabel(state: CollectionFlowState): String = when {
+        state.connecting -> "正在连接…"
+        state.connected -> "已连接"
+        else -> "连接已中断"
     }
 
     private fun showReferenceOptions(uncertain: Boolean) {

@@ -14,6 +14,7 @@ import android.widget.EditText
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
+import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
@@ -21,6 +22,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -44,6 +46,77 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class PreparationNavigationInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
+
+    @Test fun pendingCollectionLocksPreparationUntilItsFilesArePreservedThenResumeUnlocksIt() = withProfile { profile ->
+        assumeBluetoothUiPrerequisites()
+        seedProfile(profile)
+        withCollectionJournal { journal ->
+            val ledger = FreeLivingSessionStore(journal)
+            val transport = NavigationTransport()
+            launch().use { scenario ->
+                awaitHeading(scenario, "步数采集")
+                lateinit var preparation: PreparationSnapshot
+                scenario.onActivity { activity ->
+                    attachFakeRing(activity, profile, transport)
+                    preparation = requireNotNull(PreparationStore(profile).read())
+                }
+                val originalProfile = profile.readBytes()
+                val pending = ledger.requestStart(preparation, 1_000, "Asia/Shanghai")
+                replaceCollectionJournal(scenario, journal)
+                await(scenario, "pending session locks preparation") { activity ->
+                    tagged<Button>(activity, "primary").text.toString() == "进入采集" &&
+                        !tagged<Button>(activity, "edit_placement").isEnabled
+                }
+                scenario.onActivity { activity ->
+                    StepPreparationActivity::class.java.getDeclaredMethod("showPlacementPicker")
+                        .apply { isAccessible = true }.invoke(activity)
+                    assertNull(placementDialog(activity))
+                }
+                assertArrayEquals(originalProfile, profile.readBytes())
+                assertEquals(pending, ledger.read())
+                assertEquals(0, transport.connectionCount)
+
+                completeFixture(ledger, journal, pending)
+                scenario.moveToState(Lifecycle.State.STARTED)
+                scenario.moveToState(Lifecycle.State.RESUMED)
+                await(scenario, "locally complete history unlocks preparation after resume") { activity ->
+                    tagged<Button>(activity, "primary").text.toString() == "进入采集" &&
+                        tagged<Button>(activity, "edit_placement").isEnabled
+                }
+                assertTrue("Completing the task keeps its journal", journal.isFile)
+                assertEquals(0, transport.connectionCount)
+                click(scenario, "edit_placement")
+                chooseDialogPlacement(scenario, RingPlacement.LEFT_INDEX)
+                awaitDialogClosed(scenario)
+                val nextProfile = requireNotNull(PreparationStore(profile).read())
+                val next = ledger.requestStart(nextProfile, 7_000, "Asia/Shanghai")
+                assertEquals(RingPlacement.LEFT_INDEX, next.preparation.placement)
+                assertEquals(RingPlacement.RIGHT_RING, ledger.read(pending.sessionId)!!.preparation.placement)
+                assertEquals(pending.preparation.ring, next.preparation.ring)
+            }
+        }
+    }
+
+    @Test fun unreadableCollectionJournalKeepsPreparationLockedAndPreservesItsBytes() = withProfile { profile ->
+        assumeBluetoothUiPrerequisites()
+        seedProfile(profile)
+        withCollectionJournal { journal ->
+            writeDurably(journal, "corrupt test journal".toByteArray())
+            val original = journal.readBytes()
+            launch().use { scenario ->
+                awaitHeading(scenario, "步数采集")
+                replaceCollectionJournal(scenario, journal)
+                await(scenario, "corrupt journal is preserved with an explanation") { activity ->
+                    tagged<Button>(activity, "primary").text.toString() == "进入采集" &&
+                        !tagged<Button>(activity, "edit_placement").isEnabled &&
+                        descendants(activity.findViewById(android.R.id.content)).filterIsInstance<TextView>()
+                            .any { it.isShown && it.text.contains("采集记录读取失败") }
+                }
+                assertArrayEquals(original, journal.readBytes())
+                assertEquals(RingPlacement.RIGHT_RING, PreparationStore(profile).read()!!.placement)
+            }
+        }
+    }
 
     @Test
     fun firstUseSavesCompletePreparationAndImmediatelySearchesWhileColdOpenReturnsHome() = withProfile { profile ->
@@ -357,8 +430,8 @@ class PreparationNavigationInstrumentedTest {
                 assertFalse(controller.state.queryTimedOut)
                 assertTrue(controller.state.canPrepare)
                 val primary = tagged<Button>(activity, "primary")
-                assertFalse("Preparation alone does not enable capture", primary.isEnabled)
-                assertEquals("开始采集（待开放）", primary.text.toString())
+                assertTrue("Preparation offers navigation; START remains owned by the collection service", primary.isEnabled)
+                assertEquals("进入采集", primary.text.toString())
                 assertTrue(tagged<TextView>(activity, "device_status").text.contains("准备完成"))
                 assertEquals(listOf("battery", "info", "status", "battery", "info", "status"), transport.queries)
             }
@@ -534,6 +607,41 @@ class PreparationNavigationInstrumentedTest {
             check(File(backup, "recovery.txt").delete())
             check(backup.delete())
         }
+    }
+
+    private fun withCollectionJournal(test: (File) -> Unit) {
+        val cache = instrumentation.targetContext.cacheDir.canonicalFile
+        val directory = Files.createTempDirectory(cache.toPath(), "preparation-history-").toFile().canonicalFile
+        check(directory.parentFile == cache)
+        try { test(File(directory, "session.json")) } finally {
+            val diskField = StepPreparationActivity::class.java.getDeclaredField("disk").apply { isAccessible = true }
+            (diskField.get(null) as ExecutorService).submit {}.get(10, TimeUnit.SECONDS)
+            directory.deleteRecursively()
+        }
+    }
+
+    private fun replaceCollectionJournal(scenario: ActivityScenario<StepPreparationActivity>, journal: File) {
+        scenario.onActivity { activity ->
+            StepPreparationActivity::class.java.getDeclaredField("collectionJournal")
+                .apply { isAccessible = true }.set(activity, journal)
+            StepPreparationActivity::class.java.getDeclaredMethod("refreshCollectionState")
+                .apply { isAccessible = true }.invoke(activity)
+        }
+    }
+
+    private fun completeFixture(store: FreeLivingSessionStore, journal: File, pending: FreeLivingSession) {
+        val address = requireNotNull(pending.preparation.ring).address
+        store.confirmStart(pending.sessionId, address, HealthMessage.Status(true, 10, 1, 0, 7), 2_000)
+        store.requestStop(pending.sessionId, 3_000)
+        store.confirmStop(pending.sessionId, address, HealthMessage.Status(false, 10, 1, 0, 7), 4_000)
+        store.saveReference(pending.sessionId, SessionReference(ReferenceStatus.VALID, 0, 5_000))
+        val bytes = "SIMULATED_PREPARATION_HISTORY".toByteArray()
+        val raw = File(journal.parentFile, "${pending.sessionId}-history-fixture.txt")
+        writeDurably(raw, bytes)
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+        store.completeLocalData(pending.sessionId,
+            listOf(SessionRawFile(raw.name, 7, bytes.size.toLong(), digest, simulated = true)), 6_000)
     }
 
     private fun captureReviewScreen(scenario: ActivityScenario<StepPreparationActivity>, page: String) {

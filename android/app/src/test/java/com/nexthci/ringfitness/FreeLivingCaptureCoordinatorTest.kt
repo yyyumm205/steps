@@ -201,7 +201,7 @@ class FreeLivingCaptureCoordinatorTest {
     }
 
     @Test fun oldOrAmbiguousIdsAndUnknownAnchorsNeverConfirmStart() {
-        for (candidate in listOf(record(id = 9), record(id = 0), record().copy(unixMs = 0))) {
+        for (candidate in listOf(record(id = 9), record(id = 0), record().copy(unixMs = 0, uptimeMs = 0))) {
             val f = Fixture()
             f.beginStart()
             f.observe(collecting(id = candidate.sessionId), listOf(candidate))
@@ -276,7 +276,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(1, f.port.count("start"))
     }
 
-    @Test fun restartedCoordinatorPreservesCollectingJournalButCannotStopAnUnprovenRecord() {
+    @Test fun restartedCoordinatorRequiresCompleteMatchingEvidenceBeforeAllowingStop() {
         val f = Fixture()
         f.beginCollecting()
         val original = f.file.readBytes()
@@ -291,8 +291,12 @@ class FreeLivingCaptureCoordinatorTest {
         reopened.onHealth(5, SensorPacket.Health(collecting(), epoch + 100))
         reopened.onHealth(5, SensorPacket.Health(record(), epoch + 101))
         reopened.onHealth(5, SensorPacket.Health(HealthMessage.ListEnd(1), epoch + 102))
-        assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, reopened.state.issue)
-        assertArrayEquals(original, f.file.readBytes())
+        assertEquals(CaptureControlPhase.COLLECTING, reopened.state.phase)
+        assertEquals(f.store.read()!!.sessionId, reopened.state.session!!.sessionId)
+        assertNull(reopened.state.session!!.startedAtMs)
+        assertEquals(0, f.port.count("stop"))
+        reopened.requestStop()
+        assertEquals(1, f.port.count("stop"))
     }
 
     @Test fun aPersistedStoppedSessionRestoresWithoutInventingDeviceReadiness() {
@@ -533,6 +537,241 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
         assertTrue(f.port.calls.isEmpty())
         assertArrayEquals(original, f.file.readBytes())
+    }
+
+    @Test fun durableBaselineAndIdentityAreSavedBeforeCollectionIsShown() {
+        val f = Fixture()
+        f.beginStart()
+        assertEquals(DeviceStartBaseline(idle(), emptyList(), epoch), f.store.read()!!.startBaseline)
+        assertNull(f.store.read()!!.deviceRecordEvidence)
+        f.observe(collecting(), listOf(record()))
+        val saved = f.store.read()!!
+        assertEquals(DeviceRecordEvidence(record(), collecting(), epoch), saved.deviceRecordEvidence)
+        assertNull(saved.startedAtMs)
+        assertNull(saved.endedAtMs)
+    }
+
+    @Test fun unknownDeviceClockStillHasAStopExitOnTheSameProvedConnection() {
+        val f = Fixture()
+        val unknownClock = record().copy(unixMs = 0)
+        f.beginStart()
+        f.observe(collecting(), listOf(unknownClock))
+        assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
+        assertEquals(0L, f.store.read()!!.deviceRecordEvidence!!.record.unixMs)
+        assertNull(f.store.read()!!.startedAtMs)
+        f.coordinator.requestStop()
+        assertEquals(1, f.port.count("stop"))
+        f.observe(stopped(), listOf(unknownClock.copy(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertNull(f.store.read()!!.endedAtMs)
+        assertEquals("uncertain", f.store.read()!!.captureBoundaryStatus)
+    }
+
+    @Test fun unknownDeviceClockCannotBeAdoptedAfterReconnectOrProcessRestart() {
+        for (processRestart in listOf(false, true)) {
+            val f = Fixture()
+            f.beginStart()
+            f.observe(collecting(), listOf(record().copy(unixMs = 0)))
+            val original = f.file.readBytes()
+            f.coordinator.onDisconnected(1)
+            val reopened = if (processRestart) f.newCoordinator() else f.coordinator
+            reopened.onConnected(address, 2)
+            reopened.reconcile()
+            deliver(reopened, 2, collecting(), listOf(record().copy(unixMs = 0)))
+            assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, reopened.state.issue)
+            reopened.requestStop()
+            assertEquals(0, f.port.count("stop"))
+            assertEquals(1, f.port.count("start"))
+            assertArrayEquals(original, f.file.readBytes())
+        }
+    }
+
+    @Test fun reconnectAndProcessRestartRecoverOnlyAlreadyProvedCollection() {
+        val f = Fixture()
+        f.beginCollecting()
+        f.coordinator.onDisconnected(1)
+        val restored = f.newCoordinator()
+        restored.onConnected(address, 2)
+        restored.reconcile()
+        restored.onHealth(2, SensorPacket.Health(collecting().copy(bytes = 48, records = 3), epoch + 10))
+        assertEquals(CaptureControlPhase.CHECKING, restored.state.phase)
+        restored.onHealth(2, SensorPacket.Health(record(bytes = 64, records = 4), epoch + 11))
+        assertEquals(CaptureControlPhase.CHECKING, restored.state.phase)
+        restored.onHealth(2, SensorPacket.Health(HealthMessage.ListEnd(1), epoch + 12))
+        assertEquals(CaptureControlPhase.COLLECTING, restored.state.phase)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+        assertEquals(64L, f.store.read()!!.deviceRecordEvidence!!.record.bytes)
+    }
+
+    @Test fun aStopRequestSurvivesRestartAndCanConfirmWithoutResendingStop() {
+        val f = Fixture()
+        f.beginCollecting()
+        f.coordinator.requestStop()
+        val restored = f.newCoordinator()
+        restored.onConnected(address, 2)
+        restored.reconcile()
+        deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, restored.state.phase)
+        assertEquals(1, f.port.count("stop"))
+        assertEquals(stopped(), f.store.read()!!.deviceRecordEvidence!!.status)
+        assertNull(f.store.read()!!.endedAtMs)
+    }
+
+    @Test fun recoveredUnexpectedIdleDoesNotInventAUserStopOrNormalEnd() {
+        val f = Fixture()
+        f.beginCollecting()
+        val restored = f.newCoordinator()
+        restored.onConnected(address, 2)
+        restored.reconcile()
+        deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, restored.state.issue)
+        assertNull(f.store.read()!!.stopRequestedAtMs)
+        assertNull(f.store.read()!!.stopConfirmedAtMs)
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun recoveryRejectsChangedAnchorRegressedCountersAndUnknownAdditionalRecords() {
+        val variants = listOf(
+            collecting() to listOf(record().copy(unixMs = epoch + 1)),
+            collecting() to listOf(record().copy(uptimeMs = 1001)),
+            collecting().copy(bytes = 8) to listOf(record()),
+            collecting().copy(records = 0) to listOf(record()),
+            collecting() to listOf(record(bytes = 16, records = 1)),
+            collecting() to listOf(record(), record(id = 43)),
+        )
+        for ((status, records) in variants) {
+            val f = Fixture()
+            f.beginCollecting()
+            val restored = f.newCoordinator()
+            restored.onConnected(address, 2)
+            restored.reconcile()
+            deliver(restored, 2, status, records)
+            assertEquals(CaptureControlIssue.RECORD_CHANGED, restored.state.issue)
+            assertTrue(f.store.read()!!.deviceAssociationInvalidated)
+            restored.requestStop()
+            assertEquals(0, f.port.count("stop"))
+            val reopened = f.newCoordinator()
+            reopened.onConnected(address, 3)
+            reopened.reconcile()
+            deliver(reopened, 3, collecting(), listOf(record()))
+            assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, reopened.state.issue)
+        }
+    }
+
+    @Test fun unsolicitedCounterHighWaterSurvivesRestart() {
+        val f = Fixture()
+        f.beginCollecting()
+        f.health(collecting().copy(bytes = 80, records = 5))
+        assertEquals(80L, f.store.read()!!.deviceRecordEvidence!!.status.bytes)
+        val restored = f.newCoordinator()
+        restored.onConnected(address, 2)
+        restored.reconcile()
+        deliver(restored, 2, collecting().copy(bytes = 64, records = 4), listOf(record(bytes = 96, records = 6)))
+        assertEquals(CaptureControlIssue.RECORD_CHANGED, restored.state.issue)
+    }
+
+    @Test fun evidenceSaveFailureDuringRecoveryDoesNotShowCollectingOrSendStop() {
+        val f = Fixture()
+        f.beginCollecting()
+        val restored = f.newCoordinator()
+        restored.onConnected(address, 2)
+        restored.reconcile()
+        f.failCommits = true
+        deliver(restored, 2, collecting().copy(bytes = 48, records = 3), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.STORAGE_ERROR, restored.state.phase)
+        // Stop still requires a proved current association whose recovery evidence is durable.
+        restored.requestStop()
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun exactAuthorizationPermitsOnlyTheReviewedIdleRecordBaseline() {
+        val old = record(id = 9, bytes = 5_000_000, records = 10_000)
+        val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
+        val authorization = ExistingRecordAuthorization(address, oldStatus, listOf(old))
+        for (retainOld in listOf(false, true)) {
+            val f = Fixture()
+            f.connect()
+            f.coordinator.requestStart(preparation, authorization)
+            f.observe(oldStatus, listOf(old))
+            assertEquals(1, f.port.count("start"))
+            f.observe(collecting(), if (retainOld) listOf(old, record()) else listOf(record()))
+            assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
+            assertEquals(listOf(old), f.store.read()!!.startBaseline!!.records)
+            f.coordinator.requestStop()
+            f.observe(stopped(), if (retainOld) listOf(old, record(bytes = 64, records = 4)) else listOf(record(bytes = 64, records = 4)))
+            assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        }
+        for (bad in listOf(authorization.copy(ringAddress = "AA:BB:CC:DD:EE:99"),
+            authorization.copy(status = oldStatus.copy(bytes = old.bytes + 1)),
+            authorization.copy(records = listOf(old.copy(unixMs = epoch - 1))))) {
+            val f = Fixture()
+            f.connect()
+            f.coordinator.requestStart(preparation, bad)
+            f.observe(oldStatus, listOf(old))
+            assertEquals(0, f.port.count("start"))
+            assertNull(f.store.read())
+        }
+    }
+
+    @Test fun authorizationCannotClaimUnrelatedAdditionalRecordsAfterStart() {
+        val old = record(id = 9)
+        val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
+        val f = Fixture()
+        f.connect()
+        f.coordinator.requestStart(preparation, ExistingRecordAuthorization(address, oldStatus, listOf(old)))
+        f.observe(oldStatus, listOf(old))
+        f.observe(collecting(), listOf(old, record(), record(id = 43)))
+        assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
+        assertNull(f.store.read()!!.deviceRecordEvidence)
+    }
+
+    @Test fun approvedRecordReplacementCanReuseItsIdWhenBothNonzeroAnchorsChange() {
+        val old = record(id = 9, bytes = 5_000_000, records = 10_000)
+        val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
+        val fresh = record(id = 9, bytes = 17, records = 1).copy(uptimeMs = 2000, unixMs = epoch + 5000)
+        val active = collecting(id = 9).copy(bytes = 0, records = 0)
+        val f = Fixture()
+        f.connect()
+        f.coordinator.requestStart(preparation, ExistingRecordAuthorization(address, oldStatus, listOf(old)))
+        f.observe(oldStatus, listOf(old))
+        f.observe(active, listOf(fresh))
+        assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
+        assertEquals(fresh, f.store.read()!!.deviceRecordEvidence!!.record)
+        assertEquals(listOf(old), f.store.read()!!.startBaseline!!.records)
+        assertNull(f.store.read()!!.startedAtMs)
+        f.coordinator.requestStop()
+        assertEquals(1, f.port.count("stop"))
+        val final = fresh.copy(bytes = 64, records = 4)
+        f.observe(stopped().copy(sessionId = 9), listOf(final))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertEquals(final, f.store.read()!!.deviceRecordEvidence!!.record)
+        assertNull(f.store.read()!!.endedAtMs)
+    }
+
+    @Test fun reusedIdWithUnchangedOrMissingAnchorCannotAcquireStopAuthority() {
+        val old = record(id = 9)
+        val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
+        val candidates = listOf(old, old.copy(unixMs = epoch + 1), old.copy(uptimeMs = 2000),
+            old.copy(unixMs = 0, uptimeMs = 2000), old.copy(unixMs = epoch + 1, uptimeMs = 0))
+        for (candidate in candidates) {
+            val f = Fixture()
+            f.connect()
+            f.coordinator.requestStart(preparation, ExistingRecordAuthorization(address, oldStatus, listOf(old)))
+            f.observe(oldStatus, listOf(old))
+            f.observe(collecting(id = 9), listOf(candidate))
+            assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
+            assertNull(f.store.read()!!.startConfirmedAtMs)
+            f.coordinator.requestStop()
+            assertEquals(0, f.port.count("stop"))
+        }
+    }
+
+    private fun deliver(coordinator: FreeLivingCaptureCoordinator, generation: Long,
+        status: HealthMessage.Status, records: List<HealthMessage.ListItem>) {
+        coordinator.onHealth(generation, SensorPacket.Health(status, epoch + 100))
+        records.forEach { coordinator.onHealth(generation, SensorPacket.Health(it, epoch + 101)) }
+        coordinator.onHealth(generation, SensorPacket.Health(HealthMessage.ListEnd(records.size), epoch + 102))
     }
 
     private fun idle() = HealthMessage.Status(false, 0, 0, 0, 9)

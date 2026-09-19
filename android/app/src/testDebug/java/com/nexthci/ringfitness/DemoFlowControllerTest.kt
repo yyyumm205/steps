@@ -169,6 +169,8 @@ class DemoFlowControllerTest {
         assertArrayEquals(stoppedDevice, File(f.directory, "device.json").readBytes())
         assertEquals(CollectionPage.COMPLETE, f.flow.state.page)
         assertEquals(ReferenceStatus.UNRELIABLE, f.store.read()!!.reference!!.status)
+        assertFalse(f.store.read()!!.deviceRecordEvidence!!.status.collecting)
+        assertNull(f.store.read()!!.endedAtMs)
     }
 
     @Test fun restartWhileCollectingKeepsSessionAndRequiresAnExplicitStop() {
@@ -182,6 +184,8 @@ class DemoFlowControllerTest {
         assertEquals(id, f.store.read()!!.sessionId)
         f.stop()
         assertNotNull(f.store.read()!!.stopConfirmedAtMs)
+        assertFalse(f.store.read()!!.deviceRecordEvidence!!.status.collecting)
+        assertNull(f.store.read()!!.endedAtMs)
     }
 
     @Test fun restartDuringDownloadContinuesFromTheSavedReference() {
@@ -260,6 +264,7 @@ class DemoFlowControllerTest {
         f.restart()
         assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
         assertArrayEquals(startedDevice, File(f.directory, "device.json").readBytes())
+        assertTrue(f.store.read()!!.deviceRecordEvidence!!.status.collecting)
         f.flow.setFault(FlowTestFault.STOP_TIMEOUT)
         f.flow.stop()
         assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, f.store.read()!!.phase)

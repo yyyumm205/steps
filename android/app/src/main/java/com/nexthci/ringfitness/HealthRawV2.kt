@@ -148,7 +148,7 @@ object HealthRawV2 {
         }
     }
 
-    private fun header(
+    internal fun header(
         anchor: HealthMessage.ListItem,
         startedAtMs: Long,
         endedAtMs: Long,

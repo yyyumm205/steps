@@ -33,7 +33,7 @@ import java.util.concurrent.Executors
 /** Preparation stays separate from capture requests, downloads and uploads. */
 class StepPreparationActivity : Activity() {
     private enum class Page { REGISTER, HOME, DEVICES }
-    private enum class HomeAction { PLACEMENT, CONNECT, SETTINGS, DETAILS, NONE }
+    private enum class HomeAction { PLACEMENT, CONNECT, SETTINGS, DETAILS, CAPTURE, NONE }
     private data class HomeUi(
         val status: String,
         val actionText: String,
@@ -62,6 +62,14 @@ class StepPreparationActivity : Activity() {
     private var scanGeneration = 0L
     private var scanMessage: String? = null
     private var timedAttempt = -1L
+    private lateinit var collectionJournal: File
+    private var collectionLoaded = false
+    private var collectionPending = false
+    private var collectionHistory = false
+    private var collectionProblem: String? = null
+    private var collectionReadGeneration = 0L
+    private var collectionSubscription: AutoCloseable? = null
+    private var collectionOwnerSnapshot: Triple<Boolean, String?, Boolean>? = null
     private var placementDialog: AlertDialog? = null
     private var moreMenu: PopupMenu? = null
     private lateinit var back: Button
@@ -97,6 +105,7 @@ class StepPreparationActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.setDecorFitsSystemWindows(false)
         store = PreparationStore(File(filesDir, "preparation/profile.properties"))
+        collectionJournal = File(filesDir, "collection-real/session.json")
         restoredPage = savedInstanceState?.getString("page")?.let { runCatching { Page.valueOf(it) }.getOrNull() }
         placementDraft = savedInstanceState?.getInt("placement_draft") ?: 0
         permissionDenied = savedInstanceState?.getBoolean("permission_denied") ?: false
@@ -121,13 +130,28 @@ class StepPreparationActivity : Activity() {
         val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(bluetoothReceiver, filter, Context.RECEIVER_EXPORTED)
         else registerReceiver(bluetoothReceiver, filter)
+        collectionSubscription = RealCollectionBridge.observe { state ->
+            if (!visible || isDestroyed) return@observe
+            val ownership = Triple(RealCollectionBridge.isRunning(), state.session?.sessionId, state.session?.localData != null)
+            if (ownership != collectionOwnerSnapshot) {
+                collectionOwnerSnapshot = ownership
+                if (ownership.first) {
+                    stopScan()
+                    controller.disconnect("未连接")
+                    placementDialog?.dismiss()
+                }
+                refreshCollectionState()
+            }
+        }
     }
     override fun onResume() {
         super.onResume()
-        if (::primary.isInitialized) { updateViews(); prepareOnOpen() }
+        refreshCollectionState()
     }
     override fun onStop() {
         visible = false
+        collectionSubscription?.close()
+        collectionSubscription = null
         moreMenu?.dismiss()
         pendingBluetoothAction = null
         stopScan()
@@ -263,6 +287,32 @@ class StepPreparationActivity : Activity() {
             }
         }
     }
+
+    /** Pending work locks preparation; completed history keeps only its navigation entry. */
+    private fun refreshCollectionState() {
+        val generation = ++collectionReadGeneration
+        val journal = collectionJournal
+        collectionLoaded = false
+        updateViews()
+        disk.execute {
+            val result = runCatching { FreeLivingSessionStore(journal).read() }
+            main.post {
+                if (isDestroyed || generation != collectionReadGeneration) return@post
+                collectionLoaded = true
+                result.onSuccess { session ->
+                    collectionPending = session != null && session.localData == null
+                    collectionHistory = session != null
+                    collectionProblem = null
+                }.onFailure {
+                    collectionPending = true
+                    collectionHistory = true
+                    collectionProblem = "采集记录读取失败，请联系研究者。"
+                }
+                updateViews()
+                prepareOnOpen()
+            }
+        }
+    }
     private fun persist(afterSave: (PreparationSnapshot) -> Unit, onFailure: (() -> Unit)? = null, write: () -> PreparationSnapshot) {
         if (busy || storageProblem != null) return
         busy = true
@@ -297,13 +347,16 @@ class StepPreparationActivity : Activity() {
             }
             !bluetoothEnabled() -> HomeUi("手机蓝牙已关闭", "打开蓝牙", HomeAction.SETTINGS)
             !locationEnabled() -> HomeUi("手机定位已关闭", "打开定位", HomeAction.SETTINGS)
+            !collectionLoaded -> HomeUi("正在读取记录", "正在读取…", HomeAction.NONE, waiting = true)
+            collectionOwnsDevice() || collectionHistory -> HomeUi("采集记录", "进入采集", HomeAction.CAPTURE,
+                collectionProblem.orEmpty())
             state.connecting -> HomeUi("正在连接戒指", "正在连接…", HomeAction.NONE, waiting = true)
             checking() -> HomeUi("正在检查戒指", "正在检查…", HomeAction.NONE, waiting = true)
             state.queryTimedOut -> HomeUi("连接检查未完成", "重试连接", HomeAction.CONNECT, state.message)
             state.connected && !state.canPrepare -> HomeUi(
-                "戒指已连接", "查看设备详情", HomeAction.DETAILS, state.message,
+                "戒指已连接", "进入采集", HomeAction.CAPTURE, state.message,
             )
-            state.canPrepare -> HomeUi("准备完成", "开始采集（待开放）", HomeAction.NONE)
+            state.canPrepare -> HomeUi("准备完成", "进入采集", HomeAction.CAPTURE)
             else -> HomeUi(
                 if (disconnected) "戒指未连接" else state.message,
                 if (disconnected || state.message == "已取消连接") "连接戒指" else "重试连接",
@@ -329,6 +382,7 @@ class StepPreparationActivity : Activity() {
                 HomeAction.CONNECT -> connectPreparedRing()
                 HomeAction.SETTINGS -> openNeededSettings()
                 HomeAction.DETAILS -> showDetails()
+                HomeAction.CAPTURE -> openCollection()
                 HomeAction.NONE -> Unit
             }
             Page.DEVICES -> if (scanning) {
@@ -347,8 +401,9 @@ class StepPreparationActivity : Activity() {
     }
 
     private fun prepareOnOpen() {
-        if (!autoConnectPending || !visible || !loaded || busy) return
+        if (!autoConnectPending || !visible || !loaded || busy || !collectionLoaded) return
         autoConnectPending = false
+        if (collectionOwnsDevice() || collectionHistory) return
         if (storageProblem != null || snapshot?.placement == null) return
         val ring = snapshot?.ring ?: return
         if (requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) return
@@ -371,7 +426,7 @@ class StepPreparationActivity : Activity() {
             Page.REGISTER -> "第 1 步 · 填写信息"
             Page.HOME -> when {
                 snapshot?.placement == null -> "补充准备信息"
-                ui.action == HomeAction.DETAILS || (ui.action == HomeAction.NONE && !ui.waiting) -> "采集准备"
+                ui.action in setOf(HomeAction.DETAILS, HomeAction.CAPTURE) || (ui.action == HomeAction.NONE && !ui.waiting) -> "采集准备"
                 else -> "第 2 步 · 连接戒指"
             }
             Page.DEVICES -> "点击你的戒指即可连接"
@@ -380,11 +435,11 @@ class StepPreparationActivity : Activity() {
         placementPicker.isEnabled = !busy
         participantLabel.text = "编号：${snapshot?.participantId.orEmpty()}"
         editPlacement.text = snapshot?.placement?.let { "${it.displayName} · 修改" } ?: "选择佩戴位置"
-        editPlacement.isEnabled = !busy && !ui.waiting
+        editPlacement.isEnabled = !busy && !ui.waiting && !collectionOwnsDevice()
         homeStatus.text = ui.status
         homeExplanation.text = ui.explanation
         homeExplanation.visibility = if (ui.explanation.isEmpty()) View.GONE else View.VISIBLE
-        cancelConnection.visibility = if (ui.waiting) View.VISIBLE else View.GONE
+        cancelConnection.visibility = if (ui.waiting && checking()) View.VISIBLE else View.GONE
         cancelConnection.isEnabled = !busy
         scanStatus.text = scanMessage ?: "将戒指放在手机附近，点击重新搜索。"
         primary.text = when {
@@ -399,7 +454,7 @@ class StepPreparationActivity : Activity() {
         primary.isEnabled = usable && !busy && when (page) {
             Page.REGISTER -> placementDraft > 0
             Page.HOME -> ui.action != HomeAction.NONE
-            Page.DEVICES -> true
+            Page.DEVICES -> collectionLoaded
         }
         message.text = storageProblem ?: feedback.orEmpty()
         message.visibility = if (message.text.isEmpty()) View.GONE else View.VISIBLE
@@ -430,12 +485,12 @@ class StepPreparationActivity : Activity() {
     }
 
     private fun showPlacementPicker() {
-        if (busy || snapshot == null || storageProblem != null || placementDialog?.isShowing == true) return
+        if (busy || collectionOwnsDevice() || snapshot == null || storageProblem != null || placementDialog?.isShowing == true) return
         feedback = null
         val dialog = AlertDialog.Builder(this)
             .setTitle("佩戴位置")
             .setSingleChoiceItems(RingPlacement.entries.map { it.displayName }.toTypedArray(), snapshot?.placement?.ordinal ?: -1) { _, index ->
-                if (busy) return@setSingleChoiceItems
+                if (busy || collectionOwnsDevice()) return@setSingleChoiceItems
                 val chosen = RingPlacement.entries[index]
                 if (chosen == snapshot?.placement) placementDialog?.dismiss()
                 else persist(
@@ -498,6 +553,8 @@ class StepPreparationActivity : Activity() {
         listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
     } else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
     private fun scan() {
+        if (!collectionLoaded) return
+        if (collectionOwnsDevice()) { openCollection(); return }
         stopScan()
         controller.disconnect("未连接")
         scanMessage = "正在搜索附近的戒指…"
@@ -517,7 +574,7 @@ class StepPreparationActivity : Activity() {
                 results.removeAllViews()
                 rings.forEach { ring ->
                     button(results, "${ring.name} · ${ring.address.takeLast(5)}", false) {
-                        if (!busy && !checking()) {
+                        if (!busy && !checking() && !collectionOwnsDevice()) {
                             stopScan()
                             controller.disconnect("未连接")
                             persist(afterSave = { saved ->
@@ -535,7 +592,18 @@ class StepPreparationActivity : Activity() {
         runCatching { client.scanForRings() }.onFailure { stopScan(); scanMessage = "搜索失败，请检查蓝牙和权限后重试。" }
         updateViews()
     }
-    private fun connect(ring: PreparedRing) { stopScan(); controller.connect(ring) }
+    private fun connect(ring: PreparedRing) {
+        if (collectionOwnsDevice()) return
+        stopScan(); controller.connect(ring)
+    }
+    private fun collectionOwnsDevice() = RealCollectionBridge.isRunning() || !collectionLoaded || collectionPending
+    private fun openCollection() {
+        stopScan()
+        controller.disconnect("未连接")
+        autoConnectPending = false
+        startActivity(Intent(this, RealCollectionActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
+    }
     private fun stopScan() {
         ++scanGeneration
         scanning = false
@@ -557,9 +625,10 @@ class StepPreparationActivity : Activity() {
                 "设备记录编号：${state.healthStatus?.sessionId ?: "待查询"}\n" +
                 "状态码：${state.healthStatus?.errorCode ?: "待查询"}"
         ).setPositiveButton("关闭", null)
-            .setNeutralButton("更换戒指") { _, _ -> withBluetooth { navigate(Page.DEVICES); scan() } }
+            .setNeutralButton("更换戒指") { _, _ -> if (!collectionOwnsDevice()) withBluetooth { navigate(Page.DEVICES); scan() } }
             .setNegativeButton("系统设置") { _, _ -> openNeededSettings() }
             .show()
+            .getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled = !collectionOwnsDevice()
     }
     private fun section(parent: LinearLayout, padding: Int = 0) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL

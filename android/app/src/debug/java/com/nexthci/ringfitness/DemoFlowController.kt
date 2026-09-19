@@ -310,10 +310,20 @@ class DemoFlowController(
         recoveryOwner = true
         var recovered = current
         if (recovered.phase == FreeLivingSessionPhase.START_REQUESTED && record.collecting) {
-            recovered = store.confirmStart(recovered.sessionId, DEMO_RING.address, record.status(), clock.nowEpochMs())
+            val observedAtMs = clock.nowEpochMs()
+            recovered = store.confirmStart(recovered.sessionId, DEMO_RING.address, record.status(), observedAtMs,
+                recordEvidence = recovered.startBaseline?.let {
+                    DeviceRecordEvidence(record.listItem(), record.status(), observedAtMs)
+                })
         }
         if (recovered.phase == FreeLivingSessionPhase.STOP_REQUESTED && !record.collecting) {
-            recovered = store.confirmStop(recovered.sessionId, DEMO_RING.address, record.status(), clock.nowEpochMs())
+            val observedAtMs = clock.nowEpochMs()
+            // Keep the shared journal's fingerprint and counter checks when recovering a v3
+            // demo session. Older demo journals retain their absent association evidence.
+            recovered = store.confirmStop(recovered.sessionId, DEMO_RING.address, record.status(), observedAtMs,
+                recordEvidence = recovered.deviceRecordEvidence?.let {
+                    DeviceRecordEvidence(record.listItem(), record.status(), observedAtMs)
+                })
         }
         if ((recovered.phase == FreeLivingSessionPhase.COLLECTING) != record.collecting &&
             recovered.phase != FreeLivingSessionPhase.AWAITING_REFERENCE) {

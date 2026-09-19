@@ -418,7 +418,7 @@ class FreeLivingSessionStoreTest {
         val envelope = JsonParser().parse(file.readText()).asJsonObject
         val payload = envelope.getAsJsonObject("session")
         change(payload)
-        val hashed = if (envelope.get("journal_version").asInt == 2) JsonObject().apply {
+        val hashed = if (envelope.get("journal_version").asInt >= 2) JsonObject().apply {
             add("session", payload)
             add("archived_sessions", envelope.get("archived_sessions"))
         } else payload

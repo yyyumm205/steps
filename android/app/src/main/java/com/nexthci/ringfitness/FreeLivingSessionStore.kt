@@ -83,6 +83,20 @@ data class DeviceBoundaryEvidence(
     val rawEvidence: String,
 )
 
+/** Full pre-command observation. LIST anchors are record fingerprints, not capture timestamps. */
+data class DeviceStartBaseline(
+    val status: HealthMessage.Status,
+    val records: List<HealthMessage.ListItem>,
+    val observedAtMs: Long,
+)
+
+/** Durable association established by a complete STATUS/LIST round on the issuing connection. */
+data class DeviceRecordEvidence(
+    val record: HealthMessage.ListItem,
+    val status: HealthMessage.Status,
+    val observedAtMs: Long,
+)
+
 data class FreeLivingSession(
     val sessionId: String,
     val preparation: PreparationSnapshot,
@@ -100,6 +114,9 @@ data class FreeLivingSession(
     val reference: SessionReference? = null,
     val localData: SessionLocalData? = null,
     val transfer: SessionTransfer = SessionTransfer(),
+    val startBaseline: DeviceStartBaseline? = null,
+    val deviceRecordEvidence: DeviceRecordEvidence? = null,
+    val deviceAssociationInvalidated: Boolean = false,
 ) {
     val deviceSessionId: Int? get() = startStatusEvidence?.sessionId
     val startedAtMs: Long? get() = startBoundaryEvidence?.epochMs
@@ -160,7 +177,8 @@ class FreeLivingSessionStore internal constructor(
         readJournalLocked()?.let { it.archived + it.current }.orEmpty()
     }
 
-    fun requestStart(preparation: PreparationSnapshot, requestedAtMs: Long, timeZoneId: String): FreeLivingSession =
+    fun requestStart(preparation: PreparationSnapshot, requestedAtMs: Long, timeZoneId: String,
+        baseline: DeviceStartBaseline? = null): FreeLivingSession =
         synchronized(processLock) {
             validatePreparation(preparation)
             require(requestedAtMs > 0) { "开始请求时间无效" }
@@ -180,6 +198,7 @@ class FreeLivingSessionStore internal constructor(
                 timeZoneId = zone.id,
                 utcOffsetSeconds = zone.rules.getOffset(Instant.ofEpochMilli(requestedAtMs)).totalSeconds,
                 startRequestedAtMs = requestedAtMs,
+                startBaseline = baseline,
             ), if (journal == null) emptyList() else journal.archived + journal.current)
         }
 
@@ -189,13 +208,15 @@ class FreeLivingSessionStore internal constructor(
         status: HealthMessage.Status,
         receivedAtMs: Long,
         boundary: DeviceBoundaryEvidence? = null,
+        recordEvidence: DeviceRecordEvidence? = null,
     ): FreeLivingSession = update(sessionId) { current ->
         validateReply(current, ringAddress, status, receivedAtMs, collecting = true)
         validateBoundary(boundary)
+        require(recordEvidence == null || recordEvidence.status == status) { "设备关联与开始状态不一致" }
         if (current.startConfirmedAtMs != null) return@update current
         require(current.phase == FreeLivingSessionPhase.START_REQUESTED) { "当前阶段不接受开始确认" }
         current.copy(phase = FreeLivingSessionPhase.COLLECTING, startConfirmedAtMs = receivedAtMs,
-            startStatusEvidence = status, startBoundaryEvidence = boundary)
+            startStatusEvidence = status, startBoundaryEvidence = boundary, deviceRecordEvidence = recordEvidence)
     }
 
     fun requestStop(sessionId: String, requestedAtMs: Long): FreeLivingSession = update(sessionId) { current ->
@@ -211,14 +232,53 @@ class FreeLivingSessionStore internal constructor(
         status: HealthMessage.Status,
         receivedAtMs: Long,
         boundary: DeviceBoundaryEvidence? = null,
+        recordEvidence: DeviceRecordEvidence? = null,
     ): FreeLivingSession = update(sessionId) { current ->
         validateReply(current, ringAddress, status, receivedAtMs, collecting = false)
         validateBoundary(boundary)
+        require(recordEvidence == null || recordEvidence.status == status) { "设备关联与停止状态不一致" }
         if (current.stopConfirmedAtMs != null) return@update current
         require(current.phase == FreeLivingSessionPhase.STOP_REQUESTED) { "尚未请求停止采集" }
+        current.deviceRecordEvidence?.let { previous ->
+            val next = requireNotNull(recordEvidence) { "缺少停止记录关联证据" }
+            require(!current.deviceAssociationInvalidated && sameDeviceRecord(previous.record, next.record) &&
+                next.record.bytes >= previous.record.bytes && next.record.records >= previous.record.records &&
+                next.status.bytes >= previous.status.bytes && next.status.records >= previous.status.records) { "设备记录已变化" }
+        }
         current.copy(phase = FreeLivingSessionPhase.AWAITING_REFERENCE, stopConfirmedAtMs = receivedAtMs,
-            stopStatusEvidence = status, endBoundaryEvidence = boundary)
+            stopStatusEvidence = status, endBoundaryEvidence = boundary,
+            deviceRecordEvidence = recordEvidence ?: current.deviceRecordEvidence)
     }
+
+    /** Refresh only a previously proved identity; never promote a same-ID record to ownership. */
+    fun updateDeviceEvidence(sessionId: String, evidence: DeviceRecordEvidence): FreeLivingSession = update(sessionId) { current ->
+        require(!current.deviceAssociationInvalidated) { "设备记录需要研究者核对" }
+        val previous = requireNotNull(current.deviceRecordEvidence) { "缺少设备记录关联证据" }
+        require(sameDeviceRecord(previous.record, evidence.record)) { "设备记录已变化" }
+        require(evidence.record.bytes >= previous.record.bytes && evidence.record.records >= previous.record.records &&
+            evidence.status.bytes >= previous.status.bytes && evidence.status.records >= previous.status.records) { "设备计数发生回退" }
+        current.copy(deviceRecordEvidence = evidence)
+    }
+
+    fun invalidateDeviceAssociation(sessionId: String): FreeLivingSession = update(sessionId) {
+        it.copy(deviceAssociationInvalidated = true)
+    }
+
+    /** Every device record must exactly match a verified local copy before it can be replaced. */
+    fun hasPreservedDeviceRecords(ringAddress: String, records: List<HealthMessage.ListItem>): Boolean =
+        synchronized(processLock) {
+            if (records.isEmpty()) return@synchronized false
+            val sessions = readJournalLocked()?.let { it.archived + it.current }.orEmpty()
+            records.all { record ->
+                // Uptime alone cannot prove that the device still holds the same boot's record.
+                if (record.unixMs == 0L) return@all false
+                val saved = sessions.singleOrNull { it.preparation.ring?.address == ringAddress &&
+                    !it.deviceAssociationInvalidated && it.deviceRecordEvidence?.record == record && it.localData != null }
+                    ?: return@all false
+                verifyLocalFiles(saved, saved.localData!!.files)
+                saved.localData.files.none { it.simulated }
+            }
+        }
 
     fun saveReference(sessionId: String, reference: SessionReference): FreeLivingSession = update(sessionId) { current ->
         validateReference(reference)
@@ -308,12 +368,12 @@ class FreeLivingSessionStore internal constructor(
                 value.asJsonObject
             }
             val version = envelope.strictLong("journal_version")
-            require(version in 1L..2L) { "版本不受支持" }
+            require(version in 1L..3L) { "版本不受支持" }
             val payload = envelope.getAsJsonObject("session") ?: error("缺少采集段")
-            val archives = if (version == 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
+            val archives = if (version >= 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
             val hashed = if (version == 1L) payload else journalPayload(payload, archives)
             require(envelope.strictString("sha256") == digest(hashed.toString())) { "采集段完整性检查失败" }
-            return Journal(decode(payload, version == 2L), archives.map { decode(it.asJsonObject, true) }).also {
+            return Journal(decode(payload, version), archives.map { decode(it.asJsonObject, version) }).also {
                 validateJournal(it)
                 // A previous rename may have succeeded while syncing its directory failed.
                 // Do not acknowledge an idempotent retry until directory persistence succeeds.
@@ -334,7 +394,7 @@ class FreeLivingSessionStore internal constructor(
         val payload = encode(journal.current)
         val archives = JsonArray().apply { journal.archived.forEach { add(encode(it)) } }
         val envelope = JsonObject().apply {
-            addProperty("journal_version", 2)
+            addProperty("journal_version", 3)
             add("session", payload)
             add("archived_sessions", archives)
             addProperty("sha256", digest(journalPayload(payload, archives).toString()))
@@ -435,6 +495,27 @@ class FreeLivingSessionStore internal constructor(
             require(boundary.rawEvidence.isNotBlank()) { "设备时间须保留来源证据" }
         }
 
+        private fun validateDeviceStatus(status: HealthMessage.Status) {
+            require(status.sessionId in 0..65535 && status.bytes in 0..0xFFFF_FFFFL &&
+                status.records in 0..0xFFFF_FFFFL && status.errorCode == 0)
+        }
+
+        private fun validateDeviceRecord(record: HealthMessage.ListItem) {
+            require(record.sessionId in 1..65535 && record.bytes in 0..0xFFFF_FFFFL &&
+                record.records in 0..0xFFFF_FFFFL && record.uptimeMs in 0..0xFFFF_FFFFL && record.unixMs >= 0)
+        }
+
+        fun sameDeviceRecord(first: HealthMessage.ListItem, second: HealthMessage.ListItem): Boolean =
+            first.sessionId == second.sessionId && first.uptimeMs == second.uptimeMs && first.unixMs == second.unixMs
+
+        /** A reused numeric ID needs two changed, nonzero anchors in the reviewed idle record. */
+        fun isDistinctStartRecord(baseline: DeviceStartBaseline, candidate: HealthMessage.ListItem): Boolean {
+            val previous = baseline.records.singleOrNull { it.sessionId == candidate.sessionId }
+                ?: return candidate.sessionId != baseline.status.sessionId
+            return previous.unixMs > 0 && candidate.unixMs > 0 && previous.uptimeMs > 0 && candidate.uptimeMs > 0 &&
+                previous.unixMs != candidate.unixMs && previous.uptimeMs != candidate.uptimeMs
+        }
+
         private fun validateSession(session: FreeLivingSession) {
             require(UUID.fromString(session.sessionId).toString() == session.sessionId)
             validatePreparation(session.preparation)
@@ -455,6 +536,27 @@ class FreeLivingSessionStore internal constructor(
             session.stopRequestedAtMs?.let { require(it > 0) }
             validateBoundary(session.startBoundaryEvidence)
             validateBoundary(session.endBoundaryEvidence)
+            session.startBaseline?.let { baseline ->
+                validateDeviceStatus(baseline.status)
+                require(!baseline.status.collecting && baseline.observedAtMs > 0)
+                require(baseline.records.size <= 255 && baseline.records.map { it.sessionId }.distinct().size == baseline.records.size)
+                baseline.records.forEach(::validateDeviceRecord)
+                if (baseline.records.isEmpty()) require(baseline.status.bytes == 0L && baseline.status.records == 0L)
+                else require(baseline.records.any { it.sessionId == baseline.status.sessionId &&
+                    it.bytes == baseline.status.bytes && it.records == baseline.status.records })
+            }
+            session.deviceRecordEvidence?.let { evidence ->
+                require(hasStart && session.startBaseline != null && evidence.observedAtMs > 0)
+                validateDeviceStatus(evidence.status)
+                validateDeviceRecord(evidence.record)
+                require(evidence.record.unixMs > 0 || evidence.record.uptimeMs > 0)
+                require(evidence.record.sessionId == session.deviceSessionId && evidence.status.sessionId == session.deviceSessionId)
+                require(isDistinctStartRecord(session.startBaseline, evidence.record))
+                // An unsolicited STATUS may be newer than the most recently completed LIST.
+                if (hasStop) require(!evidence.status.collecting && evidence.record.bytes == evidence.status.bytes &&
+                    evidence.record.records == evidence.status.records)
+                else require(evidence.status.collecting)
+            }
             session.reference?.let {
                 validateReference(it)
                 require(hasStopRequest && (hasStop || it.status != ReferenceStatus.VALID))
@@ -474,7 +576,7 @@ class FreeLivingSessionStore internal constructor(
             }
         }
 
-        private fun encode(s: FreeLivingSession, extended: Boolean = true) = JsonObject().apply {
+        private fun encode(s: FreeLivingSession, version: Long = 3L) = JsonObject().apply {
             addProperty("session_id", s.sessionId)
             addProperty("participant_id", s.preparation.participantId)
             addProperty("participant_name", s.preparation.participantId)
@@ -496,7 +598,7 @@ class FreeLivingSessionStore internal constructor(
             addNullable("ground_truth_recorded_at_ms", s.reference?.groundTruthRecordedAtMs)
             addProperty("data_integrity_status", if (s.localData != null) "complete" else "pending")
             addNullable("download_completed_at_ms", s.localData?.completedAtMs)
-            if (extended) {
+            if (version >= 2L) {
                 addNullable("reference_saved_at_ms", s.reference?.recordedAtMs)
                 add("ground_truth_reason", s.reference?.reason?.let { com.google.gson.JsonPrimitive(it) } ?: JsonNull.INSTANCE)
                 add("raw_files", JsonArray().apply { s.localData?.files?.forEach { add(encodeFile(it)) } })
@@ -524,9 +626,23 @@ class FreeLivingSessionStore internal constructor(
             add("stop_status_evidence", encodeStatus(s.stopStatusEvidence))
             add("start_boundary_evidence", encodeBoundary(s.startBoundaryEvidence))
             add("end_boundary_evidence", encodeBoundary(s.endBoundaryEvidence))
+            if (version >= 3L) {
+                add("start_baseline", s.startBaseline?.let { baseline -> JsonObject().apply {
+                    add("status", encodeStatus(baseline.status))
+                    add("records", JsonArray().apply { baseline.records.forEach { add(encodeRecord(it)) } })
+                    addProperty("observed_at_ms", baseline.observedAtMs)
+                } } ?: JsonNull.INSTANCE)
+                add("device_record_evidence", s.deviceRecordEvidence?.let { evidence -> JsonObject().apply {
+                    add("record", encodeRecord(evidence.record))
+                    add("status", encodeStatus(evidence.status))
+                    addProperty("observed_at_ms", evidence.observedAtMs)
+                } } ?: JsonNull.INSTANCE)
+                addProperty("device_association_invalidated", s.deviceAssociationInvalidated)
+            }
         }
 
-        private fun decode(p: JsonObject, extended: Boolean): FreeLivingSession {
+        private fun decode(p: JsonObject, version: Long): FreeLivingSession {
+            val extended = version >= 2L
             val s = FreeLivingSession(
                 sessionId = p.strictString("session_id"),
                 preparation = PreparationSnapshot(p.strictString("participant_id"), p.strictString("installation_id"),
@@ -551,9 +667,16 @@ class FreeLivingSessionStore internal constructor(
                     p.required("raw_files").asJsonArray.map { decodeFile(it.asJsonObject) },
                     p.strictLong("download_completed_at_ms")),
                 transfer = if (extended) decodeTransfer(p.required("transfer").asJsonObject) else SessionTransfer(),
+                startBaseline = if (version < 3L || p.required("start_baseline").isJsonNull) null else
+                    p.getAsJsonObject("start_baseline").let { DeviceStartBaseline(requireNotNull(decodeStatus(it.required("status"))),
+                        it.required("records").asJsonArray.map { record -> decodeRecord(record.asJsonObject) }, it.strictLong("observed_at_ms")) },
+                deviceRecordEvidence = if (version < 3L || p.required("device_record_evidence").isJsonNull) null else
+                    p.getAsJsonObject("device_record_evidence").let { DeviceRecordEvidence(decodeRecord(it.getAsJsonObject("record")),
+                        requireNotNull(decodeStatus(it.required("status"))), it.strictLong("observed_at_ms")) },
+                deviceAssociationInvalidated = version >= 3L && p.strictBoolean("device_association_invalidated"),
             )
             // Re-encoding checks required fields, fixed metadata, explicit nulls and derived values.
-            require(encode(s, extended) == p) { "采集段字段不完整或数据含义不一致" }
+            require(encode(s, version) == p) { "采集段字段不完整或数据含义不一致" }
             return s
         }
 
@@ -564,6 +687,17 @@ class FreeLivingSessionStore internal constructor(
             addProperty("sha256", file.sha256)
             addProperty("simulated", file.simulated)
         }
+
+        private fun encodeRecord(record: HealthMessage.ListItem) = JsonObject().apply {
+            addProperty("device_session_id", record.sessionId)
+            addProperty("bytes", record.bytes)
+            addProperty("records", record.records)
+            addProperty("uptime_ms", record.uptimeMs)
+            addProperty("unix_ms", record.unixMs)
+        }
+
+        private fun decodeRecord(p: JsonObject) = HealthMessage.ListItem(Math.toIntExact(p.strictLong("device_session_id")),
+            p.strictLong("bytes"), p.strictLong("records"), p.strictLong("uptime_ms"), p.strictLong("unix_ms"))
 
         private fun decodeFile(p: JsonObject) = SessionRawFile(p.strictString("file_name"),
             Math.toIntExact(p.strictLong("device_session_id")), p.strictLong("bytes"),

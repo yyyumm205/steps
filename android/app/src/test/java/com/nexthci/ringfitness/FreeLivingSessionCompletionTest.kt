@@ -257,14 +257,15 @@ class FreeLivingSessionCompletionTest {
         val stopped = stop(open(file))
         val envelope = JsonParser.parseString(file.readText()).asJsonObject
         val session = envelope.getAsJsonObject("session")
-        listOf("ground_truth_reason", "reference_saved_at_ms", "raw_files", "transfer").forEach(session::remove)
+        listOf("ground_truth_reason", "reference_saved_at_ms", "raw_files", "transfer",
+            "start_baseline", "device_record_evidence", "device_association_invalidated").forEach(session::remove)
         envelope.addProperty("journal_version", 1)
         envelope.remove("archived_sessions")
         envelope.addProperty("sha256", digest(session.toString().toByteArray()))
         file.writeText(envelope.toString())
         assertEquals(stopped, open(file).read())
         open(file).saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
-        assertEquals(2, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(3, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(0L, open(file).read()!!.reference!!.steps)
     }
 

@@ -35,6 +35,13 @@ data class HealthRecordObservation(
     val records: List<HealthMessage.ListItem>,
 )
 
+/** Scope for one reviewed device baseline. It never authorizes deleting unrelated records. */
+data class ExistingRecordAuthorization(
+    val ringAddress: String,
+    val status: HealthMessage.Status,
+    val records: List<HealthMessage.ListItem>,
+)
+
 data class CaptureControlState(
     val phase: CaptureControlPhase = CaptureControlPhase.IDLE,
     val session: FreeLivingSession? = null,
@@ -44,17 +51,16 @@ data class CaptureControlState(
 )
 
 /**
- * T2b.1 software coordinator; it is not wired to an Android service or a real capture entry.
- * A future foreground service must be the sole owner of this coordinator, journal and transport.
+ * The foreground service is the sole owner of this coordinator, journal and transport.
  * Call every public method on one serial execution context. Synchronous port/listener callbacks
  * are queued to finish the current transition before processing the next event.
  *
  * STATUS/LIST have no response nonce or boot ID. A local operation ID only guards timeouts.
- * The current conservative policy requires an empty baseline, a different nonzero record ID,
- * and a complete matching LIST on one uninterrupted connection. Its firmware assumptions still
- * need device validation. LIST anchors identify observed candidates; they never supply capture
- * boundaries here. After a disconnect/process restart, T2a lacks durable association evidence,
- * so queries preserve the journal and require review instead of adopting a same-ID recording.
+ * A start requires a reviewed idle baseline and one distinct record on the issuing connection.
+ * Reusing a numeric ID requires both nonzero anchors to change from the approved baseline.
+ * A proved fingerprint and counter high-water marks are persisted with confirmation.
+ * Recovery queries require that same fingerprint and monotonic counters. LIST anchors identify
+ * records; they never supply capture boundaries. Firmware assumptions require device validation.
  */
 class FreeLivingCaptureCoordinator(
     private val store: FreeLivingSessionStore,
@@ -73,7 +79,8 @@ class FreeLivingCaptureCoordinator(
         var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
     )
-    private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String)
+    private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String,
+        val allowedExisting: ExistingRecordAuthorization?)
     private data class RecordIdentity(val sessionId: Int, val uptimeMs: Long, val unixMs: Long)
 
     private val events = ArrayDeque<() -> Unit>()
@@ -95,6 +102,9 @@ class FreeLivingCaptureCoordinator(
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
     fun restore() = dispatch { if (!restored) readJournal() }
 
+    /** The sole owner calls this after reference/file persistence, when no response is pending. */
+    fun refresh() = dispatch { if (round == null) readJournal() }
+
     /** Generation must increase for every native connection, including a same-address reconnect. */
     fun onConnected(ringAddress: String, connectionGeneration: Long) = dispatch {
         if (connectionGeneration <= highestGeneration) return@dispatch
@@ -114,10 +124,10 @@ class FreeLivingCaptureCoordinator(
         publish(CaptureControlPhase.NEEDS_REVIEW, CaptureControlIssue.CONNECTION_LOST)
     }
 
-    fun requestStart(preparation: PreparationSnapshot) = dispatch {
+    fun requestStart(preparation: PreparationSnapshot, allowedExisting: ExistingRecordAuthorization? = null) = dispatch {
         if (!ensureRestored() || round != null || intent != null || session != null) return@dispatch
         if (!connectedTo(preparation.ring?.address)) return@dispatch
-        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId())
+        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting)
         beginRound(Purpose.PREFLIGHT)
     }
 
@@ -126,7 +136,7 @@ class FreeLivingCaptureCoordinator(
         val current = session ?: return@dispatch
         if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE) return@dispatch
         if (!connectedTo(current.preparation.ring?.address)) return@dispatch
-        if (ownership == null || baseline?.connectionGeneration != generation) {
+        if (ownership == null || current.deviceAssociationInvalidated) {
             review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW)
             return@dispatch
         }
@@ -162,9 +172,11 @@ class FreeLivingCaptureCoordinator(
             if (watchingOwnedCollection &&
                 (!validStatus(status) || !status.collecting || status.errorCode != 0 ||
                     status.sessionId != ownership?.sessionId || statusRegressed(status))) {
-                clearAssociation()
-                review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE)
+                rejectAssociation(CaptureControlIssue.UNEXPECTED_DEVICE_STATE)
             } else if (watchingOwnedCollection) {
+                val previous = session?.deviceRecordEvidence
+                if (previous != null && save { store.updateDeviceEvidence(requireNotNull(session).sessionId,
+                    previous.copy(status = status, observedAtMs = packet.receivedEpochMs)) } == null) return@dispatch
                 lastStatus = status
             }
             return@dispatch
@@ -231,14 +243,15 @@ class FreeLivingCaptureCoordinator(
             Purpose.PREFLIGHT -> {
                 val requested = intent ?: return
                 intent = null
-                if (observed.status.collecting || observed.status.bytes != 0L || observed.status.records != 0L || observed.records.isNotEmpty()) {
-                    review(CaptureControlIssue.EXISTING_RECORDS, observed)
+                if (!allowedBaseline(observed, requested.allowedExisting)) {
+                    if (state.phase != CaptureControlPhase.STORAGE_ERROR) review(CaptureControlIssue.EXISTING_RECORDS, observed)
                     return
                 }
                 // A second owner of this journal is unsupported. Recheck before issuing a command.
                 val existing = try { store.readPending() } catch (_: Exception) { storageFailure(); return }
                 if (existing != null) { session = existing; publishRestored(); return }
-                val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone) } ?: return
+                val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
+                    DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs)) } ?: return
                 baseline = observed
                 publish(CaptureControlPhase.STARTING, observed = observed)
                 if (!send(port::start)) return
@@ -247,22 +260,26 @@ class FreeLivingCaptureCoordinator(
             }
             Purpose.START -> confirmStart(observed)
             Purpose.STOP -> confirmStop(observed)
-            Purpose.INSPECT -> review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)
+            Purpose.INSPECT -> recoverAssociation(observed)
         }
     }
 
     private fun confirmStart(observed: HealthRecordObservation) {
         val before = baseline
         val current = session ?: return
-        val candidate = observed.records.singleOrNull()
+        val candidate = observed.records.singleOrNull { record -> before?.let {
+            FreeLivingSessionStore.isDistinctStartRecord(DeviceStartBaseline(it.status, it.records, it.statusReceivedAtMs), record)
+        } == true }
         if (before == null || before.connectionGeneration != generation || !observed.status.collecting || candidate == null ||
-            candidate.sessionId == 0 || candidate.sessionId == before.status.sessionId ||
-            candidate.sessionId != observed.status.sessionId || candidate.unixMs <= 0 ||
-            candidate.bytes < observed.status.bytes || candidate.records < observed.status.records) {
+            candidate.sessionId == 0 ||
+            candidate.sessionId != observed.status.sessionId || (candidate.unixMs == 0L && candidate.uptimeMs == 0L) ||
+            candidate.bytes < observed.status.bytes || candidate.records < observed.status.records ||
+            !onlyKnownRecords(observed, candidate)) {
             review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
             return
         }
-        if (save { store.confirmStart(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs) } == null) return
+        if (save { store.confirmStart(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs,
+                recordEvidence = DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
         ownership = identity(candidate)
         lastRecord = candidate
         lastStatus = observed.status
@@ -271,22 +288,82 @@ class FreeLivingCaptureCoordinator(
 
     private fun confirmStop(observed: HealthRecordObservation) {
         val current = session ?: return
-        val candidate = observed.records.singleOrNull()
+        val candidate = observed.records.singleOrNull { it.sessionId == current.deviceSessionId }
         val previous = lastRecord
         if (observed.status.collecting) { review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed); return }
         if (ownership == null || candidate == null || identity(candidate) != ownership ||
             observed.status.sessionId != candidate.sessionId || previous == null ||
             statusRegressed(observed.status) ||
             candidate.bytes < previous.bytes || candidate.records < previous.records ||
-            candidate.bytes < observed.status.bytes || candidate.records < observed.status.records) {
-            clearAssociation()
-            review(CaptureControlIssue.RECORD_CHANGED, observed)
+            candidate.bytes != observed.status.bytes || candidate.records != observed.status.records ||
+            !onlyKnownRecords(observed, candidate)) {
+            rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
             return
         }
-        if (save { store.confirmStop(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs) } == null) return
+        if (save { store.confirmStop(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs,
+                recordEvidence = DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
         lastRecord = candidate
         lastStatus = observed.status
         publish(CaptureControlPhase.AWAITING_REFERENCE, observed = observed)
+    }
+
+    private fun allowedBaseline(observed: HealthRecordObservation, authorization: ExistingRecordAuthorization?): Boolean {
+        if (observed.status.collecting) return false
+        if (observed.records.isEmpty()) return observed.status.bytes == 0L && observed.status.records == 0L
+        if (observed.records.none { it.sessionId == observed.status.sessionId && it.bytes == observed.status.bytes &&
+                it.records == observed.status.records }) return false
+        if (authorization?.ringAddress?.uppercase(Locale.ROOT) == observed.address && authorization.status == observed.status &&
+            authorization.records.toSet() == observed.records.toSet()) return true
+        return try { store.hasPreservedDeviceRecords(observed.address, observed.records) }
+        catch (_: Exception) { storageFailure(); false }
+    }
+
+    private fun onlyKnownRecords(observed: HealthRecordObservation, candidate: HealthMessage.ListItem): Boolean {
+        val known = session?.startBaseline?.records ?: return false
+        return observed.records.all { it == candidate || it in known }
+    }
+
+    private fun recoverAssociation(observed: HealthRecordObservation) {
+        val current = session ?: return
+        val evidence = current.deviceRecordEvidence
+        // Zero UNIX means the device clock is unknown. An uninterrupted issuing connection can
+        // prove a new ID plus uptime, but uptime alone cannot disambiguate another boot here.
+        if (evidence == null || current.deviceAssociationInvalidated || evidence.record.unixMs == 0L) {
+            review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)
+            return
+        }
+        val candidate = observed.records.singleOrNull { it.sessionId == evidence.record.sessionId }
+        if (candidate == null || !FreeLivingSessionStore.sameDeviceRecord(candidate, evidence.record) ||
+            observed.status.sessionId != candidate.sessionId || !onlyKnownRecords(observed, candidate) ||
+            candidate.bytes < evidence.record.bytes || candidate.records < evidence.record.records ||
+            observed.status.bytes < evidence.status.bytes || observed.status.records < evidence.status.records ||
+            candidate.bytes < observed.status.bytes || candidate.records < observed.status.records) {
+            rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
+            return
+        }
+        lastRecord = evidence.record
+        lastStatus = evidence.status
+        if (current.phase == FreeLivingSessionPhase.STOP_REQUESTED) {
+            ownership = identity(candidate)
+            confirmStop(observed)
+        } else if (current.phase == FreeLivingSessionPhase.COLLECTING && observed.status.collecting) {
+            if (save { store.updateDeviceEvidence(current.sessionId,
+                    DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
+            ownership = identity(candidate)
+            lastRecord = candidate
+            lastStatus = observed.status
+            publish(CaptureControlPhase.COLLECTING, observed = observed)
+        } else {
+            // An unsolicited stop has no user stop request. Preserve the record and unknown end.
+            review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
+        }
+    }
+
+    private fun rejectAssociation(issue: CaptureControlIssue, observed: HealthRecordObservation? = null) {
+        val current = session
+        clearAssociation()
+        if (current?.deviceRecordEvidence != null && save { store.invalidateDeviceAssociation(current.sessionId) } == null) return
+        review(issue, observed)
     }
 
     private fun connectedTo(expected: String?): Boolean {
