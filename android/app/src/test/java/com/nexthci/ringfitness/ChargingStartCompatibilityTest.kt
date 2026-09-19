@@ -41,6 +41,7 @@ class ChargingStartCompatibilityTest {
         f.observe(active, listOf(record), reason = 0)
         assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
         f.coordinator.requestStop()
+        f.advance(2500)
         f.observe(active.copy(collecting = false), listOf(record), reason = 0)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
         assertNotNull(f.store.readPending()!!.stopConfirmedAtMs)

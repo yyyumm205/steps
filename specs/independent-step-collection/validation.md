@@ -659,3 +659,41 @@ adb -s <emulator-serial> shell am instrument -w -e class com.nexthci.ringfitness
 真机短采使用`ChargingRecoveryDeviceInstrumentedTest`，默认不执行。先核对准备档案、设备地址与待处理任务，按测试中的保护目录前置条件保存并验证历史副本，再显式设置`verifyChargingRecovery=true`；`expectedStartError`默认-16，本轮因旧版已读到0而显式设为0。同一run有一次START标记，重跑不得删除标记或覆盖原记录；下一次诊断应先完成现有记录审查并准备独立运行目录。该测试无上传实例，异常时只在同连接且唯一新指纹可确认的条件下尝试停止与原始文件保全。
 
 下一项按计划验证正式计步器同步短采、新上传的研究端自动到达及时间质量；下载中断、采集中进程/整机重启、长时与多记录真机恢复继续待执行。真实-16兼容及“开始后collecting仍带错误”的跨连接恢复尚未通过设备验收，继续作为独立试用前的限制。本轮未上传新增诊断记录，实验参考来源与研究纳入规则保持原义。
+
+## 24. 手机时间与SDK兼容补全（2026-09-19，E25）
+
+版本0.7.7-phone-time（41），研究导入器0.2.0。基于0.7.6已提交源码隔离构建，本轮保留并排除暂停的走路/跑步改动及本机配置。依据参考Python SDK核对TIME、INFO和HEALTH行为；原始交接资料保持原样。
+
+### 行为与证据范围
+
+| 路径 | 本轮实现及验收依据 |
+| --- | --- |
+| 新采集前手机校时 | 重新查空闲STATUS/LIST及旧文件保护 → 单次TIME SET → 同连接有效TIME回复 → 原子保存尝试证据 → 再核对原记录未变化 → 绑定session → 开始。预检期间的提前TIME、超时/迟到、手机调时、证据过期、文件保存失败及断连均有回归；绑定失败后仍可重新连接和结束未确认尝试 |
+| TIME与INFO协议 | TIME按19字节、有符号存储范围及同步标志严格解析；INFO检查声明组件完整长度，保留型号/存在/探测信息、未知值及允许的扩展尾部。TIME GET已具备底层命令；正式结束/重连探测、完整INFO落盘按下一项接入 |
+| 停止确认与恢复 | STOP单次发送，1000ms后首次查询，后续1500ms间隔、最多3轮完整核对；等待期间分别保存真实STATUS/LIST高水位。自发停止回复保留为观察，停止确认等待完整同指纹查询。覆盖计数回退、身份改变、停止后再次采集、重开、保存失败及旧回调隔离 |
+| 已保存结果呈现 | 恢复页以实际pending任务决定“这一步未完成”，上一段完整记录保持已保存；演示上传失败仍停留在已保存结果页并单独重试。原远程“保存后自动卡住”的完整现场触发链尚待核对 |
+| 旧包研究时间 | 单独输出目录生成phone_capture_window_v1及显式估算列，各通道共用平移并保留原采样间隔。原ZIP、manifest、raw、参考0步及未知时间字段保持原义；重导、缺失/异常时序、跨午夜、多文件与输出配额有回归 |
+
+### 执行结果
+
+| 类别 | 结果 | 适用范围与限制 |
+| --- | --- | --- |
+| Android JVM | 全量454项通过，失败0、错误0、跳过0；比E24新增60项 | 校时、协议、STOP、保存及现有流程；含首条/重复STATUS高水位、查询上限和重开回归。统计来自隔离后的交付源码，排除暂停的走跑测试 |
+| Python pytest | 全量192项通过，失败0、跳过0；新增13项 | 交付源码的导入与估算；原走跑未提交测试未计入 |
+| 构建 | Debug、AndroidTest、Release及lintVitalRelease通过 | Release产物未签名；实际安装验证使用Debug签名APK。完整lint未执行；既有弃用API警告保留 |
+| 模拟器运行 | API31共31个不同用例通过：CollectionFlow 21项（含截图150.349秒），末次代码再运行Bridge 10项与0步/完整保存重开2项，12项通过（52.104秒） | 真实原生输入、保存、重建、缺失/不可靠参考、0步、上传失败恢复、跨午夜时区及服务交接；BLE、原始信号和网络为测试替身。21项全量在末次STOP内部修复前执行，最终APK复测上述12项 |
+| 已有真实包处理 | 1个0步包在新目录导入通过：132个packet、2208个IMU和1081个PPG样本，原包SHA与参考数不变 | 手机请求至停止确认45036ms，全通道uptime跨度44143ms；可行平移半宽446.5ms是既定假设下的范围，不能作为实测校时精度；analysis仍pending_review |
+| 真机校时 | 受设备连接条件限制，待执行 | 本轮末电脑仅检测到模拟器。PhoneClockDeviceInstrumentedTest已构建，显式启用后只执行一次SET和前后GET/STATUS/LIST及文件不变核对；未运行不记为通过 |
+| 独立审查 | Controller、协议、持久化、STOP及后端分别审查，已修复确认的问题 | 回归覆盖绑定保存失败卡住、缓存空闲误用、最终START前手机调时、提前TIME、停止高水位和正常自发停止回复。重复STATUS独立审查指出的首条回退遗漏已修复，主代理核实后全量通过 |
+
+首次集成检查发现1项JVM时序旧预期和1项模拟器旧页面预期失败；分别修正STOP等待测试及上传失败的已保存呈现后通过复测。增加首条STATUS持久化后，另有1项目录同步故障测试提前命中观察保存；将故障注入明确移到完整停止确认的LIST_END后，全量454项通过。历史E24结果保持原版本范围。
+
+最终Debug APK SHA-256：`fe73c6470ff41939e49bd082c1ee3fd0f6949f8376ef42c3e6d3b131f6b45bbb`。原位安装保留模拟器现有准备资料；原始截图和详细运行日志保留本地。
+
+### 复现与接续
+
+在已配置JDK/SDK的Android目录执行`gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease lintVitalRelease`。研究端执行`python -m pytest backend/ringo_data/tests -q`。模拟器安装Debug及AndroidTest后，用AndroidJUnitRunner运行`com.nexthci.ringfitness.CollectionFlowInstrumentedTest`，参数`verifyCollectionFlow=true`；`captureFlowScreens=true`保存原生页面截图到测试App缓存。截图与详细设备日志保留本地。
+
+真机校时先核对当前档案、全部旧记录备份及无未完成session，停止现有连接owner后，显式设置`verifyPhoneClock=true`运行`PhoneClockDeviceInstrumentedTest`。该测试无START/STOP/READ或上传操作；保存前后文件哈希及旧记录列表，TIME不支持或保护条件不足应失败退出并保留原件。真实开始、后台采集及停止后的文件时间仍须再做短采。
+
+下一项接通校时证据的版本化上传和研究端映射，结束及重连只读查询设备时钟；随后补INFO观察留存、电量刷新和未知Unix旧记录的跨连接连续使用。TIME协议缺少请求序号，当前连接代次与时间窗口只能限制响应归属；长时漂移、固件TIME支持、旧记录不受校时影响和远程故障的设备复现仍须实测。下载中断、重启恢复及逐级长时继续按原计划验收。

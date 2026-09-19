@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .health_raw_v2 import OutputBudget, decode_to_csv, read_header
+from .phone_time import add_phone_time
 from .schema import ValidationError, integer, object_value, require, safe_name, strict_json, validate_manifest
 
 
@@ -223,6 +224,7 @@ def decode_archive(stage, manifest, limits):
             validate_sidecar(stage / "raw" / sidecar_name, entry, report, manifest)
             used_evidence.add(sidecar_name)
     require(used_evidence == set(evidence_entries), "orphan raw evidence file")
+    phone_alignment = add_phone_time(manifest, reports, stage / "derived", limits.decoded_bytes)
     reasons = ["sample_clock_uncalibrated", "sample_coverage_not_assessed"]
     if manifest["capture_boundary_status"] != "confirmed":
         reasons.append("capture_boundaries_unknown")
@@ -238,8 +240,9 @@ def decode_archive(stage, manifest, limits):
         reasons.append("duplicate_raw_content")
     if any(c[k] for r in reports for c in r["channels"].values() for k in ("gaps", "overlaps", "rollbacks")):
         reasons.append("raw_timing_discontinuity")
-    quality = {"rules_version": 1, "analysis_status": "pending_review", "analysis_reasons": reasons,
+    quality = {"rules_version": 2, "analysis_status": "pending_review", "analysis_reasons": reasons,
                "daily_aggregation_eligible": False, "absolute_sample_time_status": "unknown",
+               "phone_time_alignment": phone_alignment,
                "sample_coverage_status": "not_assessed", "files": reports,
                "reference_rows": 1, "reference_applies_to": "all_raw_files_in_session",
                "limits": asdict(limits)}
@@ -332,7 +335,7 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
                     require(existing_result(destination, session_id, digest), "existing conflict archive is inconsistent")
                     return ImportResult("conflict", session_id, digest, str(destination))
             artifacts = {p.relative_to(stage).as_posix(): sha256(p) for p in stage.rglob("*") if p.is_file()}
-            write_json(stage / "import.json", {"importer_version": "0.1.0", "session_id": session_id,
+            write_json(stage / "import.json", {"importer_version": "0.2.0", "session_id": session_id,
                        "zip_sha256": digest, "status": status, "analysis_status": quality["analysis_status"],
                        "artifacts": artifacts})
             publish(stage, destination)

@@ -17,6 +17,18 @@ data class ImuFrame(
     val gyroZ: Int,
 )
 
+/** Raw INFO component values remain available even when the model or flag is unknown. */
+data class InfoComponent(
+    val id: Int,
+    val present: Int,
+    val count: Int,
+    val model: Int,
+    val flags: Int,
+) {
+    val probeOk: Boolean get() = flags and 0x01 != 0
+    val probed: Boolean get() = flags and 0x02 != 0
+}
+
 sealed interface SensorPacket {
     val receivedEpochMs: Long
 
@@ -46,6 +58,13 @@ sealed interface SensorPacket {
         override val receivedEpochMs: Long,
     ) : SensorPacket
 
+    data class TimeStatus(
+        val synced: Boolean,
+        val unixMs: Long,
+        val uptimeMs: Long,
+        override val receivedEpochMs: Long,
+    ) : SensorPacket
+
     data class Info(
         val formatVersion: Int,
         val hardwareRevision: Int,
@@ -55,6 +74,7 @@ sealed interface SensorPacket {
         val firmwareTweak: Int,
         val componentCount: Int,
         override val receivedEpochMs: Long,
+        val components: List<InfoComponent> = emptyList(),
     ) : SensorPacket {
         val firmwareVersion: String
             get() {
@@ -117,6 +137,11 @@ object RingProtocol {
     private const val SUBCMD_IMU_START = 0x00
     private const val SUBCMD_IMU_STOP = 0x01
     private const val SUBCMD_IMU_PACKET = 0x02
+
+    private const val CMD_TIME = 0x23
+    private const val SUBCMD_TIME_SET = 0x00
+    private const val SUBCMD_TIME_GET = 0x01
+    private const val SUBCMD_TIME_STATUS = 0x02
 
     private const val CMD_PPG = 0x24
     private const val SUBCMD_PPG_START = 0x00
@@ -210,6 +235,15 @@ object RingProtocol {
 
     fun buildInfoGet(): ByteArray = byteArrayOf(CMD_INFO.toByte(), SUBCMD_INFO_GET.toByte())
 
+    /** UTC milliseconds, matching the firmware's signed 64-bit representable range. */
+    fun buildTimeSet(unixMs: Long): ByteArray {
+        require(unixMs >= 0) { "同步时间超出支持范围" }
+        return ByteBuffer.allocate(10).order(ByteOrder.LITTLE_ENDIAN)
+            .put(CMD_TIME.toByte()).put(SUBCMD_TIME_SET.toByte()).putLong(unixMs).array()
+    }
+
+    fun buildTimeGet(): ByteArray = byteArrayOf(CMD_TIME.toByte(), SUBCMD_TIME_GET.toByte())
+
     fun buildHealthStart(): ByteArray = byteArrayOf(CMD_HEALTH.toByte(), SUBCMD_HEALTH_START.toByte())
 
     fun buildHealthStop(): ByteArray = byteArrayOf(CMD_HEALTH.toByte(), SUBCMD_HEALTH_STOP.toByte())
@@ -241,6 +275,7 @@ object RingProtocol {
             cmd == CMD_PPG && subCmd == SUBCMD_PPG_RAW_PACKET -> parsePpgRaw(data, receivedEpochMs)
             cmd == CMD_BATTERY && subCmd == SUBCMD_BATTERY_STATUS -> parseBattery(data, receivedEpochMs)
             cmd == CMD_INFO && subCmd == SUBCMD_INFO_STATUS -> parseInfo(data, receivedEpochMs)
+            cmd == CMD_TIME && subCmd == SUBCMD_TIME_STATUS -> parseTimeStatus(data, receivedEpochMs)
             cmd == CMD_HEALTH -> parseHealth(data)?.let { message ->
                 SensorPacket.Health(message, receivedEpochMs,
                     statusErrorReason = if (message is HealthMessage.Status && data.size >= 16)
@@ -252,6 +287,19 @@ object RingProtocol {
 
     private fun parseInfo(data: ByteArray, receivedEpochMs: Long): SensorPacket.Info? {
         if (data.size < 9) return null
+        val count = data[8].toInt() and 0xFF
+        if (data.size < 9 + count * 5) return null
+        // Match the SDK: parse exactly the declared list and allow trailing extension bytes.
+        val components = List(count) { index ->
+            val offset = 9 + index * 5
+            InfoComponent(
+                id = data[offset].toInt() and 0xFF,
+                present = data[offset + 1].toInt() and 0xFF,
+                count = data[offset + 2].toInt() and 0xFF,
+                model = data[offset + 3].toInt() and 0xFF,
+                flags = data[offset + 4].toInt() and 0xFF,
+            )
+        }
         return SensorPacket.Info(
             formatVersion = data[2].toInt() and 0xFF,
             hardwareRevision = data[3].toInt() and 0xFF,
@@ -259,9 +307,25 @@ object RingProtocol {
             firmwareMinor = data[5].toInt() and 0xFF,
             firmwarePatch = data[6].toInt() and 0xFF,
             firmwareTweak = data[7].toInt() and 0xFF,
-            componentCount = data[8].toInt() and 0xFF,
+            componentCount = count,
             receivedEpochMs = receivedEpochMs,
+            components = components,
         )
+    }
+
+    private fun parseTimeStatus(data: ByteArray, receivedEpochMs: Long): SensorPacket.TimeStatus? {
+        // The SDK's current TIME STATUS is exactly 19 bytes; legacy or extended layouts
+        // need their own documented parser before they can serve as clock evidence.
+        if (data.size != 19) return null
+        val synced = data[2].toInt() and 0xFF
+        if (synced !in 0..1) return null
+        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.position(3)
+        val unixMs = buffer.long
+        val uptimeMs = buffer.long
+        // Wire fields are uint64. Reject values which would overflow the app's Long.
+        if (unixMs < 0 || uptimeMs < 0) return null
+        return SensorPacket.TimeStatus(synced == 1, unixMs, uptimeMs, receivedEpochMs)
     }
 
     private fun parseHealth(data: ByteArray): HealthMessage? {

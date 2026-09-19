@@ -403,7 +403,7 @@ class DemoFlowController(
                 safely {
                     if (consume(FlowTestFault.UPLOAD_FAILURE)) {
                         store.markTransferFailed(sessionId)
-                        if (isCurrentTransferTask(sessionId)) publish(CollectionPage.ERROR, "数据已保存在手机，上传请重试")
+                        if (isCurrentTransferTask(sessionId)) publish(CollectionPage.COMPLETE, "数据已保存在手机，上传请重试")
                         else publish(state.page)
                         return@safely
                     }

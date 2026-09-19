@@ -57,6 +57,8 @@ python -m pytest backend/ringo_data/tests -q
 
 ## 时间、活动标签与质量边界
 
+导入器0.2.0为单文件session增加手机时间估算：所有通道共用`phone_capture_window_v1`平移，手机开始请求与停止确认约束样本时间轴，取可行区间中点。新增`phone_estimated_unix_ms/iso`及`phone_earliest_unix_ms/phone_latest_unix_ms/phone_time_source`；quality的`phone_time_alignment`记录区间与假设。手机时钟稳定、设备标称速率和原session关联是前提，该范围不等于实测校时精度。时序异常、回卷、过长信号或多文件时保留`unavailable`原因；原有时间、数据和参考不改写，分析资格仍待核对。已导入同包继续返回既有结果；需要新版派生列时，用相同`import`命令指定新的独立`--output`目录，原输入与旧研究产物保留。
+
 - `timestamp_unix_ms`、`timestamp_iso` 当前留空：尚无验证通过的样本绝对时间标定。真实起止未知时 manifest 使用 null，rfbin 头使用 0；解码保持未知。
 - `packet_uptime_ms` 保留包内端点；`ring_uptime_ms` 按包内样本位置及标称周期展开。IMU 为 20 ms，PPG 为 40 ms。`relative_sample_offset_ms` 相对当前文件该通道首样本，`relative_to_device_anchor_ms` 相对原始设备锚点；回退和环绕保持原差值。
 - `device_anchor_estimated_unix_ms/iso` 单列设备锚推算值，仅用于诊断，不能作为真实采集边界。质量报告保留缺口、重叠及 uptime 回退统计，不插值、补点、重采样或拼成连续时间。

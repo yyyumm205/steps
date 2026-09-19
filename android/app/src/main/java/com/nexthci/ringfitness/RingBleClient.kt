@@ -345,6 +345,13 @@ class RingBleClient(
     fun stopPpg(): Boolean = enqueue(RingProtocol.buildPpgStop())
     fun requestBattery(): Boolean = enqueue(RingProtocol.buildBatteryGet())
     fun requestDeviceInfo(): Boolean = enqueue(RingProtocol.buildInfoGet())
+    /**
+     * The supplied phone time is captured at enqueue, before the queue's GATT write.
+     * The caller must validate the returned TIME STATUS and full request/response delay
+     * before accepting clock evidence; true only means the command entered this queue.
+     */
+    fun syncTime(unixMs: Long): Boolean = enqueue(RingProtocol.buildTimeSet(unixMs))
+    fun requestTime(): Boolean = enqueue(RingProtocol.buildTimeGet())
     fun startHealth(): Boolean = enqueue(RingProtocol.buildHealthStart())
     fun stopHealth(): Boolean = enqueue(RingProtocol.buildHealthStop())
     fun requestHealthStatus(): Boolean = enqueue(RingProtocol.buildHealthStatusGet())
@@ -370,7 +377,7 @@ class RingBleClient(
 
     private fun handleNotification(value: ByteArray) {
         val command = value.firstOrNull()?.toInt()?.and(0xFF)
-        if (command == 0x29 || command == 0x2A || command == 0x32) {
+        if (command == 0x23 || command == 0x29 || command == 0x2A || command == 0x32) {
             controlTrace("RX control command=0x${command.toString(16)} bytes=${value.size}")
         }
         val packet = RingProtocol.parseNotification(
@@ -412,7 +419,7 @@ class RingBleClient(
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         }
         val command = packet.firstOrNull()?.toInt()?.and(0xFF)
-        if (command == 0x29 || command == 0x2A || command == 0x32) {
+        if (command == 0x23 || command == 0x29 || command == 0x2A || command == 0x32) {
             controlTrace(
                 "TX control command=0x${command.toString(16)} " +
                     "subcommand=${packet.getOrNull(1)?.toInt()?.and(0xFF)} " +

@@ -1619,6 +1619,7 @@ class RingCaptureService : Service(), RingBleClient.Listener {
                     publishState()
                 }
                 is SensorPacket.Health -> handler.post { handleHealth(packet.message) }
+                is SensorPacket.TimeStatus -> Unit
             }
         } catch (error: Exception) {
             Log.e(TAG, "Capture write failed", error)

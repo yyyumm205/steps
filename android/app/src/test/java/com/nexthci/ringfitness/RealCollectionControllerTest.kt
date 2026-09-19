@@ -901,12 +901,150 @@ class RealCollectionControllerTest {
         assertNotNull(f.store.readPending())
     }
 
+    @Test fun phoneClockSyncCompletesBeforeStartAndBindsTheDurableSession() = Fixture(syncClock = true).use { f ->
+        f.connectReady()
+        assertEquals(0, f.port.count("time"))
+        f.owner.start(); f.owner.start()
+        assertEquals(0, f.port.count("time"))
+        f.observe(idle()) // Fresh idle check before changing device time.
+        assertEquals(1, f.port.count("time"))
+        assertEquals(0, f.port.count("start"))
+        assertNull(f.store.readPending())
+        assertFalse(f.owner.canReleaseIfIdle())
+        assertFalse(f.owner.state.canRetry)
+        f.timeReply()
+        assertEquals(1, f.clockEvidence.size)
+        assertNull(f.clockEvidence.single().second)
+        f.observe(idle()) // Post-sync unchanged record snapshot.
+        f.observe(idle()) // Capture preflight is still required.
+        assertEquals(1, f.port.count("start"))
+        assertEquals(f.store.readPending()!!.sessionId, f.clockEvidence.last().second)
+        assertEquals(f.clockEvidence.first().first, f.clockEvidence.last().first)
+        f.observe(collecting(), listOf(initialRecord))
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        f.owner.saveReference("0", "valid", ""); f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+        assertEquals(0L, f.store.read()!!.reference!!.steps)
+        f.reopen()
+        assertEquals(1, f.port.count("time")) // Recovery/opening never writes the clock.
+        assertNotNull(f.store.read()!!.localData)
+    }
+
+    @Test fun unsolicitedTimeDuringIdlePrecheckCannotReplaceTheClockWrite() = Fixture(syncClock = true).use { f ->
+        f.connectReady(); f.owner.start()
+        f.timeReply()
+        assertTrue(f.clockEvidence.isEmpty())
+        assertEquals(0, f.port.count("time"))
+        assertEquals(0, f.port.count("start"))
+        f.observe(idle())
+        assertEquals(1, f.port.count("time"))
+        assertTrue(f.clockEvidence.isEmpty())
+        assertEquals(0, f.port.count("start"))
+        f.timeReply()
+        assertEquals(1, f.clockEvidence.size)
+        f.observe(idle()); f.observe(idle())
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun clockTimeoutAndLateReplyNeverIssueStart() = Fixture(syncClock = true).use { f ->
+        f.connectReady(); f.owner.start(); f.observe(idle())
+        f.clock.elapsed += PhoneClockSync.TIMEOUT_MS
+        f.runDelay(PhoneClockSync.TIMEOUT_MS)
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        f.timeReply()
+        assertEquals(0, f.port.count("start"))
+        assertNull(f.store.readPending())
+        f.owner.retry()
+        assertTrue(f.owner.state.connecting)
+    }
+
+    @Test fun rejectedClockReplyOrWriteFailureKeepsStartUnsent() {
+        for (mode in listOf("unsynced", "clock-jump", "storage", "binding")) Fixture(syncClock = true).use { f ->
+            f.connectReady(); f.owner.start(); f.observe(idle())
+            if (mode == "clock-jump") f.clock.now += 5000
+            if (mode == "storage") f.failClockEvidence = true
+            f.timeReply(synced = mode != "unsynced")
+            if (mode == "binding") {
+                f.failClockEvidence = true
+                f.observe(idle()); f.observe(idle())
+            }
+            assertEquals("mode=$mode", 0, f.port.count("start"))
+            assertEquals(CollectionPage.ERROR, f.owner.state.page)
+            assertFalse(f.owner.state.canStart)
+            assertTrue("Failed clock persistence must leave a recovery action", f.owner.state.canRetry)
+            if (mode == "binding") {
+                f.failClockEvidence = false
+                f.owner.retry(); f.owner.onConnected(f.port.generation)
+                f.observe(idle())
+                assertEquals(0, f.port.count("start"))
+                assertTrue(f.owner.state.canEndStartAttempt)
+            }
+        }
+    }
+
+    @Test fun changedRecordsAfterClockSyncCannotAuthorizeStart() = Fixture(syncClock = true).use { f ->
+        f.connectReady(); f.owner.start(); f.observe(idle()); f.timeReply()
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertFalse(f.owner.state.canStart)
+        assertEquals(0, f.port.count("start"))
+        assertNull(f.store.readPending())
+    }
+
+    @Test fun disconnectOrCloseInvalidatesOutstandingClockReply() {
+        for (close in listOf(false, true)) Fixture(syncClock = true).use { f ->
+            f.connectReady(); f.owner.start(); f.observe(idle())
+            if (close) f.owner.close() else f.owner.onDisconnected(f.port.generation, "断连")
+            f.timeReply()
+            assertEquals(0, f.port.count("start"))
+            assertTrue(f.clockEvidence.isEmpty())
+            assertNull(f.store.readPending())
+        }
+    }
+
+    @Test fun clockWriteRequiresFreshIdleAndUnsolicitedCollectionInvalidatesReadiness() {
+        for (unsolicited in listOf(false, true)) Fixture(syncClock = true).use { f ->
+            f.connectReady()
+            if (unsolicited) f.health(collecting())
+            f.owner.start()
+            if (!unsolicited) f.observe(collecting(), listOf(initialRecord))
+            assertFalse(f.owner.state.canStart)
+            assertEquals(0, f.port.count("time"))
+            assertEquals(0, f.port.count("start"))
+        }
+    }
+
+    @Test fun phoneClockChangeAfterSyncBlocksPreflightAndActualStart() {
+        for (duringWait in listOf(false, true)) Fixture(syncClock = true, deferCaptureWaits = true).use { f ->
+            f.connectReady(); f.owner.start(); f.observe(idle()); f.timeReply(); f.observe(idle())
+            if (!duringWait) f.clock.now += 5_000
+            f.observe(idle())
+            if (duringWait) {
+                f.clock.now += 5_000
+                f.runDelay(500)
+            }
+            assertEquals(0, f.port.count("start"))
+            assertTrue(f.owner.state.canRetry)
+        }
+    }
+
+    @Test fun expiredClockEvidenceCannotStartAfterSlowPreflight() = Fixture(syncClock = true).use { f ->
+        f.connectReady(); f.owner.start(); f.observe(idle()); f.timeReply(); f.observe(idle())
+        f.clock.now += PhoneClockSync.MAX_START_AGE_MS + 1
+        f.clock.elapsed += PhoneClockSync.MAX_START_AGE_MS + 1
+        f.observe(idle())
+        assertEquals(0, f.port.count("start"))
+        assertTrue(f.owner.state.canRetry)
+    }
+
     private inner class Fixture(private val uploads: RealUploadPort? = null,
-        private val deferCaptureWaits: Boolean = false) : AutoCloseable {
+        private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false) : AutoCloseable {
         val directory = temporary.newFolder()
         var failCommit = false
         var failObservation = false
         var failDownloadSyncAfterLocalCommit = false
+        var failClockEvidence = false
+        val clockEvidence = mutableListOf<Pair<PhoneClockSyncEvidence, String?>>()
         val preparation = PreparationStore(File(directory, "profile")) { source, target -> replace(source, target) }.apply {
             register("owner001", RingPlacement.LEFT_INDEX)
             selectRing(ring)
@@ -936,7 +1074,16 @@ class RealCollectionControllerTest {
                         throw IOException("注入已保存后的清理同步失败")
                     }
                 }) }, uploads = uploads,
-            backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}))
+            backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}), syncClockBeforeStart = syncClock,
+            saveClockEvidence = { evidence, sessionId ->
+                if (failClockEvidence) throw IOException("校时证据保存失败")
+                clockEvidence += evidence to sessionId
+            })
+
+        fun timeReply(synced: Boolean = true) {
+            clock.now += 10; clock.elapsed += 10
+            owner.onTime(port.generation, SensorPacket.TimeStatus(synced, clock.now - 5, 500, clock.now))
+        }
 
         fun seedLocal(simulated: Boolean = false): FreeLivingSession {
             val session = store.requestStart(preparation.read()!!, ++clock.now, "Asia/Shanghai")
@@ -1041,6 +1188,7 @@ class RealCollectionControllerTest {
         override fun disconnect() { calls += "disconnect" }
         override fun queryStatus() = send("status")
         override fun queryBattery() = send("battery")
+        override fun syncTime(unixMs: Long) = send("time")
         override fun queryRecords() = send("list")
         override fun start() = send("start")
         override fun stop() = send("stop")
@@ -1054,6 +1202,8 @@ class RealCollectionControllerTest {
     }
 
     private class TestClock(var now: Long) : CaptureClock {
+        var elapsed = 10_000L
+        override fun nowElapsedMs() = elapsed
         override fun nowEpochMs() = now
         override fun timeZoneId() = "Asia/Shanghai"
     }

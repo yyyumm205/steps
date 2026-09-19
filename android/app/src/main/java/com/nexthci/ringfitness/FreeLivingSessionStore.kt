@@ -326,6 +326,7 @@ class FreeLivingSessionStore internal constructor(
         require(sameDeviceRecord(previous.record, evidence.record)) { "设备记录已变化" }
         require(evidence.record.bytes >= previous.record.bytes && evidence.record.records >= previous.record.records &&
             evidence.status.bytes >= previous.status.bytes && evidence.status.records >= previous.status.records) { "设备计数发生回退" }
+        require(previous.status.collecting || !evidence.status.collecting) { "停止状态发生回退" }
         current.copy(deviceRecordEvidence = evidence)
     }
 
@@ -653,7 +654,8 @@ class FreeLivingSessionStore internal constructor(
                 // An unsolicited STATUS may be newer than the most recently completed LIST.
                 if (hasStop) require(!evidence.status.collecting && evidence.record.bytes == evidence.status.bytes &&
                     evidence.record.records == evidence.status.records)
-                else require(evidence.status.collecting)
+                // A requested stop may preserve an early stopped reply while its LIST is pending.
+                else if (!hasStopRequest) require(evidence.status.collecting)
             }
             session.reference?.let {
                 validateReference(it)

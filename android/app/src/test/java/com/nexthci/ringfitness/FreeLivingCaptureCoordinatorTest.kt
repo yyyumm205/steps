@@ -411,7 +411,8 @@ class FreeLivingCaptureCoordinatorTest {
         f.beginCollecting()
         f.coordinator.requestStop()
         f.observe(collecting(), listOf(record()))
-        assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, f.coordinator.state.issue)
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        assertNull(f.coordinator.state.issue)
         f.coordinator.requestStop()
         assertEquals(1, f.port.count("stop"))
         f.coordinator.reconcile()
@@ -440,8 +441,10 @@ class FreeLivingCaptureCoordinatorTest {
         val f = Fixture()
         f.beginCollecting()
         f.coordinator.requestStop()
+        f.health(stopped())
+        f.health(record(bytes = 64, records = 4))
         f.failSyncAfterCommit = true
-        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
+        f.health(HealthMessage.ListEnd(1))
         assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
         f.failSyncAfterCommit = false
         val firstSaved = requireNotNull(f.store.read())

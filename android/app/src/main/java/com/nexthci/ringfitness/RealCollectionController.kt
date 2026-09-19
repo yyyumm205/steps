@@ -5,6 +5,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 
 /** The service supplies a fresh connection generation and serializes every callback. */
 interface RealCollectionPort : HealthControlPort {
+    fun syncTime(unixMs: Long): Boolean = false
     fun connect(ring: PreparedRing, generation: Long): Boolean
     fun disconnect()
     fun read(sessionId: Int, offset: Long, length: Int): Boolean
@@ -37,6 +38,10 @@ class RealCollectionController(
     },
     private val uploads: RealUploadPort? = null,
     private val backups: DeviceRecordBackupStore = DeviceRecordBackupStore(File(directory, "device-backups")),
+    private val syncClockBeforeStart: Boolean = false,
+    private val saveClockEvidence: (PhoneClockSyncEvidence, String?) -> Unit = { evidence, sessionId ->
+        PhoneClockSync.save(directory, evidence, sessionId)
+    },
 ) : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
     private var profile: PreparationSnapshot? = null
@@ -61,6 +66,12 @@ class RealCollectionController(
     private var stopEvidenceGeneration: Long? = null
     private var endStartAttemptReason: String? = null
     private var readinessWait: Long? = null
+    private data class TimeRound(val id: Long, val before: HealthRecordObservation,
+        val requestedAtMs: Long, val requestedElapsedMs: Long, var awaitingReply: Boolean = false,
+        var evidence: PhoneClockSyncEvidence? = null)
+    private var timeRound: TimeRound? = null
+    private var startingClockEvidence: PhoneClockSyncEvidence? = null
+    private var boundClockEvidence: PhoneClockSyncEvidence? = null
     private data class Inspection(val id: Long, val attempt: Int = 1,
         val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
@@ -71,7 +82,13 @@ class RealCollectionController(
         connected = false, connecting = true, busy = true, hasProfile = true)
         private set
 
-    private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store, port, clock,
+    private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store,
+        object : HealthControlPort by port {
+            override fun start(): Boolean {
+                if (syncClockBeforeStart) requireFreshClockEvidence(requireNotNull(boundClockEvidence))
+                return port.start()
+            }
+        }, clock,
         schedule = { delay, action -> scheduler.schedule(delay) { if (!closed) safely(action = action) } }) { control ->
         control.observation?.let(::recordDiagnostic)
         when (control.phase) {
@@ -82,7 +99,16 @@ class RealCollectionController(
                 publish(CollectionPage.HOME)
             }
             CaptureControlPhase.CHECKING -> publish(if (store.readPending() == null) CollectionPage.STARTING else CollectionPage.RECOVERY)
-            CaptureControlPhase.STARTING -> publish(CollectionPage.STARTING)
+            CaptureControlPhase.STARTING -> {
+                startingClockEvidence?.let { evidence ->
+                    val session = requireNotNull(control.session)
+                    requireFreshClockEvidence(evidence)
+                    saveClockEvidence(evidence, session.sessionId)
+                    boundClockEvidence = evidence
+                    startingClockEvidence = null
+                }
+                publish(CollectionPage.STARTING)
+            }
             CaptureControlPhase.COLLECTING -> publish(CollectionPage.COLLECTING)
             CaptureControlPhase.STOPPING -> publish(CollectionPage.STOPPING)
             CaptureControlPhase.AWAITING_REFERENCE -> {
@@ -155,6 +181,7 @@ class RealCollectionController(
     fun onDisconnected(connection: Long, message: String) = safely {
         if (closed || connection != generation) return@safely
         connected = false; connecting = false; query = null; readinessWait = null; lastIdle = null
+        timeRound = null; startingClockEvidence = null; boundClockEvidence = null
         endStartAttemptReason = null
         stopEvidenceGeneration = null
         closeDownload()
@@ -219,6 +246,16 @@ class RealCollectionController(
         }
         val round = query
         if (round == null) {
+            val idle = lastIdle
+            if (idle != null && store.readPending() == null && when (val message = packet.message) {
+                    is HealthMessage.Status -> message != idle.status
+                    is HealthMessage.ListItem -> message !in idle.records
+                    else -> false
+                }) {
+                lastIdle = null
+                publish(CollectionPage.RECOVERY, "戒指状态已变化，请重新检查")
+                return@safely
+            }
             coordinator.onHealth(connection, packet)
             // A restored STOP may already have a preserved reference; inspect its final record.
             if (query == null && coordinator.state.timeoutOperationId == null &&
@@ -296,6 +333,7 @@ class RealCollectionController(
         val recovery = ChargingStartCompatibility.evidence(requireNotNull(round.status), packet, connection,
             requireNotNull(round.batteryRequestedAtMs), clock.nowEpochMs())
         if (recovery == null || clock.nowElapsedMs() - round.startedAtElapsedMs !in 0..ChargingStartCompatibility.FRESHNESS_MS) {
+            timeRound = null
             lastIdle = null
             publish(CollectionPage.RECOVERY, if (packet.chargeStatus != null && packet.chargeStatus != 0)
                 "请将戒指取出充电盒后重试" else "充电状态尚未确认，请重新检查戒指")
@@ -305,10 +343,57 @@ class RealCollectionController(
     override fun register(participantId: String, placement: RingPlacement) = Unit // Preparation owns registration.
 
     override fun start() = safely {
-        if (!state.canStart || connecting || query != null || readinessWait != null || downloader != null || backupObservation != null || saving) return@safely
+        if (!state.canStart || connecting || query != null || readinessWait != null || timeRound != null || downloader != null || backupObservation != null || saving) return@safely
+        if (syncClockBeforeStart) {
+            val before = requireNotNull(lastIdle)
+            require(!before.status.collecting && store.readPending() == null)
+            val round = TimeRound(++operation, before, clock.nowEpochMs(), clock.nowElapsedMs())
+            timeRound = round
+            browsingHome = false; lastIdle = null
+            inspect(errorBaseline = before)
+            return@safely
+        }
+        beginCapture()
+    }
+
+    fun onTime(connection: Long, packet: SensorPacket.TimeStatus) = safely {
+        val round = timeRound ?: return@safely
+        if (!connected || generation != connection || round.before.connectionGeneration != connection ||
+            !round.awaitingReply || round.evidence != null) return@safely
+        val evidence = PhoneClockSync.accept(round.before.address, connection, round.requestedAtMs,
+            round.requestedElapsedMs, clock.nowElapsedMs(), packet)
+        saveClockEvidence(evidence, null)
+        round.evidence = evidence
+        // Re-read the complete idle snapshot: a clock write must not silently relabel old records.
+        inspect(errorBaseline = round.before)
+    }
+
+    private fun beginCapture() {
         browsingHome = false; lastIdle = null
         coordinator.refresh()
         coordinator.requestStart(requireNotNull(profile), authorizedExisting())
+    }
+
+    private fun beginClockSync(before: HealthRecordObservation) {
+        val round = TimeRound(++operation, before, clock.nowEpochMs(), clock.nowElapsedMs())
+        timeRound = round
+        publish(CollectionPage.STARTING)
+        check(port.syncTime(round.requestedAtMs)) { "时间同步未完成，请重新连接后再试" }
+        round.awaitingReply = true
+        scheduler.schedule(PhoneClockSync.TIMEOUT_MS) {
+            if (!closed && timeRound?.id == round.id && timeRound?.evidence == null) safely {
+                timeRound = null; lastIdle = null
+                publish(CollectionPage.RECOVERY, "时间同步超时，请重新连接后再试")
+            }
+        }
+    }
+
+    private fun requireFreshClockEvidence(evidence: PhoneClockSyncEvidence) {
+        val elapsed = clock.nowElapsedMs() - evidence.receivedElapsedMs
+        require(elapsed in 0..PhoneClockSync.MAX_START_AGE_MS &&
+            kotlin.math.abs((clock.nowEpochMs() - evidence.receivedAtMs) - elapsed) <= PhoneClockSync.MAX_WALL_CLOCK_SKEW_MS) {
+            "时间同步已过期，请重新连接后再试"
+        }
     }
 
     override fun stop() = safely {
@@ -428,6 +513,7 @@ class RealCollectionController(
 
     private fun connect() {
         if (connecting) return
+        timeRound = null; startingClockEvidence = null; boundClockEvidence = null
         closeDownload(); query = null; readinessWait = null; lastIdle = null
         stopEvidenceGeneration = null
         if (connected) coordinator.onDisconnected(generation)
@@ -449,7 +535,7 @@ class RealCollectionController(
         val id = ++operation
         query = Inspection(id, attempt, errorBaseline, startedAtElapsedMs = clock.nowElapsedMs())
         if (store.readPending()?.reference != null) publish(CollectionPage.DOWNLOADING)
-        else publish(CollectionPage.HOME)
+        else publish(if (timeRound != null) CollectionPage.STARTING else CollectionPage.HOME)
         check(port.queryStatus()) { "查询未完成，请重新连接" }
         scheduler.schedule(30_000) {
             if (!closed && query?.id == id) safely {
@@ -469,6 +555,7 @@ class RealCollectionController(
             observed.status.copy(errorCode = 0) == baseline.status.copy(errorCode = 0) &&
             observed.records.size == baseline.records.size && observed.records.toSet() == baseline.records.toSet())
         if (observed.status.collecting || !unchanged) {
+            timeRound = null
             publish(CollectionPage.RECOVERY, "戒指记录需要核对，请联系研究者")
             return
         }
@@ -487,11 +574,21 @@ class RealCollectionController(
                 }
             }
             lastIdle = observed
+            timeRound?.let { timing ->
+                val evidence = timing.evidence
+                if (evidence == null) { beginClockSync(observed); return }
+                requireFreshClockEvidence(evidence)
+                timeRound = null
+                startingClockEvidence = evidence
+                beginCapture()
+                return
+            }
             taskPage = null; taskError = null
             publish(CollectionPage.HOME)
             return
         }
         if (round.attempt >= READINESS_CHECK_LIMIT) {
+            timeRound = null
             publish(CollectionPage.RECOVERY, "戒指仍返回异常，请联系研究者")
             return
         }
@@ -595,7 +692,7 @@ class RealCollectionController(
     }
 
     fun close() {
-        closed = true; generation++; query = null; readinessWait = null
+        closed = true; generation++; query = null; readinessWait = null; timeRound = null; startingClockEvidence = null
         coordinator.close()
         runCatching { closeDownload() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
         runCatching { port.disconnect() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
@@ -609,7 +706,7 @@ class RealCollectionController(
     }
 
     /** Called on the serial owner executor before committing a UI-requested release. */
-    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && downloader == null && backupObservation == null &&
+    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && timeRound == null && downloader == null && backupObservation == null &&
         coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
 
     private fun publish(page: CollectionPage, error: String? = null) {
@@ -618,19 +715,19 @@ class RealCollectionController(
         if (page != CollectionPage.HOME) { taskPage = page; taskError = error }
         val visible = if (browsingHome) CollectionPage.HOME else page
         val idle = lastIdle
-        val checkingDevice = pending == null && connected && (query != null || readinessWait != null)
-        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && backupObservation == null
+        val checkingDevice = pending == null && connected && (query != null || readinessWait != null || timeRound != null)
+        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null
         state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
             hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
             placement = (pending?.preparation ?: profile)?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
             preservingExisting = backupObservation != null,
-            busy = connecting || query != null || readinessWait != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
+            busy = connecting || query != null || readinessWait != null || timeRound != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
-            canRetry = !connecting && query == null && readinessWait == null && downloader == null && backupObservation == null && !coordinator.state.settling,
+            canRetry = !connecting && query == null && readinessWait == null && timeRound == null && downloader == null && backupObservation == null && !coordinator.state.settling,
             canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,
@@ -641,6 +738,15 @@ class RealCollectionController(
     private fun safely(failurePage: CollectionPage = CollectionPage.ERROR, action: () -> Unit) {
         if (closed) return
         try { action() } catch (error: Exception) {
+            val clockStartFailed = startingClockEvidence != null
+            timeRound = null; startingClockEvidence = null
+            if (clockStartFailed) {
+                // Binding failed inside the coordinator's pre-START callback. Cancel its
+                // unscheduled wait and require fresh recovery queries on a new connection.
+                connected = false
+                runCatching { coordinator.onDisconnected(generation) }
+                runCatching { port.disconnect() }
+            }
             endStartAttemptReason = null
             reportError(error)
             runCatching { closeDownload() }

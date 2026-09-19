@@ -81,6 +81,7 @@ class RealCollectionService : Service() {
                                 when (packet) {
                                     is SensorPacket.Health -> submit { it.onHealth(generation, packet) }
                                     is SensorPacket.Battery -> submit { it.onBattery(generation, packet) }
+                                    is SensorPacket.TimeStatus -> submit { it.onTime(generation, packet) }
                                     else -> Unit
                                 }
                             }
@@ -95,6 +96,7 @@ class RealCollectionService : Service() {
                     override fun disconnect() { onMain(allowDestroyed = true) { closeClient() } }
                     override fun queryStatus() = command("STATUS") { it.requestHealthStatus() }
                     override fun queryBattery() = command("BATTERY") { it.requestBattery() }
+                    override fun syncTime(unixMs: Long) = command("TIME_SET") { it.syncTime(unixMs) }
                     override fun queryRecords() = command("LIST") { it.requestHealthSessions() }
                     override fun start() = command("START") { it.startHealth() }
                     override fun stop() = command("STOP") { it.stopHealth() }
@@ -118,7 +120,7 @@ class RealCollectionService : Service() {
                         trace("observation generation=${observation.connectionGeneration} status=${observation.status} records=${observation.records}")
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
                     }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
-                    uploads = object : RealUploadPort {
+                    syncClockBeforeStart = true, uploads = object : RealUploadPort {
                         override fun enqueue(sessionId: String, retry: Boolean) {
                             RealUploadScheduler.enqueue(applicationContext, sessionId, retry)
                         }

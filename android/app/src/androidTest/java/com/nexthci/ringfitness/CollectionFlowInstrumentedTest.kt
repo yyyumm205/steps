@@ -33,6 +33,25 @@ import org.junit.runner.RunWith
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
 
+    @Test fun connectionRecoveryDoesNotDescribeTheLastSavedSessionAsUnfinished() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val saved = FreeLivingSession("saved-view", preparation, FreeLivingSessionPhase.AWAITING_REFERENCE,
+                "Asia/Shanghai", 28_800, 1_000, localData = SessionLocalData(emptyList(), 5_000))
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.RECOVERY, isSimulation = false,
+                hasProfile = true, participantId = preparation.participantId, placement = preparation.placement,
+                session = saved, connected = true, canRetry = true, error = "时间同步超时，请重新连接后再试"))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("戒指暂未就绪", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertEquals("重试", tagged<Button>(activity, "flow_primary").text.toString())
+                assertTrue(tagged<Button>(activity, "flow_primary").isEnabled)
+                assertNull(taggedOrNull<View>(activity, "end_start_attempt"))
+            }
+        }
+    }
+
     @Test fun preservingOldDeviceDataShowsOneWaitingTaskWithoutInventingReferenceSuccess() = withFlow {
         launch().use { scenario ->
             val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME, isSimulation = false,
@@ -526,7 +545,7 @@ class CollectionFlowInstrumentedTest {
             awaitFlow(handle, "upload failure armed") { it.fault == FlowTestFault.UPLOAD_FAILURE }
             type(scenario, "flow_steps", "101")
             click(scenario, "flow_primary")
-            awaitHeading(scenario, "这一步未完成")
+            awaitHeading(scenario, "这一段已保存")
             assertEquals(SessionTransferStatus.FAILED, session(handle).transfer.status)
             captureReviewScreen(scenario, "upload_failure")
             click(scenario, "flow_back")

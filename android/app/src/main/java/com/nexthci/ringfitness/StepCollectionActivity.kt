@@ -438,7 +438,7 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun recovery(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        val session = state.session
+        val session = state.session?.takeIf { it.isPending }
         val needsStop = session != null && session.stopConfirmedAtMs == null
         val unconfirmedStart = session?.phase == FreeLivingSessionPhase.START_REQUESTED
         title(body, when {
