@@ -9,6 +9,7 @@ import java.io.File
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 
 /** Real owner and durable files, with only the BLE port, scheduler and directory fsync replaced. */
 class RealCollectionControllerTest {
@@ -419,7 +420,147 @@ class RealCollectionControllerTest {
         assertEquals(saved, f.store.read())
     }
 
-    private inner class Fixture : AutoCloseable {
+    @Test fun automaticUploadWaitsForVerifiedLocalCompletionAndKeepsTheRecordPendingUntilReceipt() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            f.reachReference()
+            val id = f.store.read()!!.sessionId
+            assertTrue(f.owner.state.uploadAvailable)
+            assertTrue(uploads.requests.isEmpty())
+            f.owner.saveReference("0", "valid", "")
+            f.observe(stopped(), listOf(finalRecord))
+            assertTrue(uploads.requests.isEmpty())
+            f.finishDownload()
+            assertEquals(listOf(id to false), uploads.requests)
+            assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            assertEquals(SessionTransferStatus.PENDING, f.owner.state.session!!.transfer.status)
+            assertNull(f.owner.state.session!!.transfer.receipt)
+            assertTrue(f.owner.state.records.single().transferInFlight)
+            assertTrue(f.owner.state.canStart)
+            f.owner.refreshUploads()
+            assertEquals(listOf(id to false), uploads.requests)
+        }
+    }
+
+    @Test fun initializationQueuesOnlyCompleteRealPendingAndInterruptedTransfersIncludingArchives() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            val pending = f.seedLocal()
+            val interrupted = f.seedLocal().also { f.store.markTransferStarted(it.sessionId) }
+            val failed = f.seedLocal().also {
+                f.store.markTransferStarted(it.sessionId)
+                f.store.markTransferFailed(it.sessionId)
+            }
+            val complete = f.seedLocal().also {
+                f.store.markTransferStarted(it.sessionId)
+                f.store.completeTransfer(it.sessionId,
+                    SessionTransferReceipt("test-receipt", ++f.clock.now, false, it.sessionId))
+            }
+            val simulated = f.seedLocal(simulated = true)
+            val incomplete = f.store.requestStart(f.preparation.read()!!, ++f.clock.now, "Asia/Shanghai")
+            f.owner.initialize()
+            assertEquals(setOf(pending.sessionId to false, interrupted.sessionId to false), uploads.requests.toSet())
+            assertEquals(2, uploads.requests.size)
+            assertEquals(SessionTransferStatus.FAILED, f.store.read(failed.sessionId)!!.transfer.status)
+            assertEquals(SessionTransferStatus.COMPLETE, f.store.read(complete.sessionId)!!.transfer.status)
+            assertNull(f.store.read(incomplete.sessionId)!!.localData)
+            assertFalse(f.owner.state.records.any { it.sessionId == simulated.sessionId })
+            f.owner.retryUpload(simulated.sessionId)
+            f.owner.retryUpload(incomplete.sessionId)
+            f.owner.retryUpload(complete.sessionId)
+            f.owner.retryUpload("unknown-session")
+            assertEquals(2, uploads.requests.size)
+        }
+    }
+
+    @Test fun archivedRetryAndUploadRefreshKeepTheActiveCaptureAndHomeNavigationIntact() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            val archive = f.seedLocal()
+            f.store.markTransferStarted(archive.sessionId)
+            f.store.markTransferFailed(archive.sessionId)
+            f.beginCollecting()
+            val current = f.store.read()!!
+            val commands = f.port.calls.toList()
+            assertTrue(uploads.requests.isEmpty())
+            f.owner.retryUpload(archive.sessionId)
+            f.owner.retryUpload(archive.sessionId)
+            assertEquals(listOf(archive.sessionId to true), uploads.requests)
+            assertEquals(current, f.owner.state.session)
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertTrue(f.owner.state.canStop)
+            assertTrue(f.owner.state.records.single { it.sessionId == archive.sessionId }.transferInFlight)
+            f.store.markTransferStarted(archive.sessionId)
+            f.owner.refreshUploads()
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertEquals(commands, f.port.calls)
+
+            f.owner.home()
+            f.store.completeTransfer(archive.sessionId,
+                SessionTransferReceipt("test-archived-receipt", ++f.clock.now, false, archive.sessionId))
+            uploads.inFlight.remove(archive.sessionId)
+            f.owner.refreshUploads()
+            assertEquals(CollectionPage.HOME, f.owner.state.page)
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.taskPage)
+            assertTrue(f.owner.state.canStop)
+            assertNull(f.owner.state.error)
+            assertEquals(current, f.owner.state.session)
+            val record = f.owner.state.records.single { it.sessionId == archive.sessionId }
+            assertEquals("complete", record.transferStatus)
+            assertFalse(record.transferInFlight)
+            assertEquals(commands, f.port.calls)
+            f.owner.retryUpload(archive.sessionId)
+            assertEquals(1, uploads.requests.size)
+        }
+    }
+
+    @Test fun rejectedUploadSchedulingPreservesTheCompletedFileAndDoesNotEnterBleRecovery() {
+        val uploads = RecordingUploads().apply { reject = true }
+        Fixture(uploads).use { f ->
+            f.reachReference()
+            f.owner.saveReference("19", "valid", "")
+            f.observe(stopped(), listOf(finalRecord))
+            val commands = f.port.calls.toList()
+            f.health(HealthMessage.DataChunk(0, payload))
+            f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            val completed = f.store.read()!!
+            assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            assertTrue(f.owner.state.canStart)
+            assertNull(f.owner.state.error)
+            assertEquals(19L, completed.reference!!.steps)
+            assertTrue(File(f.directory, completed.localData!!.files.single().fileName).isFile)
+            assertEquals(SessionTransferStatus.PENDING, completed.transfer.status)
+            assertEquals(commands, f.port.calls)
+            assertTrue(f.errors.any { it.message == "Injected upload scheduling failure" })
+            f.owner.home()
+            f.owner.retryUpload(completed.sessionId)
+            assertEquals(CollectionPage.HOME, f.owner.state.page)
+            assertNull(f.owner.state.error)
+            assertEquals(commands, f.port.calls)
+        }
+    }
+
+    @Test fun localFileReviewRefreshKeepsReferenceAndNavigationWithoutBleCommands() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            val saved = f.seedLocal()
+            f.owner.initialize()
+            val before = f.owner.state.page
+            val commands = f.port.calls.toList()
+            uploads.localReview += saved.sessionId
+            f.owner.refreshUploads()
+            assertTrue(f.owner.state.records.single().localReviewRequired)
+            assertEquals(17L, f.owner.state.records.single().steps)
+            assertEquals(before, f.owner.state.page)
+            assertEquals(commands, f.port.calls)
+            assertEquals(saved.reference, f.store.read(saved.sessionId)!!.reference)
+            uploads.localReview.clear()
+            f.owner.refreshUploads()
+            assertFalse(f.owner.state.records.single().localReviewRequired)
+        }
+    }
+
+    private inner class Fixture(private val uploads: RealUploadPort? = null) : AutoCloseable {
         val directory = temporary.newFolder()
         var failCommit = false
         var failObservation = false
@@ -448,7 +589,20 @@ class RealCollectionControllerTest {
                         failDownloadSyncAfterLocalCommit = false
                         throw IOException("注入已保存后的清理同步失败")
                     }
-                }) })
+                }) }, uploads = uploads)
+
+        fun seedLocal(simulated: Boolean = false): FreeLivingSession {
+            val session = store.requestStart(preparation.read()!!, ++clock.now, "Asia/Shanghai")
+            store.confirmStart(session.sessionId, ring.address, collecting(), ++clock.now)
+            store.requestStop(session.sessionId, ++clock.now)
+            store.confirmStop(session.sessionId, ring.address, stopped(), ++clock.now)
+            store.saveReference(session.sessionId, SessionReference(ReferenceStatus.VALID, 17, ++clock.now))
+            val file = File(directory, "${session.sessionId}-upload-fixture.rfbin")
+            file.writeBytes(payload)
+            val hash = MessageDigest.getInstance("SHA-256").digest(payload).joinToString("") { "%02x".format(it.toInt() and 255) }
+            return store.completeLocalData(session.sessionId,
+                listOf(SessionRawFile(file.name, 7, file.length(), hash, simulated)), ++clock.now)
+        }
 
         fun reopen() { owner.close(); owner = createOwner(); owner.initialize() }
 
@@ -495,6 +649,20 @@ class RealCollectionControllerTest {
     }
 
     private data class Read(val sessionId: Int, val offset: Long, val length: Int)
+
+    private class RecordingUploads : RealUploadPort {
+        val requests = mutableListOf<Pair<String, Boolean>>()
+        val inFlight = mutableSetOf<String>()
+        val localReview = mutableSetOf<String>()
+        var reject = false
+        override fun enqueue(sessionId: String, retry: Boolean) {
+            check(!reject) { "Injected upload scheduling failure" }
+            requests += sessionId to retry
+            inFlight += sessionId
+        }
+        override fun isInFlight(sessionId: String) = sessionId in inFlight
+        override fun needsLocalReview(sessionId: String) = sessionId in localReview
+    }
 
     private class RecordingPort : RealCollectionPort {
         var generation = 0L

@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.os.Build
 import android.os.SystemClock
 import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
 import android.widget.Spinner
@@ -31,6 +32,124 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
+
+    @Test fun allUnuploadedHistoryRemainsReachableAlongsideOnlyTheLastThreeUploadedRecords() = withFlow { _ ->
+        launch().use { scenario ->
+            val history = listOf(
+                FlowRecordSummary("uploaded-old", 1, "valid", "complete", true),
+                FlowRecordSummary("failed-old", 2, "valid", "failed", true),
+                FlowRecordSummary("uploaded-a", 3, "valid", "complete", true),
+                FlowRecordSummary("failed-b", 4, "valid", "failed", true),
+                FlowRecordSummary("uploaded-b", 5, "valid", "complete", true),
+                FlowRecordSummary("failed-c", 6, "valid", "failed", true),
+                FlowRecordSummary("pending-d", 7, "valid", "pending", true),
+                FlowRecordSummary("uploaded-c", 8, "valid", "complete", true),
+                FlowRecordSummary("failed-new", 9, "valid", "failed", true))
+            val fixture = RenderingFlow(CollectionFlowState(isSimulation = false, uploadAvailable = true,
+                hasProfile = true, participantId = "view001", placement = RingPlacement.LEFT_INDEX,
+                connected = true, canStart = true, records = history))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                fun statuses(view: View): List<String> = buildList {
+                    (view.tag as? String)?.takeIf { it.startsWith("record_status_") }?.let { add(it.removePrefix("record_status_")) }
+                    if (view is ViewGroup) repeat(view.childCount) { addAll(statuses(view.getChildAt(it))) }
+                }
+                assertEquals(history.drop(1).reversed().map { it.sessionId },
+                    statuses(activity.findViewById(android.R.id.content)))
+                assertNull(taggedOrNull<View>(activity, "record_status_uploaded-old"))
+                assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
+                history.filter { it.transferStatus != "complete" }.forEach {
+                    val retry = tagged<Button>(activity, "retry_upload_${it.sessionId}")
+                    assertTrue(retry.isEnabled)
+                    retry.performClick()
+                }
+            }
+            assertEquals(history.filter { it.transferStatus != "complete" }.map { it.sessionId }, fixture.uploadRetries)
+        }
+    }
+
+    @Test fun realUploadProgressAndRetryStayInsideTheSavedRecordWithoutReplacingThePrimaryAction() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val session = renderingSession(preparation).copy(
+                reference = SessionReference(ReferenceStatus.VALID, 17, 4_000),
+                localData = SessionLocalData(listOf(SessionRawFile("view.rfbin", 1, 1, "0".repeat(64))), 5_000),
+                transfer = SessionTransfer(SessionTransferStatus.TRANSFERRING, 1))
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.COMPLETE, isSimulation = false,
+                uploadAvailable = true, hasProfile = true, participantId = preparation.participantId,
+                placement = preparation.placement, session = session, connected = true, canStart = true,
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "transferring", true, true))))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("这一段已保存", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertEquals("正在上传…", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
+                assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
+                assertNull(taggedOrNull<View>(activity, "flow_error"))
+            }
+            fixture.state = fixture.state.copy(session = session.copy(
+                transfer = SessionTransfer(SessionTransferStatus.FAILED, 1)),
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "failed", true)))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("上传待重试", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
+            }
+            click(scenario, "retry_upload_${session.sessionId}")
+            assertEquals(listOf(session.sessionId), fixture.uploadRetries)
+            fixture.state = fixture.state.copy(page = CollectionPage.HOME)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
+                assertNull(taggedOrNull<View>(activity, "flow_error"))
+            }
+            click(scenario, "retry_upload_${session.sessionId}")
+            assertEquals(listOf(session.sessionId, session.sessionId), fixture.uploadRetries)
+            fixture.state = fixture.state.copy(page = CollectionPage.COMPLETE,
+                session = session.copy(transfer = SessionTransfer(SessionTransferStatus.COMPLETE, 1,
+                    SessionTransferReceipt("view-receipt", 6_000, false, session.sessionId))),
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "complete", true)))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("已完成", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
+                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
+            }
+        }
+    }
+
+    @Test fun localFileProblemShowsReviewAndPreservesTheSavedReference() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val session = renderingSession(preparation).copy(
+                reference = SessionReference(ReferenceStatus.VALID, 17, 4_000),
+                localData = SessionLocalData(listOf(SessionRawFile("view.rfbin", 1, 1, "0".repeat(64))), 5_000))
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.COMPLETE, isSimulation = false,
+                uploadAvailable = true, hasProfile = true, participantId = preparation.participantId,
+                placement = preparation.placement, session = session,
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "pending", true,
+                    localReviewRequired = true))))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("戒指数据需要检查", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertEquals("17 步", tagged<TextView>(activity, "saved_reference").text.toString())
+                assertEquals("已保存", tagged<TextView>(activity, "flow_detail_计步器读数").text.toString())
+                assertEquals("待检查", tagged<TextView>(activity, "flow_detail_戒指数据").text.toString())
+                assertEquals("等待文件检查", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("重新检查", tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+            }
+            click(scenario, "retry_upload_${session.sessionId}")
+            assertEquals(listOf(session.sessionId), fixture.uploadRetries)
+            fixture.state = fixture.state.copy(page = CollectionPage.HOME)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("戒指数据需要检查", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("重新检查", tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+            }
+        }
+    }
 
     @Test fun realConnectionPagesHideDevelopmentControlsAndPreventDuplicateConnect() = withFlow { _ ->
         launch().use { scenario ->
@@ -547,6 +666,7 @@ class CollectionFlowInstrumentedTest {
     /** Rendering checks share the native Activity while isolating all collection and network calls. */
     private class RenderingFlow(override var state: CollectionFlowState) : CollectionFlow {
         var reconnects = 0
+        val uploadRetries = mutableListOf<String>()
         var savedReference: Triple<String, String, String>? = null
         override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
             observer(state)
@@ -561,7 +681,7 @@ class CollectionFlowInstrumentedTest {
         override fun stop() = error("Unexpected stop")
         override fun enterReference() = error("Unexpected navigation")
         override fun retry() = error("Unexpected retry")
-        override fun retryUpload(sessionId: String) = error("Unexpected upload")
+        override fun retryUpload(sessionId: String) { uploadRetries += sessionId }
         override fun home() = error("Unexpected navigation")
         override fun setFault(fault: FlowTestFault) = error("Unexpected development option")
         override fun disconnect() = error("Unexpected disconnect")

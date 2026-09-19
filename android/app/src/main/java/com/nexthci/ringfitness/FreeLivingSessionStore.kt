@@ -177,6 +177,31 @@ class FreeLivingSessionStore internal constructor(
         readJournalLocked()?.let { it.archived + it.current }.orEmpty()
     }
 
+    /** Immutable research metadata; transport attempts and receipts never enter an upload package. */
+    fun manifestSnapshot(sessionId: String): JsonObject = synchronized(processLock) {
+        val journal = checkNotNull(readJournalLocked()) { "没有可打包的采集段" }
+        val session = (journal.archived + journal.current).singleOrNull { it.sessionId == sessionId }
+            ?: throw IllegalArgumentException("采集段不匹配")
+        val local = requireNotNull(session.localData) { "原始文件尚未完整保存" }
+        require(session.reference != null && session.stopConfirmedAtMs != null) { "采集信息尚未保存完整" }
+        require(local.files.none { it.simulated }) { "演示数据不能进入实验上传包" }
+        verifyLocalFiles(session, local.files)
+        encode(session).apply {
+            remove("phase")
+            remove("transfer")
+            remove("raw_files")
+            addProperty("version", 2)
+            addProperty("step_schema_version", 1)
+            addProperty("rfbin_version", 2)
+            addProperty("simulated", false)
+            add("files", JsonArray().apply {
+                local.files.sortedBy { it.fileName }.forEach { file ->
+                    add(encodeFile(file).apply { addProperty("role", "raw") })
+                }
+            })
+        }
+    }
+
     fun requestStart(preparation: PreparationSnapshot, requestedAtMs: Long, timeZoneId: String,
         baseline: DeviceStartBaseline? = null): FreeLivingSession =
         synchronized(processLock) {

@@ -12,6 +12,13 @@ interface RealCollectionPort : HealthControlPort {
 
 fun interface CollectionScheduler { fun schedule(delayMs: Long, action: () -> Unit) }
 
+/** Upload execution has an independent owner and never controls the collection connection. */
+interface RealUploadPort {
+    fun enqueue(sessionId: String, retry: Boolean = false)
+    fun isInFlight(sessionId: String): Boolean
+    fun needsLocalReview(sessionId: String): Boolean = false
+}
+
 /** Single serial owner for real device control, reference commits and recoverable downloads. */
 class RealCollectionController(
     private val directory: File,
@@ -28,6 +35,7 @@ class RealCollectionController(
         RealSessionDownload(folder, session.sessionId, requireNotNull(session.preparation.ring).address, record,
             session.startedAtMs ?: 0L, session.endedAtMs ?: 0L)
     },
+    private val uploads: RealUploadPort? = null,
 ) : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
     private var profile: PreparationSnapshot? = null
@@ -50,7 +58,7 @@ class RealCollectionController(
     private data class Inspection(val id: Long, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf())
 
-    @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = false,
+    @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploads != null,
         connected = false, connecting = true, busy = true, hasProfile = true)
         private set
 
@@ -97,6 +105,7 @@ class RealCollectionController(
         coordinator.restore()
         val current = store.read()
         browsingHome = current == null || current.localData != null
+        enqueueSavedRecords()
         connect()
     }
 
@@ -152,6 +161,7 @@ class RealCollectionController(
                         runCatching { download.close() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
                         runCatching { download.releaseTemporary() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
                         coordinator.refresh()
+                        enqueueSavedRecords()
                         publish(CollectionPage.COMPLETE)
                     } else requestWindow(download)
                 }
@@ -261,7 +271,47 @@ class RealCollectionController(
         }
     }
 
-    override fun retryUpload(sessionId: String) = Unit
+    override fun retryUpload(sessionId: String) {
+        if (closed) return
+        val upload = uploads ?: return
+        runCatching {
+            val session = store.read(sessionId) ?: return@runCatching
+            if (isRealLocal(session) && session.transfer.status != SessionTransferStatus.COMPLETE &&
+                !upload.isInFlight(sessionId)) upload.enqueue(sessionId, retry = true)
+        }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+        refreshUploads()
+    }
+
+    /** Refresh transfer evidence without changing navigation, BLE queries or capture actions. */
+    fun refreshUploads() {
+        if (closed || !initialized) return
+        runCatching {
+            state = state.copy(session = store.read(), records = recordSummaries())
+            observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
+        }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+    }
+
+    private fun enqueueSavedRecords() {
+        val upload = uploads ?: return
+        runCatching {
+            store.listSessions().filter { isRealLocal(it) && it.transfer.status in
+                setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING) }.forEach { session ->
+                runCatching {
+                    if (!upload.isInFlight(session.sessionId)) upload.enqueue(session.sessionId)
+                }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+            }
+        }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+    }
+
+    private fun isRealLocal(session: FreeLivingSession) = session.localData?.files?.let { files ->
+        files.isNotEmpty() && files.all { !it.simulated }
+    } == true
+
+    private fun recordSummaries() = store.listSessions().filter { it.localData == null || isRealLocal(it) }
+        .map { FlowRecordSummary(it.sessionId, it.reference?.steps, it.reference?.status?.wireValue,
+            it.transfer.status.wireValue, isRealLocal(it), uploads?.isInFlight(it.sessionId) == true,
+            uploads?.needsLocalReview(it.sessionId) == true) }
+
     override fun home() = safely { browsingHome = true; publish(CollectionPage.HOME) }
     override fun setFault(fault: FlowTestFault) = Unit
     override fun disconnect() = Unit // A page cannot tear down the collection connection.
@@ -370,7 +420,7 @@ class RealCollectionController(
         val visible = if (browsingHome) CollectionPage.HOME else page
         val idle = lastIdle
         val canStart = pending == null && idle != null && !connecting && connected && query == null
-        state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = false,
+        state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
             hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
             placement = (pending?.preparation ?: profile)?.placement, session = current,
             connected = connected, connecting = connecting, busy = connecting || query != null ||
@@ -379,8 +429,7 @@ class RealCollectionController(
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
             canRetry = !connecting && query == null && downloader == null,
-            records = store.listSessions().map { FlowRecordSummary(it.sessionId, it.reference?.steps, it.reference?.status?.wireValue,
-                it.transfer.status.wireValue, it.localData != null) })
+            records = recordSummaries())
         observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
     }
 

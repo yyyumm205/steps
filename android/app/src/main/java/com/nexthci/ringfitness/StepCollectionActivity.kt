@@ -234,23 +234,30 @@ abstract class StepCollectionActivity : Activity() {
         detail(profile, "佩戴位置", state.placement?.displayName ?: "待填写")
         ui.gap(profile, 18)
         detail(profile, "戒指", connectionLabel(state))
-        val recentRecords = state.records.filter { it.localComplete }.takeLast(3).reversed()
+        val localRecords = state.records.filter { it.localComplete }
+        val recentUploaded = localRecords.filter { it.transferStatus == "complete" }.takeLast(3).map { it.sessionId }.toSet()
+        val recentRecords = localRecords.filter { it.transferStatus != "complete" || it.sessionId in recentUploaded }.reversed()
         if (recentRecords.isNotEmpty()) {
-            ui.text(body, "最近记录", 16f, bold = true)
+            ui.text(body, "采集记录", 16f, bold = true)
             ui.gap(body, 12)
             recentRecords.forEach { record ->
                 val card = ui.card(body)
                 ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true)
                 ui.gap(card, 8)
                 ui.text(card, when {
+                    record.localReviewRequired -> "戒指数据需要检查"
                     record.transferStatus == "complete" -> if (state.isSimulation) "已保存 · 模拟上传完成" else "已上传"
                     record.transferInFlight -> "已保存 · 正在上传"
                     record.transferStatus in setOf("failed", "transferring") -> "已保存 · 上传待重试"
                     else -> "已保存 · 等待上传"
-                }, 14f, muted = true)
+                }, 14f, muted = true).tag = "record_status_${record.sessionId}"
                 if (record.referenceStatus == "unreliable") { ui.gap(card, 8); ui.text(card, "读数有异常", 14f, muted = true) }
                 if (state.uploadAvailable && !record.transferInFlight && record.transferStatus != "complete") {
-                    ui.button(card, if (record.transferStatus == "pending") "上传记录" else "重试上传",
+                    ui.button(card, when {
+                        record.localReviewRequired -> "重新检查"
+                        record.transferStatus == "pending" -> "上传记录"
+                        else -> "重试上传"
+                    },
                         tag = "retry_upload_${record.sessionId}") { flow.retryUpload(record.sessionId) }
                 }
             }
@@ -370,16 +377,21 @@ abstract class StepCollectionActivity : Activity() {
         val complete = state.page == CollectionPage.COMPLETE
         val session = state.session
         val reference = session?.reference
+        val localReviewRequired = state.records.any { it.sessionId == session?.sessionId && it.localReviewRequired }
         val localComplete = session?.localData?.files?.let { files ->
             files.isNotEmpty() && files.all { it.simulated == state.isSimulation }
         } == true
-        val uploaded = localComplete && session?.transfer?.status == SessionTransferStatus.COMPLETE &&
+        val uploaded = !localReviewRequired && localComplete && session?.transfer?.status == SessionTransferStatus.COMPLETE &&
             session.transfer.receipt?.let { it.sessionId == session.sessionId && it.simulated == state.isSimulation } == true
+        val uploadInFlight = localComplete && (state.records.any { it.sessionId == session?.sessionId && it.transferInFlight } ||
+            state.isSimulation && state.page == CollectionPage.UPLOADING)
         title(body, when {
+            localReviewRequired -> "戒指数据需要检查"
             complete && localComplete -> "这一段已保存"
             complete -> "记录尚未完整保存"
             else -> "正在整理记录"
         }, when {
+            localReviewRequired -> "步数已保存，请重新检查文件；仍未成功时联系研究者。"
             localComplete -> "本次记录已经保存在手机。"
             reference != null -> "步数已保存，请稍等片刻。"
             else -> "正在核对本次记录。"
@@ -393,19 +405,30 @@ abstract class StepCollectionActivity : Activity() {
         detail(progress, "计步器读数", if (reference != null) "已保存" else "待保存")
         ui.gap(progress, 20)
         detail(progress, "戒指数据", when {
+            localReviewRequired -> "待检查"
             localComplete -> "已保存"
             state.page == CollectionPage.DOWNLOADING -> "正在下载…"
             else -> "待下载"
         })
         ui.gap(progress, 20)
         detail(progress, if (state.isSimulation) "模拟上传" else "上传", when {
+            localReviewRequired -> "等待文件检查"
             uploaded -> "已完成"
             !state.uploadAvailable -> "待上传"
-            state.page == CollectionPage.UPLOADING && localComplete -> "正在上传…"
+            uploadInFlight -> "正在上传…"
+            localComplete && session?.transfer?.status in setOf(SessionTransferStatus.FAILED, SessionTransferStatus.TRANSFERRING) -> "上传待重试"
             localComplete -> "待上传"
             else -> "等待下载完成"
         })
-        if (!complete) progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
+        if (state.uploadAvailable && localComplete && !uploaded && !uploadInFlight && session != null) {
+            ui.button(progress, when {
+                localReviewRequired -> "重新检查"
+                session.transfer.status == SessionTransferStatus.PENDING -> "上传记录"
+                else -> "重试上传"
+            },
+                tag = "retry_upload_${session.sessionId}") { flow.retryUpload(session.sessionId) }
+        }
+        if (!complete || uploadInFlight) progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
             topMargin = ui.dp(20); gravity = Gravity.CENTER
         })
         action(footer, "返回首页") { flow.home() }

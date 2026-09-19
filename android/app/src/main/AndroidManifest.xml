@@ -55,6 +55,10 @@
             android:foregroundServiceType="connectedDevice"
             android:stopWithTask="false" />
         <service
+            android:name=".RealUploadService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+        <service
             android:name=".UploadJobService"
             android:exported="false"
             android:permission="android.permission.BIND_JOB_SERVICE"

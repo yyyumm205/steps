@@ -14,6 +14,7 @@ data class FlowRecordSummary(
     val transferStatus: String,
     val localComplete: Boolean,
     val transferInFlight: Boolean = false,
+    val localReviewRequired: Boolean = false,
 )
 
 data class CollectionFlowState(

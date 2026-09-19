@@ -36,6 +36,7 @@ class RealCollectionService : Service() {
     @Volatile private var destroyed = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var subscription: AutoCloseable? = null
+    private var uploadSubscription: AutoCloseable? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -107,20 +108,31 @@ class RealCollectionService : Service() {
                     }, notifyObserver = { action -> main.post { if (!destroyed) action() } },
                     recordObservation = { observation ->
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
-                    }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) })
+                    }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
+                    uploads = object : RealUploadPort {
+                        override fun enqueue(sessionId: String, retry: Boolean) {
+                            RealUploadScheduler.enqueue(applicationContext, sessionId, retry)
+                        }
+                        override fun isInFlight(sessionId: String) = RealUploadScheduler.isInFlight(sessionId)
+                        override fun needsLocalReview(sessionId: String) =
+                            RealUploadScheduler.queue(applicationContext).needsLocalReview(sessionId)
+                    })
                 controller = owner
                 subscription = owner.observe { state ->
                     RealCollectionBridge.publish(this, state)
                     updateForeground(state)
                 }
-                onMain { RealCollectionBridge.attach(this, { action -> submit(action) }, {
-                    submit { current ->
-                        if (current.canReleaseIfIdle() && onMain { RealCollectionBridge.beginRelease(this) }) {
-                            current.close()
-                            main.post { if (!destroyed) stopSelf() }
+                onMain {
+                    uploadSubscription = RealUploadScheduler.observe { submit { it.refreshUploads() } }
+                    RealCollectionBridge.attach(this, { action -> submit(action) }, {
+                        submit { current ->
+                            if (current.canReleaseIfIdle() && onMain { RealCollectionBridge.beginRelease(this) }) {
+                                current.close()
+                                main.post { if (!destroyed) stopSelf() }
+                            }
                         }
-                    }
-                }) }
+                    })
+                }
                 owner.initialize()
             } catch (error: Exception) {
                 Log.e(TAG, "Cannot initialize collection owner", error)
@@ -197,6 +209,7 @@ class RealCollectionService : Service() {
         destroyed = true
         RealCollectionBridge.beginDestroy(this)
         subscription?.close()
+        uploadSubscription?.close()
         closeClient()
         wakeLock?.let { if (it.isHeld) it.release() }
         worker.execute {
