@@ -378,7 +378,17 @@ class RingBleClient(
             System.currentTimeMillis(),
             imuLowPower = imuLowPower,
         ) ?: return
-        if (packet is SensorPacket.Health && packet.message !is HealthMessage.DataChunk) controlTrace("RX HEALTH ${packet.message}")
+        if (packet is SensorPacket.Health && packet.message !is HealthMessage.DataChunk) {
+            val detail = if (packet.message is HealthMessage.Status)
+                " error_reason=${packet.statusErrorReason ?: "unavailable"} reason_label=${packet.statusErrorReasonName}"
+            else ""
+            controlTrace("RX HEALTH ${packet.message}$detail")
+            if (BuildConfig.DEBUG && packet.message is HealthMessage.Status) {
+                // Only the bounded STATUS header, for independent decoding against the reference SDK.
+                controlTrace("STATUS wire=${value.take(16).joinToString("") { "%02x".format(it.toInt() and 0xFF) }}")
+            }
+        }
+        if (packet is SensorPacket.Battery) controlTrace("RX BATTERY percent=${packet.percent} charge_status=${packet.chargeStatus}")
         listener.onSensorPacket(packet)
     }
 

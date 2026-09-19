@@ -66,7 +66,24 @@ sealed interface SensorPacket {
     data class Health(
         val message: HealthMessage,
         override val receivedEpochMs: Long,
-    ) : SensorPacket
+        // Optional wire diagnostics stay outside persisted session identity/state evidence.
+        // null means legacy STATUS omitted the byte; zero is an explicitly reported value.
+        val statusErrorReason: Int? = null,
+    ) : SensorPacket {
+        val statusErrorReasonName: String
+            get() = when (statusErrorReason) {
+                null -> "unavailable"
+                0 -> "none"
+                1 -> "charging"
+                2 -> "sensor_busy"
+                3 -> "storage_init"
+                4 -> "imu_start"
+                5 -> "ppg_start"
+                6 -> "storage_write"
+                7 -> "storage_overwrite"
+                else -> "unknown_$statusErrorReason"
+            }
+    }
 }
 
 sealed interface HealthMessage {
@@ -224,7 +241,11 @@ object RingProtocol {
             cmd == CMD_PPG && subCmd == SUBCMD_PPG_RAW_PACKET -> parsePpgRaw(data, receivedEpochMs)
             cmd == CMD_BATTERY && subCmd == SUBCMD_BATTERY_STATUS -> parseBattery(data, receivedEpochMs)
             cmd == CMD_INFO && subCmd == SUBCMD_INFO_STATUS -> parseInfo(data, receivedEpochMs)
-            cmd == CMD_HEALTH -> parseHealth(data)?.let { SensorPacket.Health(it, receivedEpochMs) }
+            cmd == CMD_HEALTH -> parseHealth(data)?.let { message ->
+                SensorPacket.Health(message, receivedEpochMs,
+                    statusErrorReason = if (message is HealthMessage.Status && data.size >= 16)
+                        data[15].toInt() and 0xFF else null)
+            }
             else -> null
         }
     }
