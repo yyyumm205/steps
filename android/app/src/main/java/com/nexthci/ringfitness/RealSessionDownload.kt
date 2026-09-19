@@ -296,10 +296,24 @@ class RealSessionDownload internal constructor(
 
         private fun verifyContainer(file: File, header: ByteArray, evidence: HealthPayloadEvidence) {
             require(file.length() == HealthRawV2.HEADER_SIZE + evidence.payloadBytes) { "原始容器长度不完整" }
+            val (actualHeader, crc) = readContainerChecksum(file)
+            require(actualHeader.contentEquals(header)) { "原始容器记录信息不匹配" }
+            require(crc == evidence.crc32) { "原始容器 CRC 校验失败" }
+        }
+
+        /** Recheck the original container before releasing an unconfirmed-start protection gate. */
+        internal fun verifyPreservedContainer(file: File, record: HealthMessage.ListItem,
+            startedAtMs: Long, endedAtMs: Long) {
+            require(file.length() == HealthRawV2.HEADER_SIZE + record.bytes) { "原始容器长度不完整" }
+            val (actualHeader, crc) = readContainerChecksum(file)
+            val expected = HealthRawV2.header(record, startedAtMs, endedAtMs, record.bytes, crc)
+            require(actualHeader.contentEquals(expected)) { "原始容器记录或 CRC 校验失败" }
+        }
+
+        private fun readContainerChecksum(file: File): Pair<ByteArray, Long> {
             file.inputStream().use { stream ->
                 val actualHeader = ByteArray(HealthRawV2.HEADER_SIZE)
                 DataInputStream(stream).readFully(actualHeader)
-                require(actualHeader.contentEquals(header)) { "原始容器记录信息不匹配" }
                 val crc = CRC32()
                 val buffer = ByteArray(64 * 1024)
                 while (true) {
@@ -307,7 +321,7 @@ class RealSessionDownload internal constructor(
                     if (count < 0) break
                     crc.update(buffer, 0, count)
                 }
-                require(crc.value == evidence.crc32) { "原始容器 CRC 校验失败" }
+                return actualHeader to crc.value
             }
         }
 

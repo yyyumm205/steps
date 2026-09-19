@@ -258,15 +258,21 @@ class FreeLivingSessionCompletionTest {
         val envelope = JsonParser.parseString(file.readText()).asJsonObject
         val session = envelope.getAsJsonObject("session")
         listOf("ground_truth_reason", "reference_saved_at_ms", "raw_files", "transfer",
-            "start_baseline", "device_record_evidence", "device_association_invalidated").forEach(session::remove)
+            "start_baseline", "device_record_evidence", "device_association_invalidated",
+            "start_attempt_archive").forEach(session::remove)
         envelope.addProperty("journal_version", 1)
         envelope.remove("archived_sessions")
         envelope.addProperty("sha256", digest(session.toString().toByteArray()))
         file.writeText(envelope.toString())
+        val originalBytes = file.readBytes()
         assertEquals(stopped, open(file).read())
+        assertNull(open(file).read()!!.reference)
+        assertNull(open(file).read()!!.startAttemptArchive)
+        assertArrayEquals(originalBytes, file.readBytes())
         open(file).saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
-        assertEquals(3, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(4, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(0L, open(file).read()!!.reference!!.steps)
+        assertNull(open(file).read()!!.startAttemptArchive)
     }
 
     @Test fun archivedContentIsCoveredByChecksum() {

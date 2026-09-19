@@ -1,12 +1,14 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.7.2-recovery（versionCode 36）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
+当前开发版：**步数采集 0.7.3-start-recovery（versionCode 37）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
 
 ## 当前可运行范围
 
 正常入口已接通：首次登记编号与佩戴位置、选择/连接戒指、等待真实开始确认、后台采集、停止确认、整段计步器读数保存、原始文件下载校验、冻结ZIP和清华云盘上传。准备档案与采集记录使用独立App私有目录；单一前台采集服务管理BLE，独立上传服务管理网络任务。页面依据真实保存、设备证据和回执呈现结果。
 
-0.7.2在打开准备页时恢复待上传队列，无需先连接戒指。queued/sending及已手动重试的任务继续等待网络；明确失败在原记录中手动重试，保持同一session、目标和冻结包。真机短采、本地保全、云盘人工读回与Python处理分别见E18/E19，恢复及自动目录读取见[验证记录E20](../specs/independent-step-collection/validation.md#19-启动上传恢复与自动目录读取2026-09-19e20)。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
+0.7.2在打开准备页时恢复待上传队列，无需先连接戒指。queued/sending及已手动重试的任务继续等待网络；明确失败在原记录中手动重试，保持同一session、目标和冻结包。真机短采、本地保全、云盘人工读回与Python处理分别见E18/E19，恢复及自动云端读取见[验证记录E20](../specs/independent-step-collection/validation.md#19-启动上传恢复与自动云端读取2026-09-19e20)。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
+
+0.7.3增加未确认开始请求的“结束本次尝试”入口：填写原因后重新连接，完整查询并复核原始文件，满足条件才保存归档审计并返回准备。该操作保留原记录，未确认的尝试不进入研究数据；本地账本升级v4，研究manifest快照及冻结包维持原契约。软件验证及真机归档、强停重开和原包保全已通过[验证记录E21](../specs/independent-step-collection/validation.md#20-未确认开始请求的受控归档2026-09-19e21)；固件仍返回-16，新采集保持禁用，根因继续调查。
 
 Debug从“更多 → 流程演示（模拟）”进入完整交互演示，复用原生页面、协调器与持久化规则，设备、信号和传输使用替身；演示目录与正式记录隔离。Release不提供该入口。页面色彩、字号、容器和主要操作沿用功能规格的最小视觉规则。
 

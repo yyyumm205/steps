@@ -55,6 +55,7 @@ class RealCollectionController(
     private var closed = false
     private var saving = false
     private var stopEvidenceGeneration: Long? = null
+    private var endStartAttemptReason: String? = null
     private data class Inspection(val id: Long, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf())
 
@@ -65,7 +66,12 @@ class RealCollectionController(
     private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store, port, clock) { control ->
         control.observation?.let(::recordDiagnostic)
         when (control.phase) {
-            CaptureControlPhase.IDLE -> Unit
+            CaptureControlPhase.IDLE -> if (control.observation != null) {
+                lastIdle = control.observation.takeIf { !it.status.collecting && it.status.errorCode == 0 }
+                browsingHome = true; taskPage = null; taskError = null
+                if (lastIdle == null) taskError = "本次尝试已结束，请重新连接戒指后再试。"
+                publish(CollectionPage.HOME)
+            }
             CaptureControlPhase.CHECKING -> publish(if (store.readPending() == null) CollectionPage.STARTING else CollectionPage.RECOVERY)
             CaptureControlPhase.STARTING -> publish(CollectionPage.STARTING)
             CaptureControlPhase.COLLECTING -> publish(CollectionPage.COLLECTING)
@@ -81,6 +87,8 @@ class RealCollectionController(
                 CaptureControlIssue.RECORD_CHANGED, CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN,
                 CaptureControlIssue.RECOVERY_REQUIRES_REVIEW -> "本次记录需要核对，请保留戒指数据"
                 CaptureControlIssue.CONNECTION_LOST, CaptureControlIssue.NOT_CONNECTED -> "连接中断，请将戒指放在手机附近"
+                CaptureControlIssue.START_ARCHIVE_BLOCKED -> "本次记录仍需核对，请联系研究者"
+                CaptureControlIssue.DEVICE_ERROR -> "戒指返回异常，请重新连接后再试"
                 else -> "暂未收到确认，请重新检查戒指"
             })
             CaptureControlPhase.STORAGE_ERROR -> publish(CollectionPage.ERROR, "暂时无法保存，请检查手机空间后重试")
@@ -104,7 +112,7 @@ class RealCollectionController(
         require(profile?.ring != null && profile?.placement != null) { "请先选择戒指与佩戴位置" }
         coordinator.restore()
         val current = store.read()
-        browsingHome = current == null || current.localData != null
+        browsingHome = current == null || !current.isPending
         enqueueSavedRecords()
         connect()
     }
@@ -120,6 +128,11 @@ class RealCollectionController(
         connected = true; connecting = false; reconnectCount = 0
         query = null
         coordinator.onConnected(requireNotNull(profile?.ring).address, connection)
+        endStartAttemptReason?.let { reason ->
+            endStartAttemptReason = null
+            coordinator.archiveUnconfirmedStart(reason)
+            return@safely
+        }
         val pending = store.readPending()
         when {
             pending == null -> inspect()
@@ -133,6 +146,7 @@ class RealCollectionController(
     fun onDisconnected(connection: Long, message: String) = safely {
         if (closed || connection != generation) return@safely
         connected = false; connecting = false; query = null; lastIdle = null
+        endStartAttemptReason = null
         stopEvidenceGeneration = null
         closeDownload()
         coordinator.onDisconnected(connection)
@@ -271,6 +285,17 @@ class RealCollectionController(
         }
     }
 
+    override fun endStartAttempt(reason: String) = safely {
+        if (!state.canEndStartAttempt || saving || downloader != null || query != null ||
+            coordinator.state.timeoutOperationId != null) return@safely
+        val value = reason.trim()
+        require(value.length in 1..200) { "请填写简短原因（200 字以内）" }
+        browsingHome = false; lastIdle = null
+        // A fresh GATT connection excludes late replies from the failed START round.
+        endStartAttemptReason = value
+        connect()
+    }
+
     override fun retryUpload(sessionId: String) {
         if (closed) return
         val upload = uploads ?: return
@@ -286,7 +311,7 @@ class RealCollectionController(
     fun refreshUploads() {
         if (closed || !initialized) return
         runCatching {
-            state = state.copy(session = store.read(), records = recordSummaries())
+            state = state.copy(session = store.read()?.takeUnless { it.startAttemptArchive != null }, records = recordSummaries())
             observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
         }.onFailure { reportError(it as? Exception ?: Exception(it)) }
     }
@@ -307,7 +332,7 @@ class RealCollectionController(
         files.isNotEmpty() && files.all { !it.simulated }
     } == true
 
-    private fun recordSummaries() = store.listSessions().filter { it.localData == null || isRealLocal(it) }
+    private fun recordSummaries() = store.listSessions().filter { it.startAttemptArchive == null && (it.localData == null || isRealLocal(it)) }
         .map { FlowRecordSummary(it.sessionId, it.reference?.steps, it.reference?.status?.wireValue,
             it.transfer.status.wireValue, isRealLocal(it), uploads?.isInFlight(it.sessionId) == true,
             uploads?.needsLocalReview(it.sessionId) == true) }
@@ -414,8 +439,8 @@ class RealCollectionController(
         coordinator.state.timeoutOperationId == null && store.readPending() == null
 
     private fun publish(page: CollectionPage, error: String? = null) {
-        val current = store.read()
-        val pending = current?.takeIf { it.localData == null }
+        val current = store.read()?.takeUnless { it.startAttemptArchive != null }
+        val pending = current?.takeIf { it.isPending }
         if (page != CollectionPage.HOME) { taskPage = page; taskError = error }
         val visible = if (browsingHome) CollectionPage.HOME else page
         val idle = lastIdle
@@ -423,12 +448,15 @@ class RealCollectionController(
         state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
             hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
             placement = (pending?.preparation ?: profile)?.placement, session = current,
-            connected = connected, connecting = connecting, busy = connecting || query != null ||
+            connected = connected, connecting = connecting, busy = connecting || query != null || coordinator.state.timeoutOperationId != null ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
             canRetry = !connecting && query == null && downloader == null,
+            canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
+                query == null && downloader == null && !saving && coordinator.state.timeoutOperationId == null &&
+                coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,
             records = recordSummaries())
         observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
     }
@@ -436,6 +464,7 @@ class RealCollectionController(
     private fun safely(failurePage: CollectionPage = CollectionPage.ERROR, action: () -> Unit) {
         if (closed) return
         try { action() } catch (error: Exception) {
+            endStartAttemptReason = null
             reportError(error)
             runCatching { closeDownload() }
             query = null; lastIdle = null; connecting = false
@@ -443,7 +472,7 @@ class RealCollectionController(
                 ?: "暂时无法完成，本次记录已保留"
             try { publish(failurePage, message) } catch (_: Exception) {
                 state = state.copy(page = CollectionPage.ERROR, busy = false, canStart = false, canStop = false,
-                    connecting = false, error = "记录读取失败，请联系研究者", canRetry = false)
+                    connecting = false, error = "记录读取失败，请联系研究者", canRetry = false, canEndStartAttempt = false)
                 observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
             }
         }

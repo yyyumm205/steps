@@ -24,7 +24,7 @@ enum class CaptureControlIssue {
     NOT_CONNECTED, WRONG_RING, CONNECTION_LOST, RECONNECT_REQUIRED, QUERY_TIMEOUT,
     COMMAND_NOT_ACCEPTED, DEVICE_ERROR, EXISTING_RECORDS, INVALID_OBSERVATION,
     RECORD_ORIGIN_UNCERTAIN, RECORD_CHANGED, UNEXPECTED_DEVICE_STATE, RECOVERY_REQUIRES_REVIEW,
-    STORAGE_FAILURE,
+    STORAGE_FAILURE, START_ARCHIVE_BLOCKED,
 }
 
 data class HealthRecordObservation(
@@ -71,7 +71,7 @@ class FreeLivingCaptureCoordinator(
     var state = CaptureControlState()
         private set
 
-    private enum class Purpose { PREFLIGHT, START, STOP, INSPECT }
+    private enum class Purpose { PREFLIGHT, START, STOP, INSPECT, ARCHIVE_START }
     private data class Round(
         val id: Long,
         val generation: Long,
@@ -98,6 +98,7 @@ class FreeLivingCaptureCoordinator(
     private var ownership: RecordIdentity? = null
     private var lastRecord: HealthMessage.ListItem? = null
     private var lastStatus: HealthMessage.Status? = null
+    private var archiveReason: String? = null
 
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
     fun restore() = dispatch { if (!restored) readJournal() }
@@ -163,6 +164,18 @@ class FreeLivingCaptureCoordinator(
         beginRound(purpose)
     }
 
+    /** An explicit user action always collects a new round; cached observations cannot release data. */
+    fun archiveUnconfirmedStart(reason: String) = dispatch {
+        if (!ensureRestored() || round != null) return@dispatch
+        val current = session ?: return@dispatch
+        if (current.phase != FreeLivingSessionPhase.START_REQUESTED || current.startAttemptArchive != null ||
+            !connectedTo(current.preparation.ring?.address)) return@dispatch
+        val value = reason.trim()
+        if (value.length !in 1..200) { review(CaptureControlIssue.START_ARCHIVE_BLOCKED); return@dispatch }
+        archiveReason = value
+        beginRound(Purpose.ARCHIVE_START)
+    }
+
     fun onHealth(connectionGeneration: Long, packet: SensorPacket.Health) = dispatch {
         if (connectionGeneration != generation) return@dispatch
         val active = round
@@ -184,7 +197,12 @@ class FreeLivingCaptureCoordinator(
         if (active.generation != connectionGeneration) return@dispatch
         when (val message = packet.message) {
             is HealthMessage.Status -> {
-                if (active.status != null) return@dispatch
+                if (active.status != null) {
+                    if (active.purpose == Purpose.ARCHIVE_START && message != active.status?.message) {
+                        invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
+                    }
+                    return@dispatch
+                }
                 if (!validStatus(message) || packet.receivedEpochMs <= 0) {
                     invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
                     return@dispatch
@@ -226,7 +244,7 @@ class FreeLivingCaptureCoordinator(
         if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
         round = Round(++operation, connectedGeneration, purpose)
         publish(when (purpose) {
-            Purpose.PREFLIGHT, Purpose.INSPECT -> CaptureControlPhase.CHECKING
+            Purpose.PREFLIGHT, Purpose.INSPECT, Purpose.ARCHIVE_START -> CaptureControlPhase.CHECKING
             Purpose.START -> CaptureControlPhase.STARTING
             Purpose.STOP -> CaptureControlPhase.STOPPING
         })
@@ -234,6 +252,22 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun completeRound(purpose: Purpose, observed: HealthRecordObservation) {
+        if (purpose == Purpose.ARCHIVE_START) {
+            val reason = archiveReason ?: return
+            archiveReason = null
+            val current = session ?: return
+            try {
+                store.archiveStartAttempt(current.sessionId, observed, clock.nowEpochMs(), reason)
+                session = store.readPending()
+                clearAssociation()
+                publish(CaptureControlPhase.IDLE, observed = observed)
+            } catch (_: IllegalArgumentException) {
+                review(CaptureControlIssue.START_ARCHIVE_BLOCKED, observed)
+            } catch (_: Exception) {
+                storageFailure()
+            }
+            return
+        }
         if (observed.status.errorCode != 0) {
             clearAssociation()
             review(CaptureControlIssue.DEVICE_ERROR, observed)
@@ -261,6 +295,7 @@ class FreeLivingCaptureCoordinator(
             Purpose.START -> confirmStart(observed)
             Purpose.STOP -> confirmStop(observed)
             Purpose.INSPECT -> recoverAssociation(observed)
+            Purpose.ARCHIVE_START -> error("Handled before capture confirmation")
         }
     }
 
@@ -394,6 +429,7 @@ class FreeLivingCaptureCoordinator(
         ownership = null
         lastRecord = null
         lastStatus = null
+        archiveReason = null
     }
 
     private fun ensureRestored(): Boolean {
@@ -428,12 +464,14 @@ class FreeLivingCaptureCoordinator(
     private fun storageFailure() {
         round = null
         intent = null
+        archiveReason = null
         publish(CaptureControlPhase.STORAGE_ERROR, CaptureControlIssue.STORAGE_FAILURE)
     }
 
     private fun review(issue: CaptureControlIssue, observed: HealthRecordObservation? = null) {
         round = null
         intent = null
+        archiveReason = null
         publish(CaptureControlPhase.NEEDS_REVIEW, issue, observed)
     }
 

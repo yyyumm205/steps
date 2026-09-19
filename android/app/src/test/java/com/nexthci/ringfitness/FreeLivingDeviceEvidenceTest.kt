@@ -30,17 +30,20 @@ class FreeLivingDeviceEvidenceTest {
         val original = store.confirmStart(request.sessionId, preparation.ring!!.address, active, t + 1)
         val envelope = JsonParser.parseString(file.readText()).asJsonObject
         val payload = envelope.getAsJsonObject("session")
-        listOf("start_baseline", "device_record_evidence", "device_association_invalidated").forEach(payload::remove)
+        listOf("start_baseline", "device_record_evidence", "device_association_invalidated",
+            "start_attempt_archive").forEach(payload::remove)
         envelope.addProperty("journal_version", 2)
         updateChecksum(envelope)
         file.writeText(envelope.toString())
         assertEquals(original, open(file).read())
         val bytes = file.readBytes()
         assertNull(open(file).read()!!.deviceRecordEvidence)
+        assertNull(open(file).read()!!.startAttemptArchive)
         assertArrayEquals(bytes, file.readBytes())
         open(file).requestStop(original.sessionId, t + 2)
-        assertEquals(3, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(4, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
         assertNull(open(file).read()!!.deviceRecordEvidence)
+        assertNull(open(file).read()!!.startAttemptArchive)
     }
 
     @Test fun associationAndUncertaintySurviveReferenceAndLocalCompletion() {

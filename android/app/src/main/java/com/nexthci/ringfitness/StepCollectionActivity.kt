@@ -162,7 +162,7 @@ abstract class StepCollectionActivity : Activity() {
         val body = ui.column(padding = 20).apply { setPadding(ui.dp(20), ui.dp(16), ui.dp(20), ui.dp(12)) }
         scroll.addView(body)
         val footer = ui.column(root, 20).apply { setPadding(ui.dp(20), ui.dp(12), ui.dp(20), ui.dp(12)) }
-        if (state.error != null) {
+        if (state.error != null && !(state.page == CollectionPage.HOME && homeTask(state).hint == state.error)) {
             ui.text(footer, state.error, 14f).apply {
                 tag = "flow_error"
                 setTextColor(ui.error)
@@ -278,6 +278,7 @@ abstract class StepCollectionActivity : Activity() {
         state.connecting -> HomeTask("本次采集", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
         state.canStart -> HomeTask("开始这一段", "采集准备", "开始采集", "佩戴好设备，站定后将计步器清零。")
+        state.session == null -> HomeTask("采集准备", "戒指暂未就绪", "重新检查", state.error)
         else -> when (state.taskPage) {
             CollectionPage.STARTING -> HomeTask("本次采集", "正在确认开始", "查看进度", "请站定等候。")
             CollectionPage.COLLECTING -> HomeTask("采集进行中", "正在采集", "查看采集")
@@ -437,11 +438,15 @@ abstract class StepCollectionActivity : Activity() {
     private fun recovery(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val session = state.session
         val needsStop = session != null && session.stopConfirmedAtMs == null
+        val unconfirmedStart = session?.phase == FreeLivingSessionPhase.START_REQUESTED
         title(body, when {
+            session == null && state.connected -> "戒指暂未就绪"
             session == null -> "连接尚未完成"
+            unconfirmedStart -> "开始待确认"
             needsStop -> "还需要确认一下"
             else -> "这一步未完成"
         }, when {
+            session == null && state.connected -> null
             session == null -> "请将戒指放在手机附近后重试。"
             needsStop -> "连接恢复后，重新检查戒指状态。"
             else -> "已保存的内容会保留，可以重试。"
@@ -449,17 +454,45 @@ abstract class StepCollectionActivity : Activity() {
         val card = ui.card(body)
         if (session == null) detail(card, "戒指", connectionLabel(state)) else {
             detail(card, "本次记录", "已保留")
-            ui.gap(card, 18)
-            detail(card, "计步器读数", session.reference?.steps?.let { "$it 步" }
-                ?: if (session.reference != null) "已记录原因" else "待填写")
+            if (!unconfirmedStart) {
+                ui.gap(card, 18)
+                detail(card, "计步器读数", session.reference?.steps?.let { "$it 步" }
+                    ?: if (session.reference != null) "已记录原因" else "待填写")
+            }
         }
         if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
             ui.button(body, "先记下步数", tag = "preserve_reference") { flow.enterReference() }
+        }
+        if (state.canEndStartAttempt) {
+            ui.button(body, "结束本次尝试", tag = "end_start_attempt") { showEndStartAttempt() }
         }
         action(footer, if (state.connecting) "连接中…" else if (!state.connected) "重新连接" else if (needsStop) "重新检查" else "重试",
             state.canRetry && !state.busy && !state.connecting) {
             if (!state.connected) flow.reconnect() else flow.retry()
         }
+    }
+
+    private fun showEndStartAttempt() {
+        val input = EditText(this).apply {
+            hint = "填写简短原因"
+            tag = "end_start_attempt_reason"
+            filters = arrayOf(android.text.InputFilter.LengthFilter(200))
+        }
+        val confirmation = AlertDialog.Builder(this).setTitle("结束本次尝试")
+            .setMessage("将重新检查戒指，并保存这次尝试的原因。")
+            .setView(input).setNegativeButton("返回", null).setPositiveButton("确认", null).create()
+        dialog = confirmation
+        confirmation.setOnShowListener {
+            confirmation.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (!confirmation.isShowing) return@setOnClickListener
+                val reason = input.text.toString().trim()
+                if (reason.isBlank()) input.error = "请填写原因" else {
+                    confirmation.dismiss()
+                    flow.endStartAttempt(reason)
+                }
+            }
+        }
+        confirmation.show()
     }
 
     private fun detail(parent: LinearLayout, key: String, value: String) {

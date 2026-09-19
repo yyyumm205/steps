@@ -767,6 +767,100 @@ class FreeLivingCaptureCoordinatorTest {
         }
     }
 
+    @Test fun endingAnUnconfirmedAttemptRequiresANewCompleteRoundAndNeverSendsControlCommands() {
+        val f = Fixture()
+        f.beginStart()
+        f.observe(idle().copy(errorCode = -16))
+        assertNotNull(f.store.readPending())
+        f.coordinator.archiveUnconfirmedStart("体验点击，未进行正式采集")
+        assertEquals(CaptureControlPhase.CHECKING, f.coordinator.state.phase)
+        f.health(idle().copy(errorCode = -16), connection = 0)
+        f.health(HealthMessage.ListEnd(0), connection = 0)
+        assertNotNull(f.store.readPending())
+        f.health(idle().copy(errorCode = -16))
+        assertNotNull(f.store.readPending())
+        f.health(HealthMessage.ListEnd(0))
+        assertNull(f.store.readPending())
+        assertEquals(CaptureControlPhase.IDLE, f.coordinator.state.phase)
+        assertNull(f.coordinator.state.session)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+        val calls = f.port.calls.toList()
+        f.coordinator.archiveUnconfirmedStart("再次点击")
+        assertEquals(calls, f.port.calls)
+    }
+
+    @Test fun interruptionAndLateRepliesCannotArchiveAnUnconfirmedAttempt() {
+        val f = Fixture()
+        f.beginStart()
+        f.observe(idle().copy(errorCode = -16))
+        val pending = f.store.readPending()
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.health(idle())
+        f.coordinator.onDisconnected(1)
+        f.health(HealthMessage.ListEnd(0))
+        assertEquals(pending, f.store.readPending())
+        f.connect(2)
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        val operation = requireNotNull(f.coordinator.state.timeoutOperationId)
+        f.coordinator.onTimeout(operation)
+        f.observe(idle(), connection = 2)
+        assertEquals(pending, f.store.readPending())
+        assertNull(f.store.read()!!.startAttemptArchive)
+    }
+
+    @Test fun archiveRejectsChangedOrContradictoryObservationWithoutReleasingTheRequest() {
+        val f = Fixture()
+        f.beginStart()
+        f.observe(idle().copy(errorCode = -16))
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.observe(collecting(), listOf(record()))
+        assertEquals(CaptureControlIssue.START_ARCHIVE_BLOCKED, f.coordinator.state.issue)
+        assertNotNull(f.store.readPending())
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.health(idle())
+        f.health(collecting())
+        f.health(HealthMessage.ListEnd(0))
+        assertEquals(CaptureControlIssue.INVALID_OBSERVATION, f.coordinator.state.issue)
+        assertNotNull(f.store.readPending())
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun failedArchivePersistenceKeepsTheProtectionUntilADurableRetry() {
+        val f = Fixture()
+        f.beginStart()
+        f.observe(idle().copy(errorCode = -16))
+        val pending = f.store.readPending()
+        f.failCommits = true
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.observe(idle())
+        assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
+        assertEquals(pending, f.store.readPending())
+        f.failCommits = false
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.observe(idle())
+        assertNull(f.store.readPending())
+        assertEquals(CaptureControlPhase.IDLE, f.coordinator.state.phase)
+    }
+
+    @Test fun archiveRenameWithFailedDirectorySyncNeverReportsSuccessUntilRestored() {
+        val f = Fixture()
+        f.beginStart()
+        f.observe(idle().copy(errorCode = -16))
+        f.failSyncAfterCommit = true
+        f.coordinator.archiveUnconfirmedStart("仅检查操作")
+        f.observe(idle())
+        assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
+        assertNotNull(f.coordinator.state.session)
+        val recovered = f.newCoordinator()
+        recovered.restore()
+        assertEquals(CaptureControlPhase.IDLE, recovered.state.phase)
+        assertNull(recovered.state.session)
+        assertNotNull(f.store.read()!!.startAttemptArchive)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+    }
+
     private fun deliver(coordinator: FreeLivingCaptureCoordinator, generation: Long,
         status: HealthMessage.Status, records: List<HealthMessage.ListItem>) {
         coordinator.onHealth(generation, SensorPacket.Health(status, epoch + 100))

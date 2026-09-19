@@ -301,7 +301,7 @@ class StepPreparationActivity : Activity() {
                 if (isDestroyed || generation != collectionReadGeneration) return@post
                 collectionLoaded = true
                 result.onSuccess { session ->
-                    collectionPending = session != null && session.localData == null
+                    collectionPending = session?.isPending == true
                     collectionHistory = session != null
                     collectionProblem = null
                 }.onFailure {

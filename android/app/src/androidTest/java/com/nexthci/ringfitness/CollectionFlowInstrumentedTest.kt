@@ -33,6 +33,73 @@ import org.junit.runner.RunWith
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
 
+    @Test fun endStartAttemptRequiresAnExplicitReasonAndWaitsForTheOwnerResult() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val request = FreeLivingSession("view-start-request", preparation,
+                FreeLivingSessionPhase.START_REQUESTED, "Asia/Shanghai", 28_800, 1_000)
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.RECOVERY, isSimulation = false,
+                hasProfile = true, participantId = preparation.participantId, placement = preparation.placement,
+                session = request, connected = true, canRetry = true))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { assertNull(taggedOrNull<View>(it, "end_start_attempt")) }
+            fixture.state = fixture.state.copy(page = CollectionPage.HOME, canEndStartAttempt = true)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { assertNull(taggedOrNull<View>(it, "end_start_attempt")) }
+            fixture.state = fixture.state.copy(page = CollectionPage.RECOVERY)
+            renderFixture(scenario, fixture)
+            click(scenario, "end_start_attempt")
+            scenario.onActivity { activity ->
+                val confirmation = startAttemptDialog(activity)
+                val input = confirmation.window!!.decorView.findViewWithTag<EditText>("end_start_attempt_reason")
+                assertTrue(confirmation.isShowing)
+                input.setText("   ")
+                assertTrue(confirmation.getButton(AlertDialog.BUTTON_POSITIVE).performClick())
+                assertTrue(confirmation.isShowing)
+                assertEquals("请填写原因", input.error.toString())
+                assertTrue(fixture.endedStartAttempts.isEmpty())
+                assertTrue(confirmation.getButton(AlertDialog.BUTTON_NEGATIVE).performClick())
+            }
+            instrumentation.waitForIdleSync()
+            scenario.onActivity { activity ->
+                assertFalse(startAttemptDialog(activity).isShowing)
+                assertTrue(fixture.endedStartAttempts.isEmpty())
+                assertEquals("开始待确认", tagged<TextView>(activity, "flow_heading").text.toString())
+            }
+            click(scenario, "end_start_attempt")
+            scenario.onActivity { activity ->
+                val confirmation = startAttemptDialog(activity)
+                confirmation.window!!.decorView.findViewWithTag<EditText>("end_start_attempt_reason")
+                    .setText("  体验点击，未进行正式采集  ")
+                val confirm = confirmation.getButton(AlertDialog.BUTTON_POSITIVE)
+                assertTrue(confirm.performClick())
+                assertFalse(confirmation.isShowing)
+                confirm.performClick() // A queued second activation must not dispatch again.
+                assertEquals(listOf("体验点击，未进行正式采集"), fixture.endedStartAttempts)
+                assertEquals("开始待确认", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertEquals(CollectionPage.RECOVERY, fixture.state.page)
+                assertEquals(request, fixture.state.session)
+                assertNull(fixture.state.session!!.startAttemptArchive)
+                assertNull(fixture.state.session!!.localData)
+            }
+            fixture.state = fixture.state.copy(session = null, canEndStartAttempt = false,
+                error = "戒指返回异常，请重新连接后再试")
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("戒指暂未就绪", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertNull(taggedOrNull<View>(activity, "end_start_attempt"))
+            }
+            fixture.state = fixture.state.copy(page = CollectionPage.HOME)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("戒指暂未就绪", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertNull(taggedOrNull<View>(activity, "flow_error"))
+                assertEquals("重新检查", tagged<Button>(activity, "flow_primary").text.toString())
+            }
+        }
+    }
+
     @Test fun allUnuploadedHistoryRemainsReachableAlongsideOnlyTheLastThreeUploadedRecords() = withFlow { _ ->
         launch().use { scenario ->
             val history = listOf(
@@ -667,6 +734,7 @@ class CollectionFlowInstrumentedTest {
     private class RenderingFlow(override var state: CollectionFlowState) : CollectionFlow {
         var reconnects = 0
         val uploadRetries = mutableListOf<String>()
+        val endedStartAttempts = mutableListOf<String>()
         var savedReference: Triple<String, String, String>? = null
         override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
             observer(state)
@@ -681,11 +749,16 @@ class CollectionFlowInstrumentedTest {
         override fun stop() = error("Unexpected stop")
         override fun enterReference() = error("Unexpected navigation")
         override fun retry() = error("Unexpected retry")
+        override fun endStartAttempt(reason: String) { endedStartAttempts += reason }
         override fun retryUpload(sessionId: String) { uploadRetries += sessionId }
         override fun home() = error("Unexpected navigation")
         override fun setFault(fault: FlowTestFault) = error("Unexpected development option")
         override fun disconnect() = error("Unexpected disconnect")
     }
+
+    private fun startAttemptDialog(activity: DemoCollectionActivity): AlertDialog =
+        StepCollectionActivity::class.java.getDeclaredField("dialog").apply { isAccessible = true }
+            .get(activity) as AlertDialog
 
     private fun launch(): ActivityScenario<DemoCollectionActivity> = ActivityScenario.launch(
         Intent(instrumentation.targetContext, DemoCollectionActivity::class.java))

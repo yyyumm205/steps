@@ -35,6 +35,7 @@ data class CollectionFlowState(
     val canStart: Boolean = false,
     val canStop: Boolean = false,
     val canRetry: Boolean = false,
+    val canEndStartAttempt: Boolean = false,
     val records: List<FlowRecordSummary> = emptyList(),
     val fault: FlowTestFault = FlowTestFault.NONE,
 )
@@ -48,6 +49,7 @@ interface CollectionFlow {
     fun enterReference()
     fun saveReference(stepsText: String, status: String = "valid", reason: String = "")
     fun retry()
+    fun endStartAttempt(reason: String) = Unit
     fun retryUpload(sessionId: String)
     fun home()
     fun setFault(fault: FlowTestFault)

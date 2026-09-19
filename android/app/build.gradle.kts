@@ -26,8 +26,8 @@ android {
         applicationId = "com.nexthci.ringfitness.steps"
         minSdk = 30
         targetSdk = 36
-        versionCode = 36
-        versionName = "0.7.2-recovery"
+        versionCode = 37
+        versionName = "0.7.3-start-recovery"
         manifestPlaceholders["appLabel"] = "步数采集"
 
         buildConfigField("String", "PUBLIC_DATA_DIRECTORY", "\"RingFitnessSteps\"")

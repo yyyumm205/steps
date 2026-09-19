@@ -159,7 +159,7 @@ class RealCollectionService : Service() {
     }
 
     private fun updateForeground(state: CollectionFlowState) {
-        val active = state.session?.localData == null && state.session != null
+        val active = state.session?.isPending == true
         wakeLock?.let { lock ->
             if (active && !lock.isHeld) lock.acquire()
             if (!active && lock.isHeld) lock.release()
@@ -324,13 +324,13 @@ object RealCollectionBridge : CollectionFlow {
         if (owner === token && retiring !== token) publish(next)
     }
     private fun publishWaiting() = publish(state.copy(busy = true, connecting = true,
-        connected = false, canStart = false, canStop = false, canRetry = false))
+        connected = false, canStart = false, canStop = false, canRetry = false, canEndStartAttempt = false))
     internal fun publish(next: CollectionFlowState) {
         state = next
         observers.forEach { it(next) }
     }
     internal fun fail(message: String) = publish(state.copy(page = CollectionPage.ERROR, busy = false,
-        connecting = false, connected = false, canStart = false, canStop = false, canRetry = false, error = message))
+        connecting = false, connected = false, canStart = false, canStop = false, canRetry = false, canEndStartAttempt = false, error = message))
     override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
         observers += observer
         main.post { if (observer in observers) observer(state) }
@@ -342,6 +342,7 @@ object RealCollectionBridge : CollectionFlow {
     override fun enterReference() { dispatch?.invoke { it.enterReference() } }
     override fun saveReference(stepsText: String, status: String, reason: String) { dispatch?.invoke { it.saveReference(stepsText, status, reason) } }
     override fun retry() { dispatch?.invoke { it.retry() } }
+    override fun endStartAttempt(reason: String) { dispatch?.invoke { it.endStartAttempt(reason) } }
     override fun retryUpload(sessionId: String) { dispatch?.invoke { it.retryUpload(sessionId) } }
     override fun home() { dispatch?.invoke { it.home() } }
     override fun setFault(fault: FlowTestFault) = Unit

@@ -97,6 +97,13 @@ data class DeviceRecordEvidence(
     val observedAtMs: Long,
 )
 
+/** Local audit of an explicitly ended, unconfirmed request; never a research capture. */
+data class StartAttemptArchive(
+    val archivedAtMs: Long,
+    val reason: String,
+    val observation: HealthRecordObservation,
+)
+
 data class FreeLivingSession(
     val sessionId: String,
     val preparation: PreparationSnapshot,
@@ -117,7 +124,9 @@ data class FreeLivingSession(
     val startBaseline: DeviceStartBaseline? = null,
     val deviceRecordEvidence: DeviceRecordEvidence? = null,
     val deviceAssociationInvalidated: Boolean = false,
+    val startAttemptArchive: StartAttemptArchive? = null,
 ) {
+    val isPending: Boolean get() = localData == null && startAttemptArchive == null
     val deviceSessionId: Int? get() = startStatusEvidence?.sessionId
     val startedAtMs: Long? get() = startBoundaryEvidence?.epochMs
     // Preserve contradictory raw evidence, while keeping the effective end explicitly unknown.
@@ -144,7 +153,8 @@ data class FreeLivingSession(
 
 /**
  * Atomic journal for the current session and locally complete sessions awaiting transmission.
- * Only verified local files release pending-data protection. Callers must durably record requests
+ * Verified local files or a guarded unconfirmed-start audit release pending-data protection.
+ * Callers must durably record requests
  * before sending BLE commands and correlate a start reply with that request before confirming it.
  * This store neither sends commands nor treats a GATT write callback as capture confirmation.
  * Confirmations retain their first evidence. Enriching unknown boundaries from a later download
@@ -169,7 +179,7 @@ class FreeLivingSessionStore internal constructor(
 
     fun read(): FreeLivingSession? = synchronized(processLock) { readLocked() }
 
-    fun readPending(): FreeLivingSession? = read()?.takeIf { it.localData == null }
+    fun readPending(): FreeLivingSession? = read()?.takeIf { it.isPending }
 
     fun read(sessionId: String): FreeLivingSession? = listSessions().singleOrNull { it.sessionId == sessionId }
 
@@ -186,7 +196,8 @@ class FreeLivingSessionStore internal constructor(
         require(session.reference != null && session.stopConfirmedAtMs != null) { "采集信息尚未保存完整" }
         require(local.files.none { it.simulated }) { "演示数据不能进入实验上传包" }
         verifyLocalFiles(session, local.files)
-        encode(session).apply {
+        // Local audit additions must not change already frozen research manifests.
+        encode(session, version = 3).apply {
             remove("phase")
             remove("transfer")
             remove("raw_files")
@@ -210,13 +221,13 @@ class FreeLivingSessionStore internal constructor(
             val zone = ZoneId.of(timeZoneId)
             val journal = readJournalLocked()
             val existing = journal?.current
-            if (existing != null && existing.localData == null) {
+            if (existing != null && existing.isPending) {
                 require(existing.preparation == preparation) { "已有采集段的编号、位置或戒指不能更改" }
                 require(existing.phase == FreeLivingSessionPhase.START_REQUESTED ||
                     existing.phase == FreeLivingSessionPhase.COLLECTING) { "上一段原始数据尚未安全保存，暂不能开始新采集" }
                 return@synchronized existing
             }
-            existing?.let { verifyLocalFiles(it, requireNotNull(it.localData).files) }
+            existing?.localData?.let { verifyLocalFiles(existing, it.files) }
             persist(FreeLivingSession(
                 sessionId = UUID.randomUUID().toString(), preparation = preparation,
                 phase = FreeLivingSessionPhase.START_REQUESTED,
@@ -226,6 +237,30 @@ class FreeLivingSessionStore internal constructor(
                 startBaseline = baseline,
             ), if (journal == null) emptyList() else journal.archived + journal.current)
         }
+
+    /** The coordinator supplies a newly completed STATUS/LIST round after explicit user input. */
+    fun archiveStartAttempt(sessionId: String, observation: HealthRecordObservation,
+        archivedAtMs: Long, reason: String): FreeLivingSession = update(sessionId) { current ->
+        current.startAttemptArchive?.let {
+            require(it.reason == reason) { "本次尝试已结束，原说明已保留" }
+            return@update current
+        }
+        val audit = StartAttemptArchive(archivedAtMs, reason, observation)
+        validateStartAttemptArchive(current, audit)
+        if (observation.records.isNotEmpty()) {
+            require(hasPreservedDeviceRecords(observation.address, observation.records)) { "戒指记录尚未完整保存在手机" }
+            val sessions = listSessions()
+            observation.records.forEach { record ->
+                val saved = sessions.single { it.preparation.ring?.address == observation.address &&
+                    it.deviceRecordEvidence?.record == record && !it.deviceAssociationInvalidated && it.localData != null }
+                val raw = requireNotNull(saved.localData).files.singleOrNull()
+                    ?: throw IllegalArgumentException("本次记录需要研究者核对")
+                RealSessionDownload.verifyPreservedContainer(File(file.parentFile, raw.fileName), record,
+                    saved.startedAtMs ?: 0L, saved.endedAtMs ?: 0L)
+            }
+        }
+        current.copy(startAttemptArchive = audit)
+    }
 
     fun confirmStart(
         sessionId: String,
@@ -393,7 +428,7 @@ class FreeLivingSessionStore internal constructor(
                 value.asJsonObject
             }
             val version = envelope.strictLong("journal_version")
-            require(version in 1L..3L) { "版本不受支持" }
+            require(version in 1L..4L) { "版本不受支持" }
             val payload = envelope.getAsJsonObject("session") ?: error("缺少采集段")
             val archives = if (version >= 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
             val hashed = if (version == 1L) payload else journalPayload(payload, archives)
@@ -419,7 +454,7 @@ class FreeLivingSessionStore internal constructor(
         val payload = encode(journal.current)
         val archives = JsonArray().apply { journal.archived.forEach { add(encode(it)) } }
         val envelope = JsonObject().apply {
-            addProperty("journal_version", 3)
+            addProperty("journal_version", 4)
             add("session", payload)
             add("archived_sessions", archives)
             addProperty("sha256", digest(journalPayload(payload, archives).toString()))
@@ -472,7 +507,7 @@ class FreeLivingSessionStore internal constructor(
             val sessions = journal.archived + journal.current
             require(sessions.map { it.sessionId }.distinct().size == sessions.size) { "采集段标识重复" }
             sessions.forEach(::validateSession)
-            require(journal.archived.all { it.localData != null }) { "尚未保存完整的采集段不能归档" }
+            require(journal.archived.all { !it.isPending }) { "尚未保存完整的采集段不能归档" }
         }
 
         private fun validateReference(reference: SessionReference) {
@@ -528,6 +563,27 @@ class FreeLivingSessionStore internal constructor(
         private fun validateDeviceRecord(record: HealthMessage.ListItem) {
             require(record.sessionId in 1..65535 && record.bytes in 0..0xFFFF_FFFFL &&
                 record.records in 0..0xFFFF_FFFFL && record.uptimeMs in 0..0xFFFF_FFFFL && record.unixMs >= 0)
+        }
+
+        private fun validateStartAttemptArchive(session: FreeLivingSession, audit: StartAttemptArchive) {
+            require(session.phase == FreeLivingSessionPhase.START_REQUESTED && session.startConfirmedAtMs == null &&
+                session.stopRequestedAtMs == null && session.stopConfirmedAtMs == null &&
+                session.deviceRecordEvidence == null && !session.deviceAssociationInvalidated &&
+                session.reference == null && session.localData == null) { "本次记录仍需保留，请联系研究者" }
+            require(audit.archivedAtMs > 0 && audit.reason.length in 1..200 && audit.reason == audit.reason.trim()) {
+                "请填写简短原因（200 字以内）"
+            }
+            val baseline = requireNotNull(session.startBaseline) { "缺少开始前记录，请联系研究者" }
+            val observed = audit.observation
+            // Observed -16 remains opaque; unchanged records and verified originals govern archival.
+            require(observed.address == session.preparation.ring?.address && observed.connectionGeneration > 0 &&
+                observed.statusReceivedAtMs > 0 && !observed.status.collecting &&
+                observed.status.errorCode in setOf(0, -16) &&
+                observed.status.copy(errorCode = 0) == baseline.status &&
+                observed.records.size == baseline.records.size && observed.records.toSet() == baseline.records.toSet()) {
+                "戒指状态或记录有变化，请联系研究者"
+            }
+            require(observed.records.all { it.unixMs > 0 }) { "戒指记录来源待核对，请联系研究者" }
         }
 
         fun sameDeviceRecord(first: HealthMessage.ListItem, second: HealthMessage.ListItem): Boolean =
@@ -599,9 +655,10 @@ class FreeLivingSessionStore internal constructor(
                 require(it.receiptId.isNotBlank() && it.receivedAtMs > 0 && it.sessionId == session.sessionId)
                 require(session.localData!!.files.all { file -> file.simulated == it.simulated })
             }
+            session.startAttemptArchive?.let { validateStartAttemptArchive(session, it) }
         }
 
-        private fun encode(s: FreeLivingSession, version: Long = 3L) = JsonObject().apply {
+        private fun encode(s: FreeLivingSession, version: Long = 4L) = JsonObject().apply {
             addProperty("session_id", s.sessionId)
             addProperty("participant_id", s.preparation.participantId)
             addProperty("participant_name", s.preparation.participantId)
@@ -664,6 +721,15 @@ class FreeLivingSessionStore internal constructor(
                 } } ?: JsonNull.INSTANCE)
                 addProperty("device_association_invalidated", s.deviceAssociationInvalidated)
             }
+            if (version >= 4L) add("start_attempt_archive", s.startAttemptArchive?.let { audit -> JsonObject().apply {
+                addProperty("archived_at_ms", audit.archivedAtMs)
+                addProperty("reason", audit.reason)
+                addProperty("ring_address", audit.observation.address)
+                addProperty("connection_generation", audit.observation.connectionGeneration)
+                addProperty("observed_at_ms", audit.observation.statusReceivedAtMs)
+                add("status", encodeStatus(audit.observation.status))
+                add("records", JsonArray().apply { audit.observation.records.forEach { add(encodeRecord(it)) } })
+            } } ?: JsonNull.INSTANCE)
         }
 
         private fun decode(p: JsonObject, version: Long): FreeLivingSession {
@@ -699,6 +765,11 @@ class FreeLivingSessionStore internal constructor(
                     p.getAsJsonObject("device_record_evidence").let { DeviceRecordEvidence(decodeRecord(it.getAsJsonObject("record")),
                         requireNotNull(decodeStatus(it.required("status"))), it.strictLong("observed_at_ms")) },
                 deviceAssociationInvalidated = version >= 3L && p.strictBoolean("device_association_invalidated"),
+                startAttemptArchive = if (version < 4L || p.required("start_attempt_archive").isJsonNull) null else
+                    p.getAsJsonObject("start_attempt_archive").let { StartAttemptArchive(it.strictLong("archived_at_ms"),
+                        it.strictString("reason"), HealthRecordObservation(it.strictString("ring_address"),
+                            it.strictLong("connection_generation"), requireNotNull(decodeStatus(it.required("status"))),
+                            it.strictLong("observed_at_ms"), it.required("records").asJsonArray.map { row -> decodeRecord(row.asJsonObject) })) },
             )
             // Re-encoding checks required fields, fixed metadata, explicit nulls and derived values.
             require(encode(s, version) == p) { "采集段字段不完整或数据含义不一致" }
