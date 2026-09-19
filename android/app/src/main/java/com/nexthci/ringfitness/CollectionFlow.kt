@@ -28,6 +28,7 @@ data class CollectionFlowState(
     val session: FreeLivingSession? = null,
     val connected: Boolean = true,
     val connecting: Boolean = false,
+    val checkingDevice: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
     val savedSteps: Long? = null,

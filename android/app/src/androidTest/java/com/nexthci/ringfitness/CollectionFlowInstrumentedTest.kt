@@ -97,6 +97,14 @@ class CollectionFlowInstrumentedTest {
                 assertNull(taggedOrNull<View>(activity, "flow_error"))
                 assertEquals("重新检查", tagged<Button>(activity, "flow_primary").text.toString())
             }
+            fixture.state = fixture.state.copy(checkingDevice = true, busy = true, error = null)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("正在检查戒指", tagged<TextView>(activity, "home_task_status").text.toString())
+                val primary = tagged<Button>(activity, "flow_primary")
+                assertEquals("检查中…", primary.text.toString())
+                assertFalse(primary.isEnabled)
+            }
         }
     }
 

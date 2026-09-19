@@ -770,7 +770,7 @@ class FreeLivingCaptureCoordinatorTest {
     @Test fun endingAnUnconfirmedAttemptRequiresANewCompleteRoundAndNeverSendsControlCommands() {
         val f = Fixture()
         f.beginStart()
-        f.observe(idle().copy(errorCode = -16))
+        repeat(3) { f.observe(idle().copy(errorCode = -16)) }
         assertNotNull(f.store.readPending())
         f.coordinator.archiveUnconfirmedStart("体验点击，未进行正式采集")
         assertEquals(CaptureControlPhase.CHECKING, f.coordinator.state.phase)
@@ -793,7 +793,7 @@ class FreeLivingCaptureCoordinatorTest {
     @Test fun interruptionAndLateRepliesCannotArchiveAnUnconfirmedAttempt() {
         val f = Fixture()
         f.beginStart()
-        f.observe(idle().copy(errorCode = -16))
+        repeat(3) { f.observe(idle().copy(errorCode = -16)) }
         val pending = f.store.readPending()
         f.coordinator.archiveUnconfirmedStart("仅检查操作")
         f.health(idle())
@@ -812,7 +812,7 @@ class FreeLivingCaptureCoordinatorTest {
     @Test fun archiveRejectsChangedOrContradictoryObservationWithoutReleasingTheRequest() {
         val f = Fixture()
         f.beginStart()
-        f.observe(idle().copy(errorCode = -16))
+        repeat(3) { f.observe(idle().copy(errorCode = -16)) }
         f.coordinator.archiveUnconfirmedStart("仅检查操作")
         f.observe(collecting(), listOf(record()))
         assertEquals(CaptureControlIssue.START_ARCHIVE_BLOCKED, f.coordinator.state.issue)
@@ -829,7 +829,7 @@ class FreeLivingCaptureCoordinatorTest {
     @Test fun failedArchivePersistenceKeepsTheProtectionUntilADurableRetry() {
         val f = Fixture()
         f.beginStart()
-        f.observe(idle().copy(errorCode = -16))
+        repeat(3) { f.observe(idle().copy(errorCode = -16)) }
         val pending = f.store.readPending()
         f.failCommits = true
         f.coordinator.archiveUnconfirmedStart("仅检查操作")
@@ -846,7 +846,7 @@ class FreeLivingCaptureCoordinatorTest {
     @Test fun archiveRenameWithFailedDirectorySyncNeverReportsSuccessUntilRestored() {
         val f = Fixture()
         f.beginStart()
-        f.observe(idle().copy(errorCode = -16))
+        repeat(3) { f.observe(idle().copy(errorCode = -16)) }
         f.failSyncAfterCommit = true
         f.coordinator.archiveUnconfirmedStart("仅检查操作")
         f.observe(idle())
@@ -894,7 +894,8 @@ class FreeLivingCaptureCoordinatorTest {
         var observer: (CaptureControlState) -> Unit = {}
         val coordinator = newCoordinator()
 
-        fun newCoordinator() = FreeLivingCaptureCoordinator(store, port, clock) { observer(it) }
+        // These cases check state/evidence rules; monotonic delays have dedicated timing tests.
+        fun newCoordinator() = FreeLivingCaptureCoordinator(store, port, clock, { _, action -> action() }) { observer(it) }
         fun connect(connection: Long = 1) = coordinator.onConnected(address, connection)
         fun health(message: HealthMessage, connection: Long = 1) =
             coordinator.onHealth(connection, SensorPacket.Health(message, clock.now))

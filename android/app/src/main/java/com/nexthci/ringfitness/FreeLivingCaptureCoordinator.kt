@@ -48,6 +48,7 @@ data class CaptureControlState(
     val issue: CaptureControlIssue? = null,
     val observation: HealthRecordObservation? = null,
     val timeoutOperationId: Long? = null,
+    val settling: Boolean = false,
 )
 
 /**
@@ -66,6 +67,7 @@ class FreeLivingCaptureCoordinator(
     private val store: FreeLivingSessionStore,
     private val port: HealthControlPort,
     private val clock: CaptureClock,
+    private val schedule: (Long, () -> Unit) -> Unit,
     private val onState: (CaptureControlState) -> Unit,
 ) {
     var state = CaptureControlState()
@@ -82,6 +84,8 @@ class FreeLivingCaptureCoordinator(
     private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String,
         val allowedExisting: ExistingRecordAuthorization?)
     private data class RecordIdentity(val sessionId: Int, val uptimeMs: Long, val unixMs: Long)
+    private enum class StartWaitStage { BEFORE_START, BEFORE_STATUS }
+    private data class StartWait(val id: Long, val generation: Long, val sessionId: String, val stage: StartWaitStage)
 
     private val events = ArrayDeque<() -> Unit>()
     private var draining = false
@@ -99,12 +103,23 @@ class FreeLivingCaptureCoordinator(
     private var lastRecord: HealthMessage.ListItem? = null
     private var lastStatus: HealthMessage.Status? = null
     private var archiveReason: String? = null
+    private var startWait: StartWait? = null
+    private var startPollCount = 0
+    private var closed = false
 
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
     fun restore() = dispatch { if (!restored) readJournal() }
 
     /** The sole owner calls this after reference/file persistence, when no response is pending. */
-    fun refresh() = dispatch { if (round == null) readJournal() }
+    fun refresh() = dispatch {
+        if (round == null) {
+            if (startWait != null) clearAssociation()
+            readJournal()
+        }
+    }
+
+    /** The owner cancels pending delays before releasing its transport. */
+    fun close() = dispatch { closed = true; clearAssociation() }
 
     /** Generation must increase for every native connection, including a same-address reconnect. */
     fun onConnected(ringAddress: String, connectionGeneration: Long) = dispatch {
@@ -133,7 +148,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     fun requestStop() = dispatch {
-        if (!ensureRestored() || round != null) return@dispatch
+        if (!ensureRestored() || round != null || startWait != null) return@dispatch
         val current = session ?: return@dispatch
         if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE) return@dispatch
         if (!connectedTo(current.preparation.ring?.address)) return@dispatch
@@ -151,7 +166,7 @@ class FreeLivingCaptureCoordinator(
 
     /** Recovery only queries. Stable collecting/reference states keep their normal action. */
     fun reconcile() = dispatch {
-        if (!ensureRestored() || round != null) return@dispatch
+        if (!ensureRestored() || round != null || startWait != null) return@dispatch
         if (state.phase == CaptureControlPhase.COLLECTING || state.phase == CaptureControlPhase.AWAITING_REFERENCE) return@dispatch
         val current = session ?: return@dispatch
         if (!connectedTo(current.preparation.ring?.address)) return@dispatch
@@ -166,7 +181,7 @@ class FreeLivingCaptureCoordinator(
 
     /** An explicit user action always collects a new round; cached observations cannot release data. */
     fun archiveUnconfirmedStart(reason: String) = dispatch {
-        if (!ensureRestored() || round != null) return@dispatch
+        if (!ensureRestored() || round != null || startWait != null) return@dispatch
         val current = session ?: return@dispatch
         if (current.phase != FreeLivingSessionPhase.START_REQUESTED || current.startAttemptArchive != null ||
             !connectedTo(current.preparation.ring?.address)) return@dispatch
@@ -178,6 +193,21 @@ class FreeLivingCaptureCoordinator(
 
     fun onHealth(connectionGeneration: Long, packet: SensorPacket.Health) = dispatch {
         if (connectionGeneration != generation) return@dispatch
+        startWait?.let { waiting ->
+            // No response round is open during settling. In particular, a spontaneous START
+            // response cannot confirm the request before the delayed STATUS/LIST query.
+            if (waiting.stage == StartWaitStage.BEFORE_START) {
+                val before = baseline
+                val consistent = before != null && packet.receivedEpochMs > 0 && when (val message = packet.message) {
+                    is HealthMessage.Status -> message == before.status
+                    is HealthMessage.ListItem -> message in before.records
+                    is HealthMessage.ListEnd -> message.count == before.records.size
+                    else -> false
+                }
+                if (!consistent) invalidateRound(CaptureControlIssue.UNEXPECTED_DEVICE_STATE)
+            }
+            return@dispatch
+        }
         val active = round
         if (active == null) {
             val status = packet.message as? HealthMessage.Status ?: return@dispatch
@@ -242,6 +272,7 @@ class FreeLivingCaptureCoordinator(
     private fun beginRound(purpose: Purpose) {
         val connectedGeneration = generation ?: return
         if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
+        if (purpose == Purpose.START) startPollCount++
         round = Round(++operation, connectedGeneration, purpose)
         publish(when (purpose) {
             Purpose.PREFLIGHT, Purpose.INSPECT, Purpose.ARCHIVE_START -> CaptureControlPhase.CHECKING
@@ -268,6 +299,14 @@ class FreeLivingCaptureCoordinator(
             }
             return
         }
+        if (purpose == Purpose.START && startPollCount < START_POLL_LIMIT && unchangedIdleBaseline(observed)) {
+            // A complete idle reply may precede firmware readiness. Recheck only that same
+            // baseline; an unfamiliar record or collecting error keeps the protective exit.
+            waitForStart(StartWaitStage.BEFORE_STATUS, START_POLL_INTERVAL_MS, observed) {
+                beginRound(Purpose.START)
+            }
+            return
+        }
         if (observed.status.errorCode != 0) {
             clearAssociation()
             review(CaptureControlIssue.DEVICE_ERROR, observed)
@@ -287,15 +326,56 @@ class FreeLivingCaptureCoordinator(
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
                     DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs)) } ?: return
                 baseline = observed
-                publish(CaptureControlPhase.STARTING, observed = observed)
-                if (!send(port::start)) return
+                startPollCount = 0
                 check(saved.phase == FreeLivingSessionPhase.START_REQUESTED)
-                beginRound(Purpose.START)
+                waitForStart(StartWaitStage.BEFORE_START, START_SETTLE_DELAY_MS) {
+                    if (send(port::start)) {
+                        // This delay starts at local enqueue, not at confirmed device execution.
+                        waitForStart(StartWaitStage.BEFORE_STATUS, START_FIRST_POLL_DELAY_MS) {
+                            beginRound(Purpose.START)
+                        }
+                    }
+                }
             }
             Purpose.START -> confirmStart(observed)
             Purpose.STOP -> confirmStop(observed)
             Purpose.INSPECT -> recoverAssociation(observed)
             Purpose.ARCHIVE_START -> error("Handled before capture confirmation")
+        }
+    }
+
+    private fun unchangedIdleBaseline(observed: HealthRecordObservation): Boolean {
+        val before = baseline ?: return false
+        return !observed.status.collecting && observed.address == before.address &&
+            observed.connectionGeneration == before.connectionGeneration &&
+            observed.status.copy(errorCode = 0) == before.status &&
+            observed.records.size == before.records.size && observed.records.toSet() == before.records.toSet()
+    }
+
+    private fun waitForStart(stage: StartWaitStage, delayMs: Long,
+        observed: HealthRecordObservation? = baseline, action: () -> Unit) {
+        val current = session ?: return
+        val connection = generation ?: return
+        val waiting = StartWait(++operation, connection, current.sessionId, stage)
+        startWait = waiting
+        publish(CaptureControlPhase.STARTING, observed = observed)
+        try {
+            schedule(delayMs) {
+                dispatch callback@{
+                    if (startWait != waiting || generation != waiting.generation || session?.sessionId != waiting.sessionId) return@callback
+                    // A durable request remains the prerequisite even if storage changed while waiting.
+                    val durable = try { store.readPending() } catch (_: Exception) { storageFailure(); return@callback }
+                    if (durable != session || durable?.phase != FreeLivingSessionPhase.START_REQUESTED) {
+                        clearAssociation()
+                        readJournal()
+                        return@callback
+                    }
+                    startWait = null
+                    action()
+                }
+            }
+        } catch (_: Exception) {
+            invalidateRound(CaptureControlIssue.COMMAND_NOT_ACCEPTED)
         }
     }
 
@@ -423,6 +503,8 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun clearAssociation() {
+        startWait = null
+        startPollCount = 0
         round = null
         intent = null
         baseline = null
@@ -462,6 +544,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun storageFailure() {
+        startWait = null
         round = null
         intent = null
         archiveReason = null
@@ -469,6 +552,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun review(issue: CaptureControlIssue, observed: HealthRecordObservation? = null) {
+        startWait = null
         round = null
         intent = null
         archiveReason = null
@@ -476,16 +560,17 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun publish(phase: CaptureControlPhase, issue: CaptureControlIssue? = null, observed: HealthRecordObservation? = null) {
-        state = CaptureControlState(phase, session, issue, observed, round?.id)
+        state = CaptureControlState(phase, session, issue, observed, round?.id, settling = startWait != null)
         onState(state)
     }
 
     private fun dispatch(action: () -> Unit) {
+        if (closed) return
         events.addLast(action)
         if (draining) return
         draining = true
         try {
-            while (events.isNotEmpty()) events.removeFirst().invoke()
+            while (!closed && events.isNotEmpty()) events.removeFirst().invoke()
         } finally {
             events.clear()
             draining = false
@@ -505,5 +590,9 @@ class FreeLivingCaptureCoordinator(
 
     companion object {
         const val QUERY_TIMEOUT_MS = 30_000L
+        const val START_SETTLE_DELAY_MS = 500L
+        const val START_FIRST_POLL_DELAY_MS = 1_000L
+        const val START_POLL_INTERVAL_MS = 1_500L
+        const val START_POLL_LIMIT = 3
     }
 }

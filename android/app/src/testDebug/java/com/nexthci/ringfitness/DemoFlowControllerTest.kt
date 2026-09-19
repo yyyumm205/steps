@@ -257,7 +257,7 @@ class DemoFlowControllerTest {
     @Test fun restartAtStartAndStopRequestsAdoptsOnlyTheMatchingSyntheticEvidence() {
         val f = Fixture()
         f.flow.setFault(FlowTestFault.START_TIMEOUT)
-        f.flow.start(); f.advance(600)
+        f.flow.start(); f.advance(1100) // Complete preflight plus the 500 ms start settling window.
         assertEquals(FreeLivingSessionPhase.START_REQUESTED, f.store.read()!!.phase)
         val id = f.store.read()!!.sessionId
         val startedDevice = File(f.directory, "device.json").readBytes()
@@ -361,7 +361,7 @@ class DemoFlowControllerTest {
         f.begin(); f.stop(); f.flow.saveReference("41"); f.advance(1550)
         val firstId = f.store.read()!!.sessionId
         assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
-        f.flow.home(); f.flow.start(); f.advance(1200)
+        f.flow.home(); f.flow.start(); f.advance(2700) // Preflight, start/poll waits, then a complete STATUS/LIST.
         val secondId = f.store.read()!!.sessionId
         assertNotEquals(firstId, secondId)
         assertEquals(CollectionPage.COLLECTING, f.flow.state.page)

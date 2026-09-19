@@ -67,9 +67,11 @@ class RealCollectionService : Service() {
                             override fun onBleState(message: String, ready: Boolean) {
                                 if (!active()) return
                                 if (ready) {
+                                    trace("connected generation=$generation")
                                     clientWasReady = true
                                     submit { it.onConnected(generation) }
                                 } else if (clientWasReady) {
+                                    trace("disconnected generation=$generation")
                                     clientWasReady = false
                                     submit { it.onDisconnected(generation, "连接中断，请将戒指放在手机附近") }
                                 }
@@ -86,12 +88,12 @@ class RealCollectionService : Service() {
                         next.connectKnownAddress(ring.address, ring.name)
                     }
                     override fun disconnect() { onMain(allowDestroyed = true) { closeClient() } }
-                    override fun queryStatus() = command { it.requestHealthStatus() }
-                    override fun queryRecords() = command { it.requestHealthSessions() }
-                    override fun start() = command { it.startHealth() }
-                    override fun stop() = command { it.stopHealth() }
+                    override fun queryStatus() = command("STATUS") { it.requestHealthStatus() }
+                    override fun queryRecords() = command("LIST") { it.requestHealthSessions() }
+                    override fun start() = command("START") { it.startHealth() }
+                    override fun stop() = command("STOP") { it.stopHealth() }
                     override fun read(sessionId: Int, offset: Long, length: Int) =
-                        command { it.readHealth(sessionId, offset, length) }
+                        command("READ") { it.readHealth(sessionId, offset, length) }
                 }
                 val owner = RealCollectionController(directory, PreparationStore(File(filesDir, "preparation/profile.properties")),
                     store, port, CollectionScheduler { delay, action ->
@@ -107,6 +109,7 @@ class RealCollectionService : Service() {
                         else null
                     }, notifyObserver = { action -> main.post { if (!destroyed) action() } },
                     recordObservation = { observation ->
+                        trace("observation generation=${observation.connectionGeneration} status=${observation.status} records=${observation.records}")
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
                     }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
                     uploads = object : RealUploadPort {
@@ -153,9 +156,16 @@ class RealCollectionService : Service() {
         if (!destroyed) worker.execute { if (!destroyed) controller?.let(action) }
     }
 
-    private fun command(action: (RingBleClient) -> Boolean): Boolean {
+    private fun command(name: String, action: (RingBleClient) -> Boolean): Boolean {
         val expected = clientGeneration
-        return onMain { if (expected != clientGeneration) false else client?.let(action) ?: false }
+        trace("enqueue_request command=$name generation=$expected")
+        return onMain { if (expected != clientGeneration) false else client?.let(action) ?: false }.also {
+            trace("enqueue_result command=$name generation=$expected accepted=$it")
+        }
+    }
+
+    private fun trace(message: String) {
+        if (BuildConfig.DEBUG) Log.i(TAG, "elapsed_ms=${android.os.SystemClock.elapsedRealtime()} $message")
     }
 
     private fun updateForeground(state: CollectionFlowState) {

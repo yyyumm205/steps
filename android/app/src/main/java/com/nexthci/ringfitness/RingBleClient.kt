@@ -65,7 +65,7 @@ class RingBleClient(
             listener.onBleState("戒指已连接", true)
         },
         onFailure = ::closeFailedControlConnection,
-        trace = { Log.d(TAG, it) },
+        trace = { controlTrace(it) },
     )
 
     private val scanTimeout = Runnable {
@@ -371,14 +371,14 @@ class RingBleClient(
     private fun handleNotification(value: ByteArray) {
         val command = value.firstOrNull()?.toInt()?.and(0xFF)
         if (command == 0x29 || command == 0x2A || command == 0x32) {
-            Log.d(TAG, "RX control command=0x${command.toString(16)} bytes=${value.size}")
+            controlTrace("RX control command=0x${command.toString(16)} bytes=${value.size}")
         }
         val packet = RingProtocol.parseNotification(
             value,
             System.currentTimeMillis(),
             imuLowPower = imuLowPower,
         ) ?: return
-        if (packet is SensorPacket.Health) Log.d(TAG, "RX HEALTH ${packet.message}")
+        if (packet is SensorPacket.Health && packet.message !is HealthMessage.DataChunk) controlTrace("RX HEALTH ${packet.message}")
         listener.onSensorPacket(packet)
     }
 
@@ -403,8 +403,7 @@ class RingBleClient(
         }
         val command = packet.firstOrNull()?.toInt()?.and(0xFF)
         if (command == 0x29 || command == 0x2A || command == 0x32) {
-            Log.d(
-                TAG,
+            controlTrace(
                 "TX control command=0x${command.toString(16)} " +
                     "subcommand=${packet.getOrNull(1)?.toInt()?.and(0xFF)} " +
                     "bytes=${packet.size} mode=${if (writeWithResponse) "with-response" else "without-response"}",
@@ -423,8 +422,12 @@ class RingBleClient(
             @Suppress("DEPRECATION")
             currentGatt.writeCharacteristic(characteristic)
         }
-        Log.d(TAG, "GATT control write accepted=$submitted")
+        controlTrace("GATT control write accepted=$submitted")
         return submitted
+    }
+
+    private fun controlTrace(message: String) {
+        if (BuildConfig.DEBUG) Log.i(TAG, "elapsed_ms=${android.os.SystemClock.elapsedRealtime()} $message")
     }
 
     private fun writeDescriptor(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor): Boolean {

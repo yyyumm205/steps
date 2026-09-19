@@ -56,14 +56,17 @@ class RealCollectionController(
     private var saving = false
     private var stopEvidenceGeneration: Long? = null
     private var endStartAttemptReason: String? = null
-    private data class Inspection(val id: Long, var status: SensorPacket.Health? = null,
+    private var readinessWait: Long? = null
+    private data class Inspection(val id: Long, val attempt: Int = 1,
+        val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf())
 
     @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploads != null,
         connected = false, connecting = true, busy = true, hasProfile = true)
         private set
 
-    private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store, port, clock) { control ->
+    private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store, port, clock,
+        schedule = { delay, action -> scheduler.schedule(delay) { if (!closed) safely(action = action) } }) { control ->
         control.observation?.let(::recordDiagnostic)
         when (control.phase) {
             CaptureControlPhase.IDLE -> if (control.observation != null) {
@@ -126,7 +129,7 @@ class RealCollectionController(
     fun onConnected(connection: Long) = safely {
         if (closed || connection != generation || connected) return@safely
         connected = true; connecting = false; reconnectCount = 0
-        query = null
+        query = null; readinessWait = null
         coordinator.onConnected(requireNotNull(profile?.ring).address, connection)
         endStartAttemptReason?.let { reason ->
             endStartAttemptReason = null
@@ -145,7 +148,7 @@ class RealCollectionController(
 
     fun onDisconnected(connection: Long, message: String) = safely {
         if (closed || connection != generation) return@safely
-        connected = false; connecting = false; query = null; lastIdle = null
+        connected = false; connecting = false; query = null; readinessWait = null; lastIdle = null
         endStartAttemptReason = null
         stopEvidenceGeneration = null
         closeDownload()
@@ -193,12 +196,19 @@ class RealCollectionController(
         }
         when (val message = packet.message) {
             is HealthMessage.Status -> {
-                if (round.status != null) return@safely
+                require(message.sessionId in 0..65535 && message.bytes in 0..0xFFFF_FFFFL &&
+                    message.records in 0..0xFFFF_FFFFL && packet.receivedEpochMs > 0) { "戒指状态需要重新核对" }
+                if (round.status != null) {
+                    require(round.status?.message == message) { "戒指状态发生变化，请重新检查" }
+                    return@safely
+                }
                 round.status = packet
                 check(port.queryRecords()) { "查询未完成，请重新连接" }
             }
             is HealthMessage.ListItem -> {
                 if (round.status == null) return@safely
+                require(message.sessionId in 0..65535 && message.bytes in 0..0xFFFF_FFFFL &&
+                    message.records in 0..0xFFFF_FFFFL && message.uptimeMs in 0..0xFFFF_FFFFL && message.unixMs >= 0)
                 require(round.records.size < 255 && round.records.none { it.sessionId == message.sessionId })
                 round.records += message
             }
@@ -211,9 +221,7 @@ class RealCollectionController(
                 recordDiagnostic(observation)
                 val current = store.readPending()
                 if (current == null) {
-                    lastIdle = observation.takeIf { !it.status.collecting && it.status.errorCode == 0 }
-                    if (lastIdle == null) publish(CollectionPage.RECOVERY, "戒指状态需要核对，请联系研究者")
-                    else { taskPage = null; taskError = null; publish(CollectionPage.HOME) }
+                    finishReadinessInspection(round, observation)
                 } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null) {
                     beginDownload(current, observation)
                 }
@@ -225,7 +233,7 @@ class RealCollectionController(
     override fun register(participantId: String, placement: RingPlacement) = Unit // Preparation owns registration.
 
     override fun start() = safely {
-        if (!state.canStart || connecting || query != null || downloader != null || saving) return@safely
+        if (!state.canStart || connecting || query != null || readinessWait != null || downloader != null || saving) return@safely
         browsingHome = false; lastIdle = null
         coordinator.refresh()
         coordinator.requestStart(requireNotNull(profile), authorizedExisting())
@@ -273,12 +281,16 @@ class RealCollectionController(
 
     override fun retry() = safely {
         browsingHome = false
-        if (saving || downloader != null || query != null || coordinator.state.timeoutOperationId != null) {
+        if (saving || downloader != null || query != null || readinessWait != null ||
+            coordinator.state.timeoutOperationId != null || coordinator.state.settling) {
             publish(taskPage ?: CollectionPage.RECOVERY, taskError); return@safely
         }
         val pending = store.readPending()
         when {
-            pending == null -> { if (store.read()?.localData != null) publish(CollectionPage.COMPLETE) else connect() }
+            pending == null -> {
+                if (store.read()?.localData != null && lastIdle != null) publish(CollectionPage.COMPLETE)
+                else connect()
+            }
             pending.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && pending.reference == null -> publish(CollectionPage.REFERENCE)
             coordinator.state.phase == CaptureControlPhase.COLLECTING && connected -> publish(CollectionPage.COLLECTING)
             else -> connect() // A fresh GATT channel separates untagged late replies from retry queries.
@@ -287,7 +299,7 @@ class RealCollectionController(
 
     override fun endStartAttempt(reason: String) = safely {
         if (!state.canEndStartAttempt || saving || downloader != null || query != null ||
-            coordinator.state.timeoutOperationId != null) return@safely
+            coordinator.state.timeoutOperationId != null || coordinator.state.settling) return@safely
         val value = reason.trim()
         require(value.length in 1..200) { "请填写简短原因（200 字以内）" }
         browsingHome = false; lastIdle = null
@@ -344,7 +356,7 @@ class RealCollectionController(
 
     private fun connect() {
         if (connecting) return
-        closeDownload(); query = null; lastIdle = null
+        closeDownload(); query = null; readinessWait = null; lastIdle = null
         stopEvidenceGeneration = null
         if (connected) coordinator.onDisconnected(generation)
         connected = false; connecting = true
@@ -360,10 +372,10 @@ class RealCollectionController(
         }
     }
 
-    private fun inspect() {
-        if (query != null || downloader != null || !connected) return
+    private fun inspect(attempt: Int = 1, errorBaseline: HealthRecordObservation? = null) {
+        if (query != null || readinessWait != null || downloader != null || !connected) return
         val id = ++operation
-        query = Inspection(id)
+        query = Inspection(id, attempt, errorBaseline)
         if (store.readPending()?.reference != null) publish(CollectionPage.DOWNLOADING)
         else publish(CollectionPage.HOME)
         check(port.queryStatus()) { "查询未完成，请重新连接" }
@@ -372,6 +384,41 @@ class RealCollectionController(
                 query = null; lastIdle = null
                 port.disconnect()
                 onDisconnected(generation, "查询超时，请重新连接戒指")
+            }
+        }
+    }
+
+    private fun finishReadinessInspection(round: Inspection, observed: HealthRecordObservation) {
+        lastIdle = null
+        val baseline = round.errorBaseline
+        val unchanged = baseline == null || (observed.address == baseline.address &&
+            observed.connectionGeneration == baseline.connectionGeneration &&
+            observed.status.copy(errorCode = 0) == baseline.status.copy(errorCode = 0) &&
+            observed.records.size == baseline.records.size && observed.records.toSet() == baseline.records.toSet())
+        if (observed.status.collecting || !unchanged) {
+            publish(CollectionPage.RECOVERY, "戒指记录需要核对，请联系研究者")
+            return
+        }
+        if (observed.status.errorCode == 0) {
+            lastIdle = observed
+            taskPage = null; taskError = null
+            publish(CollectionPage.HOME)
+            return
+        }
+        if (round.attempt >= READINESS_CHECK_LIMIT) {
+            publish(CollectionPage.RECOVERY, "戒指仍返回异常，请联系研究者")
+            return
+        }
+        // A bounded read-only follow-up can observe an error clearing; it cannot explain its semantics.
+        val token = ++operation
+        val connection = generation
+        readinessWait = token
+        taskPage = null; taskError = null
+        publish(CollectionPage.HOME)
+        scheduler.schedule(READINESS_CHECK_INTERVAL_MS) {
+            if (!closed && connected && generation == connection && readinessWait == token) safely {
+                readinessWait = null
+                inspect(round.attempt + 1, baseline ?: observed)
             }
         }
     }
@@ -422,7 +469,8 @@ class RealCollectionController(
     }
 
     fun close() {
-        closed = true; generation++; query = null
+        closed = true; generation++; query = null; readinessWait = null
+        coordinator.close()
         runCatching { closeDownload() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
         runCatching { port.disconnect() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
     }
@@ -436,7 +484,7 @@ class RealCollectionController(
 
     /** Called on the serial owner executor before committing a UI-requested release. */
     fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && downloader == null &&
-        coordinator.state.timeoutOperationId == null && store.readPending() == null
+        coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
 
     private fun publish(page: CollectionPage, error: String? = null) {
         val current = store.read()?.takeUnless { it.startAttemptArchive != null }
@@ -444,18 +492,20 @@ class RealCollectionController(
         if (page != CollectionPage.HOME) { taskPage = page; taskError = error }
         val visible = if (browsingHome) CollectionPage.HOME else page
         val idle = lastIdle
-        val canStart = pending == null && idle != null && !connecting && connected && query == null
+        val checkingDevice = pending == null && connected && (query != null || readinessWait != null)
+        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null
         state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
             hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
             placement = (pending?.preparation ?: profile)?.placement, session = current,
-            connected = connected, connecting = connecting, busy = connecting || query != null || coordinator.state.timeoutOperationId != null ||
+            connected = connected, connecting = connecting, checkingDevice = checkingDevice,
+            busy = connecting || query != null || readinessWait != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
-            canRetry = !connecting && query == null && downloader == null,
+            canRetry = !connecting && query == null && readinessWait == null && downloader == null && !coordinator.state.settling,
             canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
-                query == null && downloader == null && !saving && coordinator.state.timeoutOperationId == null &&
+                query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,
             records = recordSummaries())
         observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
@@ -467,7 +517,7 @@ class RealCollectionController(
             endStartAttemptReason = null
             reportError(error)
             runCatching { closeDownload() }
-            query = null; lastIdle = null; connecting = false
+            query = null; readinessWait = null; lastIdle = null; connecting = false
             val message = error.message?.takeIf { it.length < 70 && it.any { c -> c.code > 127 } }
                 ?: "暂时无法完成，本次记录已保留"
             try { publish(failurePage, message) } catch (_: Exception) {
@@ -481,5 +531,10 @@ class RealCollectionController(
     private fun recordDiagnostic(observation: HealthRecordObservation) {
         // The journal owns required evidence. An auxiliary diagnostic must not split its transaction.
         runCatching { recordObservation(observation) }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+    }
+
+    companion object {
+        internal const val READINESS_CHECK_LIMIT = 3
+        internal const val READINESS_CHECK_INTERVAL_MS = 1_500L
     }
 }

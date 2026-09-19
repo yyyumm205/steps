@@ -569,7 +569,7 @@ class RealCollectionControllerTest {
         f.owner.home()
         f.owner.start()
         f.observe(stopped(), listOf(finalRecord))
-        f.observe(stopped().copy(errorCode = -16), listOf(finalRecord))
+        f.observeUnconfirmedStart(stopped().copy(errorCode = -16), listOf(finalRecord))
         val request = requireNotNull(f.store.readPending())
         assertEquals("戒指返回异常，请重新连接后再试", f.owner.state.error)
         assertFalse(f.owner.state.canStart)
@@ -610,7 +610,7 @@ class RealCollectionControllerTest {
         f.connectReady()
         f.owner.start()
         f.observe(idle())
-        f.observe(idle().copy(errorCode = -16))
+        f.observeUnconfirmedStart(idle().copy(errorCode = -16))
         val request = f.store.readPending()
         f.owner.endStartAttempt("仅检查操作")
         f.owner.onConnected(f.port.generation)
@@ -625,7 +625,113 @@ class RealCollectionControllerTest {
         assertEquals(0, f.port.count("stop"))
     }
 
-    private inner class Fixture(private val uploads: RealUploadPort? = null) : AutoCloseable {
+    @Test fun idleDeviceErrorGetsOnlyThreeReadOnlyChecksAndNeverStartsOrChangesTheJournal() = Fixture().use { f ->
+        val saved = f.seedLocal()
+        val before = File(f.directory, "session.json").readBytes()
+        f.owner.initialize()
+        f.owner.onConnected(f.port.generation)
+        repeat(3) { index ->
+            f.observe(stopped().copy(errorCode = -16), listOf(finalRecord))
+            assertFalse(f.owner.state.canStart)
+            if (index < 2) {
+                assertTrue(f.owner.state.checkingDevice)
+                assertTrue(f.owner.state.busy)
+                assertFalse(f.owner.state.canRetry)
+                val count = f.port.calls.size
+                f.owner.start(); f.owner.retry()
+                assertEquals(count, f.port.calls.size)
+                f.runReadinessWait()
+            }
+        }
+        assertFalse(f.owner.state.busy)
+        assertFalse(f.owner.state.checkingDevice)
+        assertTrue(f.owner.state.canRetry)
+        assertEquals(3, f.port.count("status"))
+        assertEquals(3, f.port.count("list"))
+        assertEquals(0, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+        assertTrue(f.port.reads.isEmpty())
+        assertEquals(listOf(-16, -16, -16), f.observations.map { it.status.errorCode })
+        assertEquals(saved, f.store.read())
+        assertArrayEquals(before, File(f.directory, "session.json").readBytes())
+        assertFalse(f.hasReadinessWait())
+        val oldConnection = f.port.generation
+        f.owner.retry()
+        assertTrue(f.owner.state.connecting)
+        assertTrue(f.port.generation > oldConnection)
+        f.owner.onConnected(f.port.generation)
+        assertEquals(4, f.port.count("status"))
+        f.observe(stopped(), listOf(finalRecord))
+        assertTrue(f.owner.state.canStart)
+        assertEquals(saved, f.store.read())
+        assertArrayEquals(before, File(f.directory, "session.json").readBytes())
+    }
+
+    @Test fun aClearedErrorRequiresTheWholeUnchangedSnapshotBeforeReadiness() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(idle().copy(errorCode = -16))
+        f.runReadinessWait()
+        f.health(idle())
+        assertFalse(f.owner.state.canStart)
+        f.health(HealthMessage.ListEnd(0))
+        assertTrue(f.owner.state.canStart)
+        assertFalse(f.owner.state.checkingDevice)
+        assertNull(f.owner.state.error)
+        assertEquals(listOf(-16, 0), f.observations.map { it.status.errorCode })
+        assertNull(f.store.read())
+        assertEquals(0, f.port.count("start"))
+    }
+
+    @Test fun changedRecordsOrCollectingDuringRecheckCannotBeAcceptedAsRecovery() {
+        listOf(stopped(), stopped().copy(collecting = true)).forEach { next ->
+            Fixture().use { f ->
+                f.owner.initialize(); f.owner.onConnected(f.port.generation)
+                f.observe(idle().copy(errorCode = -16))
+                f.runReadinessWait()
+                f.observe(next, listOf(finalRecord))
+                assertFalse(f.owner.state.canStart)
+                assertFalse(f.owner.state.checkingDevice)
+                assertFalse(f.hasReadinessWait())
+                assertEquals(0, f.port.count("start"))
+                assertNull(f.store.read())
+            }
+        }
+    }
+
+    @Test fun disconnectedOrClosedOwnersCannotRunAnOldReadinessCheck() {
+        for (close in listOf(false, true)) Fixture().use { f ->
+            f.owner.initialize(); f.owner.onConnected(f.port.generation)
+            f.observe(idle().copy(errorCode = -16))
+            if (close) f.owner.close() else {
+                f.owner.onDisconnected(f.port.generation, "测试断连")
+                f.owner.reconnect()
+                f.owner.onConnected(f.port.generation)
+                f.observe(idle())
+            }
+            val before = f.port.calls.toList()
+            f.runReadinessWait()
+            assertEquals(before, f.port.calls)
+            assertNull(f.store.read())
+        }
+    }
+
+    @Test fun delayedStartPreventsRetryAndReleaseAndCloseCancelsTheCommand() = Fixture(deferCaptureWaits = true).use { f ->
+        f.connectReady()
+        f.owner.start(); f.observe(idle())
+        assertTrue(f.owner.state.busy)
+        assertFalse(f.owner.state.canRetry)
+        assertFalse(f.owner.canReleaseIfIdle())
+        val commands = f.port.calls.toList()
+        f.owner.retry(); f.owner.start()
+        assertEquals(commands, f.port.calls)
+        f.owner.close()
+        f.runDelay(500)
+        assertEquals(0, f.port.count("start"))
+        assertNotNull(f.store.readPending())
+    }
+
+    private inner class Fixture(private val uploads: RealUploadPort? = null,
+        private val deferCaptureWaits: Boolean = false) : AutoCloseable {
         val directory = temporary.newFolder()
         var failCommit = false
         var failObservation = false
@@ -642,11 +748,15 @@ class RealCollectionControllerTest {
         val port = RecordingPort()
         private val scheduled = mutableListOf<Pair<Long, () -> Unit>>()
         val errors = mutableListOf<Exception>()
+        val observations = mutableListOf<HealthRecordObservation>()
         var owner = createOwner()
 
         private fun createOwner() = RealCollectionController(directory, preparation, store, port,
-            CollectionScheduler { delay, action -> scheduled += delay to action }, clock,
-            recordObservation = { if (failObservation) throw IOException("注入诊断记录失败") },
+            // Timing is covered by dedicated virtual-time cases; existing workflow tests complete these waits immediately.
+            CollectionScheduler { delay, action ->
+                if (!deferCaptureWaits && delay in setOf(500L, 1_000L)) action() else scheduled += delay to action
+            }, clock,
+            recordObservation = { if (failObservation) throw IOException("注入诊断记录失败") else observations += it },
             reportError = { errors += it },
             downloadFactory = { location, session, record -> RealSessionDownload(location, session.sessionId,
                 session.preparation.ring!!.address, record, session.startedAtMs ?: 0L, session.endedAtMs ?: 0L, {
@@ -670,6 +780,14 @@ class RealCollectionControllerTest {
         }
 
         fun reopen() { owner.close(); owner = createOwner(); owner.initialize() }
+
+        fun hasReadinessWait() = scheduled.any { it.first == RealCollectionController.READINESS_CHECK_INTERVAL_MS }
+        fun runReadinessWait() = runDelay(RealCollectionController.READINESS_CHECK_INTERVAL_MS)
+        fun runDelay(delay: Long) {
+            val index = scheduled.indexOfFirst { it.first == delay }
+            check(index >= 0) { "Expected a scheduled wait" }
+            scheduled.removeAt(index).second()
+        }
 
         fun connectReady() {
             owner.initialize()
@@ -698,6 +816,13 @@ class RealCollectionControllerTest {
             health(status)
             records.forEach(::health)
             health(HealthMessage.ListEnd(records.size))
+        }
+
+        fun observeUnconfirmedStart(status: HealthMessage.Status, records: List<HealthMessage.ListItem> = emptyList()) {
+            repeat(3) { attempt ->
+                observe(status, records)
+                if (attempt < 2) runDelay(1_500)
+            }
         }
 
         fun health(message: HealthMessage) {

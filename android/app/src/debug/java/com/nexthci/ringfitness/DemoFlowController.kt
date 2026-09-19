@@ -216,12 +216,14 @@ class DemoFlowController(
         browsingHome = false
         connected = true
         blockedQuery = false
+        coordinator?.close()
         coordinator = null
         operationEpoch++
         recoverStored(false)
     }
 
     private fun attachCoordinator() {
+        coordinator?.close()
         val activeGeneration = ++generation
         val epoch = operationEpoch
         val port = object : HealthControlPort {
@@ -266,7 +268,7 @@ class DemoFlowController(
                 return true
             }
         }
-        coordinator = FreeLivingCaptureCoordinator(store, port, clock) { control ->
+        coordinator = FreeLivingCaptureCoordinator(store, port, clock, { delay, action -> scheduler.schedule(delay, action) }) { control ->
             when (control.phase) {
                 CaptureControlPhase.IDLE -> Unit
                 CaptureControlPhase.CHECKING, CaptureControlPhase.STARTING -> publish(CollectionPage.STARTING)
