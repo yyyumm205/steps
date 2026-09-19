@@ -1,17 +1,58 @@
-# Reference handoff and all original artifacts remain local.
+# Reference handoff, experiment data, and local QA artifacts remain local.
 /original/
-/.local/
+.local/
 /data/
 /research-data/
 /secrets/
 /android/dist/
+*.rfbin
+*.csv
+
+# Machine configuration and credentials; keep the shareable templates.
 .env
 .env.*
 !.env.example
-*.rfbin
-*.csv
-*.apk
-*.aab
+local.properties
+local.properties.*
+!local.properties.example
+key.properties
+keystore.properties
+signing.properties
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.key
+
+# Generated installation packages and diagnostic output.
+*.apk
+*.aab
+*.log
+*.hprof
+hs_err_pid*
+replay_pid*
+
+# Python backend environments, bytecode, and tool caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editor and operating-system temporary files.
+.idea/
+*.iml
+*.swp
+*.swo
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
+
 # Local configuration and generated Android files are also excluded by android/.gitignore.
