@@ -21,6 +21,7 @@ import android.widget.TextView
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 /** Rendering and input only; the flow owner survives page changes and owns durable state. */
 abstract class StepCollectionActivity : Activity() {
@@ -214,48 +215,87 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun home(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        title(body, "开始这一段")
+        val task = homeTask(state)
+        title(body, task.title)
         val ready = ui.card(body, ui.softGreen)
-        ui.text(ready, if (state.canStart) "一切就绪" else if (state.busy) "正在准备" else "继续你的记录", 24f, bold = true)
-        ui.gap(ready, 12)
-        ui.text(ready, if (state.canStart) "佩戴好设备，站定后将计步器清零。" else "上次记录已保留，可以接着完成。", muted = true)
+        ui.text(ready, task.status, 24f, bold = true).tag = "home_task_status"
+        task.hint?.let { ui.gap(ready, 12); ui.text(ready, it, muted = true) }
         val profile = ui.card(body)
         detail(profile, "被试编号", state.participantId)
         ui.gap(profile, 18)
         detail(profile, "佩戴位置", state.placement?.displayName ?: "待填写")
         ui.gap(profile, 18)
         detail(profile, "戒指", if (state.connected) "已连接" else "连接已中断")
-        if (state.records.isNotEmpty()) {
+        val recentRecords = state.records.filter { it.localComplete }.takeLast(3).reversed()
+        if (recentRecords.isNotEmpty()) {
             ui.text(body, "最近记录", 16f, bold = true)
             ui.gap(body, 12)
-            state.records.takeLast(3).reversed().forEach { record ->
+            recentRecords.forEach { record ->
                 val card = ui.card(body)
                 ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true)
                 ui.gap(card, 8)
                 ui.text(card, when {
-                    !record.localComplete -> "还有数据待保存"
                     record.transferStatus == "complete" -> if (state.isSimulation) "已保存 · 模拟上传完成" else "已上传"
+                    record.transferInFlight -> "已保存 · 正在上传"
+                    record.transferStatus in setOf("failed", "transferring") -> "已保存 · 上传待重试"
                     else -> "已保存 · 等待上传"
                 }, 14f, muted = true)
                 if (record.referenceStatus == "unreliable") { ui.gap(card, 8); ui.text(card, "读数有异常", 14f, muted = true) }
-                if (record.localComplete && record.transferStatus != "complete") {
-                    ui.button(card, "重试上传", tag = "retry_upload_${record.sessionId}") { flow.retryUpload(record.sessionId) }
+                if (!record.transferInFlight && record.transferStatus != "complete") {
+                    ui.button(card, if (record.transferStatus == "pending") "上传记录" else "重试上传",
+                        tag = "retry_upload_${record.sessionId}") { flow.retryUpload(record.sessionId) }
                 }
             }
         }
-        action(footer, if (state.canStart) "开始采集" else "继续本次记录", !state.busy) {
-            if (state.canStart) flow.start() else flow.retry()
+        action(footer, task.action, !state.busy) {
+            when {
+                !state.connected -> flow.reconnect()
+                state.canStart -> flow.start()
+                state.taskPage == CollectionPage.REFERENCE -> flow.enterReference()
+                else -> flow.retry()
+            }
+        }
+    }
+
+    private data class HomeTask(val title: String, val status: String, val action: String, val hint: String? = null)
+
+    private fun homeTask(state: CollectionFlowState): HomeTask = when {
+        !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
+        state.canStart -> HomeTask("开始这一段", "采集准备", "开始采集", "佩戴好设备，站定后将计步器清零。")
+        else -> when (state.taskPage) {
+            CollectionPage.STARTING -> HomeTask("本次采集", "正在确认开始", "查看进度", "请站定等候。")
+            CollectionPage.COLLECTING -> HomeTask("采集进行中", "正在采集", "查看采集")
+            CollectionPage.STOPPING -> HomeTask("本次采集", "正在确认结束", "查看进度", "请站定等候。")
+            CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
+                HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
+            else HomeTask("本次采集", "结束状态待确认", "先填写步数", "可以先填写计步器读数。")
+            CollectionPage.SAVING -> HomeTask("正在保存步数", "正在保存", "查看进度")
+            CollectionPage.DOWNLOADING -> HomeTask("正在下载数据", "步数已保存", "查看下载")
+            CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
+            CollectionPage.ERROR -> when {
+                state.session?.localData != null -> HomeTask("待上传记录", "数据已保存在手机", "重试上传")
+                state.session?.reference != null && state.session.stopConfirmedAtMs != null ->
+                    HomeTask("待下载数据", "步数已保存", "重试下载")
+                else -> HomeTask("本次采集", "记录需要检查", "重新检查")
+            }
+            else -> HomeTask("本次采集", when {
+                state.session?.stopRequestedAtMs != null -> "结束状态待确认"
+                state.session?.startConfirmedAtMs == null -> "开始状态待确认"
+                else -> "戒指状态待确认"
+            }, "重新检查")
         }
     }
 
     private fun collecting(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        title(body, "正在采集", "正常生活就好，活动切换无需操作。")
+        title(body, "正在采集")
         val card = ui.card(body, ui.softGreen)
         ui.text(card, "本次记录时长", 14f, muted = true)
         ui.gap(card, 18)
         elapsedLabel = ui.text(card, "00:00:00", 44f, bold = true).apply { tag = "flow_elapsed" }
         ui.gap(card, 24)
-        detail(card, "开始时间", time(state.session?.startConfirmedAtMs))
+        ui.text(card, "开始时间", 14f, muted = true)
+        ui.gap(card, 8)
+        ui.text(card, startDateTime(state.session), 18f, bold = true).tag = "flow_started_at"
         val device = ui.card(body)
         detail(device, "戒指", if (state.connected) "已连接" else "连接已中断")
         ui.gap(device, 16)
@@ -290,8 +330,6 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(card, "计步器总步数", 14f, muted = true)
             ui.gap(card, 12)
             stepsInput = ui.input(card, "填写步数", "flow_steps", numeric = true).apply { setText(stepsDraft) }
-            ui.gap(card, 10)
-            ui.text(card, "没有走动，也可以填写 0。", 14f, muted = true)
         } else ui.text(card, "本次无法提供读数", 20f, bold = true)
         if (referenceKind != "valid") {
             ui.gap(card, 20)
@@ -393,6 +431,10 @@ abstract class StepCollectionActivity : Activity() {
         elapsedLabel?.text = String.format(Locale.ROOT, "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
     }
 
-    private fun time(atMs: Long?) = atMs?.let { SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(it)) } ?: "—"
+    private fun startDateTime(session: FreeLivingSession?): String = session?.startConfirmedAtMs?.let { atMs ->
+        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).apply {
+            timeZone = TimeZone.getTimeZone(session.timeZoneId)
+        }.format(Date(atMs))
+    } ?: "—"
     private fun hideKeyboard() = getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(currentFocus?.windowToken, 0)
 }

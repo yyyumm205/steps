@@ -50,6 +50,7 @@ class PreparationNavigationInstrumentedTest {
         val commits = AtomicInteger()
         launch().use { scenario ->
             awaitHeading(scenario, "填写准备信息")
+            assertMinimalDebugActions(scenario)
             replaceStore(scenario, countingStore(profile, commits))
             typeParticipant(scenario, "NAV001")
             scenario.onActivity { activity ->
@@ -67,6 +68,7 @@ class PreparationNavigationInstrumentedTest {
             assertEquals("Registration commits one complete profile", 1, commits.get())
             click(scenario, "back")
             awaitHeading(scenario, "步数采集")
+            assertMinimalDebugActions(scenario)
             scenario.onActivity { activity ->
                 assertEquals("连接戒指", tagged<Button>(activity, "primary").text.toString())
                 assertFalse(tagged<Button>(activity, "back").isShown)
@@ -76,6 +78,7 @@ class PreparationNavigationInstrumentedTest {
         val original = profile.readBytes()
         launch().use { reopened ->
             awaitHeading(reopened, "步数采集")
+            assertMinimalDebugActions(reopened)
             assertVisibleText(reopened, "编号：nav001")
             assertSavedPlacement(reopened, RingPlacement.RIGHT_RING)
             assertArrayEquals(original, profile.readBytes())
@@ -648,6 +651,17 @@ class PreparationNavigationInstrumentedTest {
             val edit = tagged<Button>(activity, "edit_placement")
             assertTrue(edit.isShown)
             assertTrue("Home shows the confirmed placement", edit.text.contains(value.displayName))
+        }
+    }
+
+    private fun assertMinimalDebugActions(scenario: ActivityScenario<StepPreparationActivity>) {
+        scenario.onActivity { activity ->
+            val root = activity.findViewById<View>(android.R.id.content)
+            assertNull("Demonstration entry belongs in More, not beside the primary preparation action",
+                root.findViewWithTag<View>("open_demo"))
+            val more = tagged<Button>(activity, "details")
+            assertEquals("更多", more.text.toString())
+            assertTrue("More is available before registration and after preparation", more.isShown && more.isEnabled)
         }
     }
 

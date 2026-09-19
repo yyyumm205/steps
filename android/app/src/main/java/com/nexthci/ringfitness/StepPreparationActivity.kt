@@ -26,6 +26,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -64,6 +65,7 @@ class StepPreparationActivity : Activity() {
     private var scanMessage: String? = null
     private var timedAttempt = -1L
     private var placementDialog: AlertDialog? = null
+    private var moreMenu: PopupMenu? = null
     private lateinit var back: Button
     private lateinit var heading: TextView
     private lateinit var subtitle: TextView
@@ -127,6 +129,7 @@ class StepPreparationActivity : Activity() {
     }
     override fun onStop() {
         visible = false
+        moreMenu?.dismiss()
         pendingBluetoothAction = null
         stopScan()
         controller.disconnect("未连接")
@@ -177,16 +180,13 @@ class StepPreparationActivity : Activity() {
             tag = "heading"; setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
-        details = button(titleRow, "设备详情", false) { showDetails() }.apply {
+        details = button(titleRow, if (BuildConfig.DEBUG) "更多" else "设备详情", false) {
+            if (BuildConfig.DEBUG) showMore() else showDetails()
+        }.apply {
             tag = "details"; textSize = 13f
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
         subtitle = label(header, "", 14f)
-        if (BuildConfig.DEBUG) {
-            QuietUi(this).button(header, "体验完整流程", tag = "open_demo") {
-                startActivity(Intent().setClassName(packageName, "com.nexthci.ringfitness.DemoCollectionActivity"))
-            }
-        }
         scroll = ScrollView(this).apply { isFillViewport = true }
         frame.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), dp(12)) }
@@ -358,8 +358,8 @@ class StepPreparationActivity : Activity() {
         devices.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
         back.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
         back.isEnabled = !busy
-        details.visibility = if (usable && page == Page.HOME && ui.action != HomeAction.DETAILS) View.VISIBLE else View.GONE
-        details.isEnabled = !busy && !ui.waiting
+        details.visibility = if (BuildConfig.DEBUG || (usable && page == Page.HOME && ui.action != HomeAction.DETAILS)) View.VISIBLE else View.GONE
+        details.isEnabled = !busy && (BuildConfig.DEBUG || !ui.waiting)
         heading.text = when (page) { Page.REGISTER -> "填写准备信息"; Page.HOME -> "步数采集"; Page.DEVICES -> "选择戒指" }
         subtitle.text = when (page) {
             Page.REGISTER -> "第 1 步 · 填写信息"
@@ -402,6 +402,24 @@ class StepPreparationActivity : Activity() {
             dialog.setCanceledOnTouchOutside(!busy)
             dialog.listView.isEnabled = !busy
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !busy
+        }
+    }
+
+    private fun showMore() {
+        if (!BuildConfig.DEBUG || busy) return
+        moreMenu?.dismiss()
+        moreMenu = PopupMenu(this, details).apply {
+            if (snapshot != null && page == Page.HOME) menu.add(0, 1, 0, "设备详情").isEnabled = !checking()
+            menu.add(0, 2, 1, "流程演示（模拟）")
+            setOnMenuItemClickListener { item ->
+                when (item.itemId) {
+                    1 -> showDetails()
+                    2 -> startActivity(Intent().setClassName(packageName, "com.nexthci.ringfitness.DemoCollectionActivity"))
+                }
+                true
+            }
+            setOnDismissListener { moreMenu = null }
+            show()
         }
     }
 

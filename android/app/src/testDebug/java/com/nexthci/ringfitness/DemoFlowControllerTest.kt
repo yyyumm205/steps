@@ -319,8 +319,25 @@ class DemoFlowControllerTest {
         f.flow.retry(); f.drain()
         assertNotNull(f.store.read()!!.localData)
         assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
-        f.flow.retry(); f.drain()
-        assertEquals(CollectionPage.COMPLETE, f.flow.state.page)
+        val id = f.store.read()!!.sessionId
+        f.flow.home()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.ERROR, f.flow.state.taskPage)
+        assertNotNull(f.flow.state.error)
+        assertTrue(f.flow.state.canStart)
+        assertEquals("transferring", f.flow.state.records.single().transferStatus)
+        assertFalse(f.flow.state.records.single().transferInFlight)
+        f.flow.retryUpload(id)
+        assertEquals(id, f.flow.state.records.single().sessionId)
+        assertTrue(f.flow.state.records.single().transferInFlight)
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.UPLOADING, f.flow.state.taskPage)
+        f.drain()
+        assertEquals(id, f.store.read()!!.sessionId)
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.COMPLETE, f.flow.state.taskPage)
+        assertEquals("complete", f.flow.state.records.single().transferStatus)
+        assertFalse(f.flow.state.records.single().transferInFlight)
     }
 
     @Test fun switchingBackToValidReadingDoesNotSaveTheHiddenReason() {
@@ -351,6 +368,142 @@ class DemoFlowControllerTest {
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read(firstId)!!.transfer.status)
     }
 
+    @Test fun homeDuringPreflightShowsStartingAndCannotOfferAnotherStartBeforeASessionExists() {
+        val f = Fixture()
+        f.flow.start()
+        assertNull(f.store.read())
+        f.flow.home()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.STARTING, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        assertTrue(f.flow.state.canRetry)
+        val scheduled = f.scheduledCount
+        f.flow.retry()
+        assertEquals(CollectionPage.STARTING, f.flow.state.page)
+        assertEquals(scheduled, f.scheduledCount)
+        f.drain()
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
+        assertEquals(1, f.store.listSessions().size)
+    }
+
+    @Test fun homeDoesNotHideAsynchronousTaskProgressOrNavigateAwayFromHome() {
+        val f = Fixture()
+        f.flow.start()
+        f.flow.home()
+        f.drain()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        val id = f.store.read()!!.sessionId
+        val before = File(f.directory, "device.json").readBytes()
+        f.flow.retry()
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
+        assertEquals(id, f.store.read()!!.sessionId)
+        assertArrayEquals(before, File(f.directory, "device.json").readBytes())
+    }
+
+    @Test fun returningToPendingStopShowsTheSameOperationWithoutAnotherCommand() {
+        val f = Fixture()
+        f.begin(); f.flow.stop()
+        val deviceBefore = File(f.directory, "device.json").readBytes()
+        f.flow.home()
+        assertEquals(CollectionPage.STOPPING, f.flow.state.taskPage)
+        val scheduled = f.scheduledCount
+        f.flow.retry()
+        assertEquals(CollectionPage.STOPPING, f.flow.state.page)
+        assertEquals(scheduled, f.scheduledCount)
+        assertArrayEquals(deviceBefore, File(f.directory, "device.json").readBytes())
+        f.drain()
+        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+    }
+
+    @Test fun returningHomeWhileSavingRetainsTheInFlightReferenceAndDoesNotReopenItsForm() {
+        val f = Fixture()
+        f.begin(); f.stop(); f.flow.saveReference("562")
+        f.flow.home()
+        assertEquals(CollectionPage.SAVING, f.flow.state.taskPage)
+        assertNull(f.store.read()!!.reference)
+        assertFalse(f.flow.state.canStart)
+        val scheduled = f.scheduledCount
+        f.flow.retry()
+        assertEquals(CollectionPage.SAVING, f.flow.state.page)
+        assertEquals(scheduled, f.scheduledCount)
+        f.flow.saveReference("999")
+        f.drain()
+        assertEquals(562L, f.store.read()!!.reference!!.steps)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+    }
+
+    @Test fun returningToDownloadOrUploadShowsProgressWithoutSchedulingAnotherTask() {
+        val f = Fixture()
+        f.begin(); f.stop(); f.flow.saveReference("8"); f.advance(350)
+        f.flow.home()
+        assertEquals(CollectionPage.DOWNLOADING, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        val downloadScheduled = f.scheduledCount
+        f.flow.retry()
+        assertEquals(CollectionPage.DOWNLOADING, f.flow.state.page)
+        assertEquals(downloadScheduled, f.scheduledCount)
+        f.advance(1200)
+        f.flow.home()
+        assertEquals(CollectionPage.UPLOADING, f.flow.state.taskPage)
+        assertTrue(f.flow.state.canStart)
+        val uploadScheduled = f.scheduledCount
+        f.flow.retry()
+        assertEquals(CollectionPage.UPLOADING, f.flow.state.page)
+        assertEquals(uploadScheduled, f.scheduledCount)
+        f.flow.home(); f.drain()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.COMPLETE, f.flow.state.taskPage)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+    }
+
+    @Test fun homeShowsConfirmationTimeoutAndReconnectRecoveryWithoutResendingStart() {
+        val f = Fixture()
+        f.flow.setFault(FlowTestFault.START_TIMEOUT)
+        f.flow.start(); f.flow.home(); f.drain()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.RECOVERY, f.flow.state.taskPage)
+        val before = File(f.directory, "device.json").readBytes()
+        f.flow.retry()
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
+        assertArrayEquals(before, File(f.directory, "device.json").readBytes())
+        f.flow.home(); f.flow.disconnect()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.RECOVERY, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        f.flow.reconnect()
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
+    }
+
+    @Test fun previousReceiptDuringNewPreflightDoesNotReplaceStartingTaskOnHome() {
+        val f = Fixture()
+        f.begin(); f.stop(); f.flow.saveReference("41"); f.advance(2450)
+        val firstId = f.store.read()!!.sessionId
+        assertEquals(CollectionPage.UPLOADING, f.flow.state.page)
+        f.flow.home(); f.flow.start(); f.flow.home()
+        f.advance(300)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read(firstId)!!.transfer.status)
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertEquals(CollectionPage.STARTING, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        f.drain()
+        assertNotEquals(firstId, f.store.read()!!.sessionId)
+        assertEquals(CollectionPage.COLLECTING, f.flow.state.taskPage)
+    }
+
+    @Test fun reconnectBeforeAnySessionClearsTheRecoveryTaskAndRestoresTheStartAction() {
+        val f = Fixture()
+        f.flow.home(); f.flow.disconnect()
+        assertEquals(CollectionPage.RECOVERY, f.flow.state.taskPage)
+        assertFalse(f.flow.state.canStart)
+        f.flow.reconnect()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertNull(f.flow.state.taskPage)
+        assertTrue(f.flow.state.canStart)
+        assertNull(f.store.read())
+    }
+
     private inner class Fixture(parent: File = temporary.newFolder()) {
         val directory = File(parent, "collection-demo")
         var now = 1_789_804_800_000L
@@ -359,6 +512,7 @@ class DemoFlowControllerTest {
         var rejectUploadScheduling = false
         var uploadExtraDelayMs = 0L
         private var order = 0L
+        val scheduledCount get() = order
         private val tasks = PriorityQueue<Task>(compareBy<Task> { it.time }.thenBy { it.order })
         private val clock = object : CaptureClock {
             override fun nowEpochMs() = now
@@ -397,7 +551,7 @@ class DemoFlowControllerTest {
         fun restart() { tasks.clear(); flow = create(); flow.initialize() }
         fun advance(ms: Long) {
             val end = now + ms
-            while (tasks.isNotEmpty() && tasks.peek().time <= end) {
+            while (tasks.peek()?.time?.let { it <= end } == true) {
                 val task = tasks.remove(); now = task.time; task.action()
             }
             now = end

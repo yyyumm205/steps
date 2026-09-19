@@ -2,6 +2,7 @@ package com.nexthci.ringfitness
 
 import android.app.AlertDialog
 import android.content.Intent
+import android.graphics.Bitmap
 import android.os.Build
 import android.os.SystemClock
 import android.view.View
@@ -15,7 +16,12 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.gson.JsonParser
 import java.io.File
+import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.time.Instant
+import java.util.TimeZone
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -29,7 +35,8 @@ class CollectionFlowInstrumentedTest {
     @Test fun complete562PathSavesRealFilesAndReceiptThenReopensTheSameResult() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)
-            val id = reachReference(scenario, handle)
+            captureReviewScreen(scenario, "home")
+            val id = reachReference(scenario, handle, capture = true)
             type(scenario, "flow_steps", "562")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
@@ -183,11 +190,11 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "本次走了多少步？")
             click(scenario, "flow_back")
-            awaitHeading(scenario, "开始这一段")
-            scenario.onActivity { assertEquals("继续本次记录", tagged<Button>(it, "flow_primary").text.toString()) }
+            awaitHeading(scenario, "待填写步数")
+            scenario.onActivity { assertEquals("填写步数", tagged<Button>(it, "flow_primary").text.toString()) }
         }
         launch().use { reopened ->
-            awaitHeading(reopened, "开始这一段")
+            awaitHeading(reopened, "待填写步数")
             click(reopened, "flow_primary")
             awaitHeading(reopened, "本次走了多少步？")
             assertEquals(id, session(handle).sessionId)
@@ -250,7 +257,12 @@ class CollectionFlowInstrumentedTest {
             handle.flow.disconnect()
             awaitHeading(scenario, "还需要确认一下")
             assertEquals(original, session(handle))
-            scenario.onActivity { assertEquals("重新连接", tagged<Button>(it, "flow_primary").text.toString()) }
+            click(scenario, "flow_back")
+            awaitHeading(scenario, "本次采集")
+            scenario.onActivity {
+                assertEquals("戒指连接中断", tagged<TextView>(it, "home_task_status").text.toString())
+                assertEquals("重新连接", tagged<Button>(it, "flow_primary").text.toString())
+            }
             click(scenario, "flow_primary")
             awaitHeading(scenario, "正在采集")
             scenario.onActivity { assertTrue(tagged<Button>(it, "flow_primary").isEnabled) }
@@ -258,6 +270,141 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "本次走了多少步？")
             assertEquals(original.sessionId, session(handle).sessionId)
+        }
+    }
+
+    @Test fun collectingHomeShowsCurrentTaskAndReturnsWithoutStoppingOrCreatingAnotherSession() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "正在采集")
+            val original = session(handle)
+            click(scenario, "flow_back")
+            awaitHeading(scenario, "采集进行中")
+            scenario.onActivity {
+                assertEquals("正在采集", tagged<TextView>(it, "home_task_status").text.toString())
+                assertEquals("查看采集", tagged<Button>(it, "flow_primary").text.toString())
+            }
+            assertEquals(original, session(handle))
+            assertNull(session(handle).stopRequestedAtMs)
+            scenario.recreate()
+            awaitHeading(scenario, "采集进行中")
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "正在采集")
+            assertEquals(original, session(handle))
+            assertEquals(1, FreeLivingSessionStore(File(handle.directory, "session.json")).listSessions().size)
+        }
+    }
+
+    @Test fun downloadFailureUpdatesHomeInPlaceAndRetryFinishesTheOriginalSavedReference() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val id = reachReference(scenario, handle)
+            handle.flow.setFault(FlowTestFault.DOWNLOAD_FAILURE)
+            awaitFlow(handle, "download failure armed") { it.fault == FlowTestFault.DOWNLOAD_FAILURE }
+            type(scenario, "flow_steps", "562")
+            click(scenario, "flow_primary")
+            awaitFlow(handle, "download is active") { it.page == CollectionPage.DOWNLOADING }
+            click(scenario, "flow_back")
+            awaitHeading(scenario, "正在下载数据")
+            scenario.onActivity { assertEquals("查看下载", tagged<Button>(it, "flow_primary").text.toString()) }
+            awaitFlow(handle, "download failure remains at home") {
+                it.page == CollectionPage.HOME && it.taskPage == CollectionPage.ERROR
+            }
+            awaitHeading(scenario, "待下载数据")
+            scenario.onActivity {
+                assertEquals("步数已保存", tagged<TextView>(it, "home_task_status").text.toString())
+                assertEquals("重试下载", tagged<Button>(it, "flow_primary").text.toString())
+                assertTrue(tagged<Button>(it, "flow_primary").isEnabled)
+            }
+            val saved = session(handle)
+            assertEquals(id, saved.sessionId)
+            assertEquals(562L, saved.reference!!.steps)
+            assertNull(saved.localData)
+            assertFalse(handle.flow.state.canStart)
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "这一段已保存")
+            assertEquals(id, session(handle).sessionId)
+            assertEquals(saved.reference, session(handle).reference)
+            assertNotNull(session(handle).localData)
+            assertEquals(SessionTransferStatus.COMPLETE, session(handle).transfer.status)
+        }
+    }
+
+    @Test fun startDateKeepsTheSessionTimezoneAcrossMidnightAndDefaultTimezoneChanges() = withFlow { handle ->
+        val originalDefault = TimeZone.getDefault()
+        try {
+            handle.flow.register("date001", RingPlacement.LEFT_INDEX)
+            awaitFlow(handle, "test registration saved") { it.hasProfile && !it.busy }
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            // Seed only this test's isolated journal and synthetic device. The same instant falls
+            // on September 18 in UTC and September 19 in the session's recorded Shanghai zone.
+            val start = Instant.parse("2026-09-18T16:05:00Z").toEpochMilli()
+            val store = FreeLivingSessionStore(File(handle.directory, "session.json"))
+            val requested = store.requestStart(preparation, start - 100, "Asia/Shanghai")
+            val device = DemoDeviceRecord(requested.sessionId, 41, start)
+            store.confirmStart(requested.sessionId, preparation.ring!!.address, device.status(), start)
+            DemoDeviceStore(File(handle.directory, "device.json")).save(device)
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            handle.flow.reconnect()
+            awaitFlow(handle, "dated task restored") { it.page == CollectionPage.COLLECTING }
+            launch().use { scenario ->
+                awaitHeading(scenario, "正在采集")
+                scenario.onActivity { assertEquals("2026-09-19 00:05", tagged<TextView>(it, "flow_started_at").text.toString()) }
+                TimeZone.setDefault(TimeZone.getTimeZone("America/Los_Angeles"))
+                scenario.recreate()
+                awaitHeading(scenario, "正在采集")
+                scenario.onActivity { assertEquals("2026-09-19 00:05", tagged<TextView>(it, "flow_started_at").text.toString()) }
+                assertEquals("Asia/Shanghai", session(handle).timeZoneId)
+                assertEquals(start, session(handle).startConfirmedAtMs)
+                assertEquals(requested.sessionId, session(handle).sessionId)
+            }
+        } finally {
+            TimeZone.setDefault(originalDefault)
+        }
+    }
+
+    @Test fun unconfirmedStopReferenceHomeKeepsItsWarningAndReturnsWithoutConfirmingTheDevice() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "正在采集")
+            val id = session(handle).sessionId
+            handle.flow.setFault(FlowTestFault.STOP_TIMEOUT)
+            awaitFlow(handle, "stop timeout armed") { it.fault == FlowTestFault.STOP_TIMEOUT }
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "还需要确认一下")
+            assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, session(handle).phase)
+            assertNull(session(handle).stopConfirmedAtMs)
+            click(scenario, "preserve_reference")
+            awaitHeading(scenario, "本次走了多少步？")
+            click(scenario, "flow_back")
+            awaitHeading(scenario, "本次采集")
+            scenario.onActivity {
+                assertEquals("结束状态待确认", tagged<TextView>(it, "home_task_status").text.toString())
+                assertEquals("先填写步数", tagged<Button>(it, "flow_primary").text.toString())
+            }
+            val beforeReturn = session(handle)
+            assertNull(beforeReturn.stopConfirmedAtMs)
+            assertFalse(handle.flow.state.canStart)
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "本次走了多少步？")
+            assertEquals("Returning to the form must not query and silently confirm a previously unknown stop",
+                beforeReturn, session(handle))
+            chooseReferenceKind(scenario, "missing")
+            type(scenario, "flow_reason", "计步器意外清零")
+            click(scenario, "flow_primary")
+            awaitHeading(scenario, "还需要确认一下")
+            val saved = session(handle)
+            assertEquals(id, saved.sessionId)
+            assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, saved.phase)
+            assertNull(saved.stopConfirmedAtMs)
+            assertNull(saved.endedAtMs)
+            assertNull(saved.localData)
+            assertEquals(ReferenceStatus.MISSING, saved.reference!!.status)
+            assertNull(saved.reference!!.steps)
+            assertEquals("计步器意外清零", saved.reference!!.reason)
+            assertFalse(handle.flow.state.canStart)
         }
     }
 
@@ -290,14 +437,37 @@ class CollectionFlowInstrumentedTest {
         awaitHeading(scenario, "开始这一段")
     }
 
-    private fun reachReference(scenario: ActivityScenario<DemoCollectionActivity>, handle: DemoFlowRuntime.TestHandle): String {
+    private fun reachReference(scenario: ActivityScenario<DemoCollectionActivity>, handle: DemoFlowRuntime.TestHandle,
+        capture: Boolean = false): String {
         click(scenario, "flow_primary")
         awaitHeading(scenario, "正在采集")
+        if (capture) captureReviewScreen(scenario, "collecting")
         val id = session(handle).sessionId
         click(scenario, "flow_primary")
         awaitHeading(scenario, "本次走了多少步？")
+        if (capture) captureReviewScreen(scenario, "reference")
         assertEquals(id, session(handle).sessionId)
         return id
+    }
+
+    private fun captureReviewScreen(scenario: ActivityScenario<DemoCollectionActivity>, page: String) {
+        if (InstrumentationRegistry.getArguments().getString("captureFlowScreens") != "true") return
+        require(page in setOf("home", "collecting", "reference"))
+        val frameDrawn = CountDownLatch(1)
+        scenario.onActivity { activity ->
+            val root = activity.window.decorView
+            root.viewTreeObserver.registerFrameCommitCallback { frameDrawn.countDown() }
+            root.invalidate()
+        }
+        assertTrue("The review page must be drawn before its screenshot", frameDrawn.await(5, TimeUnit.SECONDS))
+        instrumentation.waitForIdleSync()
+        val screenshot = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+        try {
+            FileOutputStream(File(instrumentation.targetContext.cacheDir, "flow-review-$page.png")).use {
+                assertTrue(screenshot.compress(Bitmap.CompressFormat.PNG, 100, it))
+                it.fd.sync()
+            }
+        } finally { screenshot.recycle() }
     }
 
     private fun chooseReferenceKind(scenario: ActivityScenario<DemoCollectionActivity>, kind: String) {

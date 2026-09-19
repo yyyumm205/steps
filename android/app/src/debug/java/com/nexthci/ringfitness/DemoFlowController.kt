@@ -39,6 +39,9 @@ class DemoFlowController(
     private var recoveryOwner = false
     private var savingReference = false
     private var failNextReferenceCommit = false
+    private var browsingHome = false
+    private var taskPage: CollectionPage? = null
+    private var taskError: String? = null
 
     @Volatile override var state = CollectionFlowState(isSimulation = true, busy = true)
         private set
@@ -86,7 +89,11 @@ class DemoFlowController(
     }
 
     override fun start() = safely {
-        if (coordinator?.state?.phase in setOf(CaptureControlPhase.CHECKING, CaptureControlPhase.STARTING, CaptureControlPhase.STOPPING)) return@safely
+        browsingHome = false
+        inFlightPage()?.takeUnless { it == CollectionPage.UPLOADING }?.let {
+            publish(it)
+            return@safely
+        }
         val profile = requireNotNull(preparation.read()) { "请先填写体验编号" }
         require(profile.ring == DEMO_RING && profile.placement != null) { "请先完成准备" }
         val current = store.read()
@@ -103,6 +110,7 @@ class DemoFlowController(
     }
 
     override fun stop() = safely {
+        browsingHome = false
         val current = store.read() ?: return@safely
         if (current.phase != FreeLivingSessionPhase.COLLECTING || !connected) return@safely
         if (!recoveryOwner) {
@@ -123,13 +131,16 @@ class DemoFlowController(
     }
 
     override fun enterReference() = safely {
+        browsingHome = false
+        if (savingReference) { publish(CollectionPage.SAVING); return@safely }
         val current = store.read() ?: return@safely
         require(current.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE))
         publish(CollectionPage.REFERENCE)
     }
 
     override fun saveReference(stepsText: String, status: String, reason: String) = safely(CollectionPage.REFERENCE) {
-        if (savingReference) return@safely
+        browsingHome = false
+        if (savingReference) { publish(CollectionPage.SAVING); return@safely }
         val current = requireNotNull(store.read())
         if (current.reference != null) { showStored(current); return@safely }
         val referenceStatus = when (status) {
@@ -170,10 +181,14 @@ class DemoFlowController(
     }
 
     override fun retry() = safely {
+        if (state.page == CollectionPage.HOME) {
+            browsingHome = false
+            inFlightPage()?.let { publish(it); return@safely }
+        }
         if (state.busy) return@safely
         blockedQuery = false
         val current = store.read()
-        if (current == null) { publish(CollectionPage.HOME); return@safely }
+        if (current == null) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return@safely }
         if (current.localData != null) {
             if (current.transfer.status == SessionTransferStatus.COMPLETE) publish(CollectionPage.COMPLETE)
             else upload(current.sessionId)
@@ -183,7 +198,7 @@ class DemoFlowController(
 
     override fun retryUpload(sessionId: String) = safely { upload(sessionId) }
 
-    override fun home() = safely { publish(CollectionPage.HOME) }
+    override fun home() = safely { browsingHome = true; publish(CollectionPage.HOME) }
 
     override fun setFault(fault: FlowTestFault) {
         this.fault = fault
@@ -198,6 +213,7 @@ class DemoFlowController(
     }
 
     override fun reconnect() = safely {
+        browsingHome = false
         connected = true
         blockedQuery = false
         coordinator = null
@@ -272,10 +288,14 @@ class DemoFlowController(
     private fun recoverStored(resumeTransfer: Boolean) {
         recoveryOwner = false
         val current = store.read()
-        if (current == null) { publish(CollectionPage.HOME); return }
+        if (current == null) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return }
         if (current.localData != null) {
             verifyLocalFiles(current)
-            if (resumeTransfer && current.transfer.status == SessionTransferStatus.COMPLETE) publish(CollectionPage.HOME)
+            if (resumeTransfer && current.transfer.status == SessionTransferStatus.COMPLETE) {
+                taskPage = CollectionPage.COMPLETE
+                browsingHome = true
+                publish(CollectionPage.HOME)
+            }
             else if (resumeTransfer && current.transfer.status in setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING)) upload(current.sessionId)
             else showStored(current)
             return
@@ -321,7 +341,7 @@ class DemoFlowController(
         if (session.localData != null) { upload(sessionId); return }
         require(session.stopConfirmedAtMs != null && session.reference != null)
         if (!connected) { publish(CollectionPage.RECOVERY, "读数已保存，请重新连接下载数据"); return }
-        if (!downloading.add(sessionId)) return
+        if (!downloading.add(sessionId)) { publish(CollectionPage.DOWNLOADING); return }
         try {
             publish(CollectionPage.DOWNLOADING)
             // Transfer tasks retain their owner when pages close and use session IDs, never a mutable current pointer.
@@ -354,21 +374,24 @@ class DemoFlowController(
         requireNotNull(current.localData)
         verifyLocalFiles(current)
         if (current.transfer.status == SessionTransferStatus.COMPLETE) {
-            publish(if (store.read()?.sessionId == sessionId) CollectionPage.COMPLETE else state.page)
+            publish(if (isCurrentTransferTask(sessionId)) CollectionPage.COMPLETE else state.page)
             return
         }
-        if (sessionId in transferring) return
+        if (sessionId in transferring) {
+            if (isCurrentTransferTask(sessionId)) publish(CollectionPage.UPLOADING)
+            return
+        }
         store.markTransferStarted(sessionId)
         transferring.add(sessionId)
         try {
-            val displayed = store.read()?.sessionId == sessionId
+            val displayed = isCurrentTransferTask(sessionId)
             if (displayed) publish(CollectionPage.UPLOADING)
             scheduler.schedule(1200) {
                 transferring.remove(sessionId)
                 safely {
                     if (consume(FlowTestFault.UPLOAD_FAILURE)) {
                         store.markTransferFailed(sessionId)
-                        if (store.read()?.sessionId == sessionId) publish(CollectionPage.ERROR, "数据已保存在手机，上传请重试")
+                        if (isCurrentTransferTask(sessionId)) publish(CollectionPage.ERROR, "数据已保存在手机，上传请重试")
                         else publish(state.page)
                         return@safely
                     }
@@ -378,7 +401,7 @@ class DemoFlowController(
                     if (receiptFile.exists()) require(receiptFile.readBytes().contentEquals(payload))
                     else writeDemoFile(receiptFile, payload, syncDirectory)
                     store.completeTransfer(sessionId, SessionTransferReceipt(receiptId, clock.nowEpochMs(), simulated = true, sessionId = sessionId))
-                    if (store.read()?.sessionId == sessionId) publish(CollectionPage.COMPLETE) else publish(state.page)
+                    if (isCurrentTransferTask(sessionId)) publish(CollectionPage.COMPLETE) else publish(state.page)
                 }
             }
         } catch (error: Exception) {
@@ -421,7 +444,10 @@ class DemoFlowController(
                 else -> null
             } ?: "暂时无法完成，已有记录已保留"
             try { publish(failurePage, message) } catch (_: Exception) {
-                state = state.copy(page = CollectionPage.ERROR, busy = false, error = "记录暂时无法读取，请联系研究者", canStart = false, canStop = false, canRetry = false)
+                taskPage = CollectionPage.ERROR
+                taskError = "记录暂时无法读取，请联系研究者"
+                state = state.copy(page = if (browsingHome) CollectionPage.HOME else CollectionPage.ERROR,
+                    taskPage = taskPage, busy = false, error = taskError, canStart = false, canStop = false, canRetry = false)
                 broadcast()
             }
         }
@@ -431,23 +457,44 @@ class DemoFlowController(
         val profile = preparation.read()
         val session = store.read()
         val reference = session?.reference
-        val busy = page in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING, CollectionPage.UPLOADING)
-        state = CollectionFlowState(page = page, isSimulation = true, hasProfile = profile?.ring != null,
+        if (page != CollectionPage.HOME) {
+            taskPage = page
+            taskError = error
+        }
+        val visiblePage = if (browsingHome) CollectionPage.HOME else page
+        val busy = visiblePage in waitingPages
+        val blockingWork = inFlightPage()?.let { it != CollectionPage.UPLOADING } == true
+        state = CollectionFlowState(page = visiblePage, taskPage = taskPage, isSimulation = true, hasProfile = profile?.ring != null,
             participantId = profile?.participantId.orEmpty(), placement = profile?.placement,
-            session = session, connected = connected, busy = busy, error = error,
+            session = session, connected = connected, busy = busy, error = if (visiblePage == CollectionPage.HOME) taskError else error,
             savedSteps = reference?.steps, referenceStatus = reference?.status?.name?.lowercase(),
-            canStart = !busy && connected && profile?.ring != null && (session == null || session.localData != null),
+            canStart = !blockingWork && connected && profile?.ring != null && (session == null || session.localData != null),
             canStop = !busy && connected && session?.phase == FreeLivingSessionPhase.COLLECTING &&
                 (recoveryOwner || coordinator?.state?.phase == CaptureControlPhase.COLLECTING),
-            canRetry = !busy && (session != null || !connected),
+            canRetry = !busy && (taskPage != null || session != null || !connected),
             records = store.listSessions().map { FlowRecordSummary(it.sessionId, it.reference?.steps,
-                it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null) }, fault = fault)
+                it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null,
+                transferInFlight = it.sessionId in transferring) }, fault = fault)
         broadcast()
     }
 
     private fun broadcast() = observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
 
+    private fun inFlightPage(): CollectionPage? = when {
+        savingReference -> CollectionPage.SAVING
+        coordinator?.state?.phase in setOf(CaptureControlPhase.CHECKING, CaptureControlPhase.STARTING) -> CollectionPage.STARTING
+        coordinator?.state?.phase == CaptureControlPhase.STOPPING -> CollectionPage.STOPPING
+        taskPage == CollectionPage.STOPPING && recoveryOwner -> CollectionPage.STOPPING
+        store.read()?.sessionId in downloading -> CollectionPage.DOWNLOADING
+        store.read()?.sessionId in transferring -> CollectionPage.UPLOADING
+        else -> null
+    }
+
+    private fun isCurrentTransferTask(sessionId: String): Boolean = store.read()?.sessionId == sessionId &&
+        coordinator?.state?.phase !in setOf(CaptureControlPhase.CHECKING, CaptureControlPhase.STARTING)
+
     companion object {
+        private val waitingPages = setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING, CollectionPage.UPLOADING)
         val DEMO_RING = PreparedRing("02:00:00:00:00:01", "体验戒指")
     }
 }

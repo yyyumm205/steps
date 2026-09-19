@@ -13,10 +13,12 @@ data class FlowRecordSummary(
     val referenceStatus: String?,
     val transferStatus: String,
     val localComplete: Boolean,
+    val transferInFlight: Boolean = false,
 )
 
 data class CollectionFlowState(
     val page: CollectionPage = CollectionPage.HOME,
+    val taskPage: CollectionPage? = null,
     val isSimulation: Boolean,
     val hasProfile: Boolean = false,
     val participantId: String = "",
