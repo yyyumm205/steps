@@ -33,6 +33,238 @@ import org.junit.runner.RunWith
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
 
+    /**
+     * Review export only: opt in with captureUiCatalog, verifyCollectionFlow and captureFlowScreens.
+     * All states below are in-memory test doubles rendered by the production Activity. In particular,
+     * isSimulation=false selects the production layout; the raw-file and receipt objects are only
+     * rendering evidence and never reach a production store, BLE connection or upload service.
+     * Transient states are held explicitly so their screenshots do not depend on device/network timing.
+     */
+    @Test fun exportCurrentCollectionUiCatalog() {
+        assumeTrue("Explicit UI catalog opt-in is required",
+            InstrumentationRegistry.getArguments().getString("captureUiCatalog") == "true")
+        assumeTrue("UI catalog export requires screenshot capture",
+            InstrumentationRegistry.getArguments().getString("captureFlowScreens") == "true")
+        withFlow { handle ->
+            launch().use { scenario ->
+                register(scenario)
+                val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+                val now = System.currentTimeMillis()
+                val requested = FreeLivingSession("catalog-session", preparation,
+                    FreeLivingSessionPhase.START_REQUESTED, "Asia/Shanghai", 28_800, now - 490_000,
+                    activity = SessionActivity.WALKING)
+                val collecting = requested.copy(phase = FreeLivingSessionPhase.COLLECTING,
+                    startConfirmedAtMs = now - 480_000)
+                val stopping = collecting.copy(phase = FreeLivingSessionPhase.STOP_REQUESTED,
+                    stopRequestedAtMs = now - 20_000)
+                val stopped = stopping.copy(phase = FreeLivingSessionPhase.AWAITING_REFERENCE,
+                    stopConfirmedAtMs = now - 19_000)
+                val reference = stopped.copy(completionPolicy = CompletionPolicy.SAVE_UPLOAD)
+                val recorded = reference.copy(reference = SessionReference(ReferenceStatus.VALID, 562, now - 15_000))
+                val local = recorded.copy(localData = SessionLocalData(
+                    listOf(SessionRawFile("catalog-rendering-only.rfbin", 7, 800, "0".repeat(64))), now - 10_000))
+                val base = CollectionFlowState(isSimulation = false, hasProfile = true,
+                    participantId = preparation.participantId, placement = preparation.placement,
+                    connected = true, uploadAvailable = true)
+                val fixture = RenderingFlow(base)
+                val names = mutableSetOf<String>()
+
+                fun show(state: CollectionFlowState) {
+                    fixture.state = state
+                    renderFixture(scenario, fixture)
+                    scenario.onActivity {
+                        assertNull(taggedOrNull<View>(it, "demo_marker"))
+                        assertNull(taggedOrNull<View>(it, "flow_options"))
+                    }
+                }
+                fun capture(name: String, anchorTag: String? = null) {
+                    require(name.startsWith("catalog_") && names.add(name))
+                    instrumentation.waitForIdleSync()
+                    scenario.onActivity { activity ->
+                        val scroll = StepCollectionActivity::class.java.getDeclaredField("pageScroll")
+                            .apply { isAccessible = true }.get(activity) as android.widget.ScrollView
+                        if (anchorTag == null) scroll.scrollTo(0, 0) else {
+                            val card = tagged<View>(activity, anchorTag).parent as View
+                            val bounds = android.graphics.Rect(0, 0, card.width, card.height)
+                            scroll.offsetDescendantRectToMyCoords(card, bounds)
+                            scroll.scrollTo(0, bounds.top)
+                        }
+                    }
+                    captureReviewScreen(scenario, name)
+                }
+                fun screen(name: String, state: CollectionFlowState) { show(state); capture(name) }
+                fun selectReferenceKind(label: String) {
+                    click(scenario, "reference_options")
+                    scenario.onActivity { activity ->
+                        val list = startAttemptDialog(activity).listView
+                        val index = (0 until list.adapter.count).single { list.adapter.getItem(it).toString() == label }
+                        assertTrue(list.performItemClick(list.adapter.getView(index, null, list), index, list.adapter.getItemId(index)))
+                    }
+                }
+                fun savedState(session: FreeLivingSession = local, inFlight: Boolean = false,
+                    needsReview: Boolean = false) = base.copy(page = CollectionPage.COMPLETE,
+                    taskPage = CollectionPage.COMPLETE, session = session, canStart = true,
+                    records = listOf(FlowRecordSummary(session.sessionId, session.reference?.steps,
+                        session.reference?.status?.wireValue, session.transfer.status.wireValue, true,
+                        transferInFlight = inFlight, localReviewRequired = needsReview,
+                        activity = session.activity, uploadDeferred = session.completionPolicy == CompletionPolicy.SAVE_LATER)))
+
+                screen("catalog_home_unselected", base.copy(canStart = true))
+                screen("catalog_home_walking", base.copy(canStart = true, selectedActivity = SessionActivity.WALKING))
+                screen("catalog_home_running", base.copy(canStart = true, selectedActivity = SessionActivity.RUNNING))
+                screen("catalog_starting", base.copy(page = CollectionPage.STARTING,
+                    taskPage = CollectionPage.STARTING, session = requested, busy = true))
+                screen("catalog_collecting", base.copy(page = CollectionPage.COLLECTING,
+                    taskPage = CollectionPage.COLLECTING, session = collecting, canStop = true))
+                screen("catalog_stopping", base.copy(page = CollectionPage.STOPPING,
+                    taskPage = CollectionPage.STOPPING, session = stopping, busy = true))
+                screen("catalog_finish", base.copy(page = CollectionPage.FINISH,
+                    taskPage = CollectionPage.FINISH, session = stopped))
+                click(scenario, "finish_discard")
+                capture("catalog_discard_confirmation")
+                scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+
+                val referenceState = base.copy(page = CollectionPage.REFERENCE,
+                    taskPage = CollectionPage.REFERENCE, session = reference)
+                screen("catalog_reference_empty", referenceState)
+                type(scenario, "flow_steps", "562")
+                capture("catalog_reference_valid")
+                click(scenario, "reference_options")
+                capture("catalog_reference_options")
+                scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+                selectReferenceKind("无法提供读数")
+                type(scenario, "flow_reason", "计步器意外清零")
+                capture("catalog_reference_missing")
+                selectReferenceKind("数字可能不准确")
+                type(scenario, "flow_reason", "结束后仍走动了几步")
+                capture("catalog_reference_unreliable")
+                selectReferenceKind("读数正常")
+                scenario.onActivity { activity ->
+                    val input = tagged<EditText>(activity, "flow_steps")
+                    input.requestFocus()
+                    input.setSelection(input.text.length)
+                    activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                        .showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+                }
+                await(scenario, "catalog reference keyboard visible") {
+                    it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+                }
+                capture("catalog_reference_keyboard")
+                scenario.onActivity { activity ->
+                    val input = tagged<EditText>(activity, "flow_steps")
+                    activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                        .hideSoftInputFromWindow(input.windowToken, 0)
+                    input.clearFocus()
+                }
+                await(scenario, "catalog reference keyboard hidden") {
+                    !it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+                }
+                show(referenceState.copy(error = "请输入计步器上的整数"))
+                type(scenario, "flow_steps", "")
+                capture("catalog_reference_validation")
+                type(scenario, "flow_steps", "562")
+                screen("catalog_save_failure", referenceState.copy(error = "暂时无法完成，本次记录已保留"))
+                screen("catalog_saving", base.copy(page = CollectionPage.SAVING,
+                    taskPage = CollectionPage.SAVING, session = reference, busy = true))
+                screen("catalog_downloading", base.copy(page = CollectionPage.DOWNLOADING,
+                    taskPage = CollectionPage.DOWNLOADING, session = recorded, busy = true))
+                screen("catalog_upload_queue", savedState())
+                val uploading = local.copy(transfer = SessionTransfer(SessionTransferStatus.TRANSFERRING, 1))
+                screen("catalog_uploading", savedState(uploading, inFlight = true))
+                screen("catalog_uploaded", savedState(local.copy(transfer = SessionTransfer(
+                    SessionTransferStatus.COMPLETE, 1,
+                    SessionTransferReceipt("catalog-rendering-only-receipt", now - 5_000, false, local.sessionId)))))
+                screen("catalog_upload_deferred", savedState(local.copy(completionPolicy = CompletionPolicy.SAVE_LATER)))
+                screen("catalog_upload_failure", savedState(local.copy(transfer = SessionTransfer(SessionTransferStatus.FAILED, 1))))
+                screen("catalog_local_file_review", savedState(needsReview = true))
+
+                val startRecovery = base.copy(page = CollectionPage.RECOVERY, taskPage = CollectionPage.RECOVERY,
+                    session = requested, canRetry = true, canEndStartAttempt = true,
+                    error = "暂未收到确认，请重新检查戒指")
+                screen("catalog_recovery_start", startRecovery)
+                click(scenario, "end_start_attempt")
+                scenario.onActivity { activity ->
+                    val input = startAttemptDialog(activity).findViewById<View>(android.R.id.content)
+                        .findViewWithTag<EditText>("end_start_attempt_reason")
+                    input.setText("开始等待超时，重新准备后再试")
+                    input.clearFocus()
+                }
+                capture("catalog_end_attempt_reason")
+                scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+                screen("catalog_recovery_stop", base.copy(page = CollectionPage.RECOVERY,
+                    taskPage = CollectionPage.RECOVERY, session = stopping, canRetry = true,
+                    error = "暂未收到确认，请重新检查戒指"))
+                screen("catalog_reference_stop_uncertain", referenceState.copy(session = stopping))
+                screen("catalog_recovery_disconnected", base.copy(page = CollectionPage.RECOVERY,
+                    taskPage = CollectionPage.RECOVERY, session = collecting, connected = false,
+                    canRetry = true, error = "连接中断，请将戒指放在手机附近"))
+                screen("catalog_recovery_reconnecting", base.copy(page = CollectionPage.RECOVERY,
+                    taskPage = CollectionPage.RECOVERY, session = collecting, connected = false,
+                    connecting = true, busy = true))
+                screen("catalog_download_failure", base.copy(page = CollectionPage.ERROR,
+                    taskPage = CollectionPage.ERROR, session = recorded, canRetry = true,
+                    error = "下载连接中断，请重试"))
+                screen("catalog_recovery_device_unready", base.copy(page = CollectionPage.RECOVERY,
+                    canRetry = true, error = "时间同步超时，请重新连接后再试"))
+                screen("catalog_recovery_no_connection", base.copy(page = CollectionPage.RECOVERY,
+                    connected = false, canRetry = true))
+
+                val observation = HealthRecordObservation(preparation.ring?.address ?: "AA:BB:CC:DD:EE:FF", 1,
+                    HealthMessage.Status(true, 800, 10, 0, 7), now - 30_000,
+                    listOf(HealthMessage.ListItem(7, 800, 10, 200, 0)))
+                val protective = requested.copy(startAbort = UnconfirmedStartAbort(now - 29_000,
+                    "00000000-0000-0000-0000-000000000001", observation))
+                val protectedStop = protective.copy(startAbort = protective.startAbort!!.copy(
+                    stoppedObservation = observation.copy(status = observation.status.copy(collecting = false),
+                        statusReceivedAtMs = now - 25_000)))
+                screen("catalog_protective_stop", base.copy(page = CollectionPage.RECOVERY,
+                    taskPage = CollectionPage.RECOVERY, session = requested, canStopUnconfirmedStart = true))
+                screen("catalog_protective_stop_pending", base.copy(page = CollectionPage.RECOVERY,
+                    taskPage = CollectionPage.RECOVERY, session = protective, canRetry = true))
+                screen("catalog_protective_backup", base.copy(page = CollectionPage.DOWNLOADING,
+                    taskPage = CollectionPage.DOWNLOADING, session = protectedStop, busy = true,
+                    preservingExisting = true))
+                screen("catalog_protective_backup_failure", base.copy(page = CollectionPage.ERROR,
+                    taskPage = CollectionPage.ERROR, session = protectedStop, canRetry = true,
+                    error = "下载连接中断，请重试"))
+                screen("catalog_home_existing_backup", base.copy(preservingExisting = true, busy = true))
+                screen("catalog_home_checking", base.copy(checkingDevice = true, busy = true))
+                screen("catalog_home_reconnecting", base.copy(connected = false, connecting = true, busy = true))
+                screen("catalog_home_disconnected", base.copy(connected = false, canRetry = true))
+                screen("catalog_home_finish_pending", base.copy(taskPage = CollectionPage.FINISH, session = stopped))
+                screen("catalog_home_reference_pending", base.copy(taskPage = CollectionPage.REFERENCE, session = reference))
+                screen("catalog_home_stop_uncertain", base.copy(taskPage = CollectionPage.REFERENCE, session = stopping))
+                screen("catalog_home_download_failure", base.copy(taskPage = CollectionPage.ERROR,
+                    session = recorded, canRetry = true, error = "下载连接中断，请重试"))
+
+                // One genuine scroll container with representative record states, in its native order.
+                val history = listOf(
+                    FlowRecordSummary("catalog-history-review", 330, "valid", "pending", true,
+                        localReviewRequired = true, activity = SessionActivity.RUNNING),
+                    FlowRecordSummary("catalog-history-unreliable", 425, "unreliable", "complete", true,
+                        activity = SessionActivity.WALKING),
+                    FlowRecordSummary("catalog-history-failed", 618, "valid", "failed", true,
+                        activity = SessionActivity.RUNNING),
+                    FlowRecordSummary("catalog-history-deferred", null, "missing", "pending", true,
+                        activity = SessionActivity.WALKING, uploadDeferred = true),
+                    FlowRecordSummary("catalog-history-uploading", 736, "valid", "transferring", true,
+                        transferInFlight = true, activity = SessionActivity.RUNNING),
+                    FlowRecordSummary("catalog-history-queued", 248, "valid", "pending", true,
+                        activity = SessionActivity.WALKING),
+                    FlowRecordSummary("catalog-history-uploaded", 562, "valid", "complete", true,
+                        activity = SessionActivity.WALKING))
+                screen("catalog_home_history_top", base.copy(canStart = true, records = history))
+                capture("catalog_home_history_uploaded", "record_status_catalog-history-uploaded")
+                capture("catalog_home_history_queue", "record_status_catalog-history-queued")
+                capture("catalog_home_history_uploading", "record_status_catalog-history-uploading")
+                capture("catalog_home_history_deferred", "record_status_catalog-history-deferred")
+                capture("catalog_home_history_failed", "record_status_catalog-history-failed")
+                capture("catalog_home_history_unreliable", "record_status_catalog-history-unreliable")
+                capture("catalog_home_history_review", "record_status_catalog-history-review")
+            }
+        }
+    }
+
     @Test fun stoppedRecordOffersLocalFinishFromHomeAndRecoveryWhileBluetoothReconnects() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)

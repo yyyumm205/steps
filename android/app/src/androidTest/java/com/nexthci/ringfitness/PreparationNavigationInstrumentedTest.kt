@@ -7,12 +7,15 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Build
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.Spinner
 import android.widget.TextView
+import android.widget.PopupMenu
 import androidx.test.core.app.ActivityScenario
 import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -46,6 +49,208 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class PreparationNavigationInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
+
+    /** Explicit screenshot export; all device responses are fixtures rendered by the real Activity. */
+    @Test
+    fun exportCurrentPreparationUiCatalog() {
+        val arguments = InstrumentationRegistry.getArguments()
+        assumeTrue("Explicit UI catalog opt-in is required", arguments.getString("captureUiCatalog") == "true")
+        assumeTrue("UI catalog export requires screenshots", arguments.getString("captureFlowScreens") == "true")
+        withProfile { profile ->
+            assumeBluetoothUiPrerequisites()
+            withCollectionJournal { journal ->
+                val transport = NavigationTransport()
+                lateinit var controller: RingPreparationController
+                launch().use { scenario ->
+                    awaitHeading(scenario, "填写准备信息")
+                    replaceCollectionJournal(scenario, journal)
+                    scenario.onActivity { activity -> controller = replaceController(activity, transport) }
+                    captureReviewScreen(scenario, "catalog_prep_registration")
+                    scenario.onActivity { activity ->
+                        assertTrue(tagged<Spinner>(activity, "placement_picker").performClick())
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_registration_placement")
+                    instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+                    typeParticipant(scenario, "!")
+                    choosePlacement(scenario, RingPlacement.RIGHT_RING)
+                    click(scenario, "primary")
+                    await(scenario, "invalid catalog participant") { activity ->
+                        tagged<TextView>(activity, "feedback").text.contains("3–24")
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_invalid_registration")
+
+                    typeParticipant(scenario, "NAV001")
+                    replaceStore(scenario, PreparationStore(profile) { _, _ -> throw IOException("simulated catalog save failure") })
+                    click(scenario, "primary")
+                    await(scenario, "catalog registration save failure") { activity ->
+                        tagged<TextView>(activity, "feedback").text.contains("保存失败")
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_registration_save_failure")
+                    replaceStore(scenario, PreparationStore(profile))
+                    click(scenario, "primary")
+                    awaitHeading(scenario, "选择戒指")
+                    freezeCatalogSearch(scenario)
+                    captureReviewScreen(scenario, "catalog_prep_searching")
+                    click(scenario, "primary")
+                    assertVisibleText(scenario, "已停止搜索")
+                    captureReviewScreen(scenario, "catalog_prep_search_stopped")
+                    click(scenario, "back")
+                    awaitHeading(scenario, "步数采集")
+                    captureReviewScreen(scenario, "catalog_prep_home_no_ring")
+
+                    click(scenario, "edit_placement")
+                    awaitDialog(scenario)
+                    captureReviewScreen(scenario, "catalog_prep_placement_dialog")
+                    replaceStore(scenario, PreparationStore(profile) { _, _ -> throw IOException("simulated catalog placement failure") })
+                    chooseDialogPlacement(scenario, RingPlacement.LEFT_RING)
+                    await(scenario, "catalog placement save failure") { activity ->
+                        placementDialog(activity)?.let { dialog ->
+                            dialog.isShowing && dialog.listView.isEnabled &&
+                                descendants(requireNotNull(dialog.window).decorView).filterIsInstance<TextView>()
+                                    .any { it.text.toString() == "保存失败，请重新选择" }
+                        } == true
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_placement_save_failure")
+                    scenario.onActivity { activity ->
+                        requireNotNull(placementDialog(activity)).getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
+                    }
+                    awaitDialogClosed(scenario)
+                    replaceStore(scenario, PreparationStore(profile))
+
+                    click(scenario, "primary")
+                    awaitHeading(scenario, "选择戒指")
+                    val scanListener = freezeCatalogSearch(scenario)
+                    scenario.onActivity {
+                        scanListener.onRingsFound(emptyList())
+                        scanListener.onBleState("没有发现戒指，请确认戒指已唤醒且未连接其他设备", false)
+                    }
+                    await(scenario, "catalog search has no results") { activity ->
+                        tagged<Button>(activity, "primary").text.toString() == "重新搜索"
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_search_empty")
+                    val ring = ScannedRing("AA:BB:CC:DD:EE:01", "Ringo navigation test", -42)
+                    val secondRing = ScannedRing("AA:BB:CC:DD:EE:02", "Ringo selection test", -58)
+                    scenario.onActivity {
+                        scanListener.onRingsFound(listOf(ring, secondRing))
+                        scanListener.onBleState("搜索完成，请选择要连接的戒指", false)
+                    }
+                    await(scenario, "catalog ring candidates") { activity ->
+                        scannedRingButton(activity, ring)?.isShown == true &&
+                            scannedRingButton(activity, secondRing)?.isShown == true
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_search_candidates")
+                    clickScannedRing(scenario, ring)
+                    awaitHeading(scenario, "步数采集")
+                    await(scenario, "catalog connecting") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "正在连接戒指"
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_connecting")
+                    scenario.onActivity { controller.timeout(controller.state.attemptId) }
+                    captureReviewScreen(scenario, "catalog_prep_connection_timeout")
+                    click(scenario, "primary")
+                    scenario.onActivity { transport.listener.onConnection("测试连接完成", true) }
+                    await(scenario, "catalog checking") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "正在检查戒指"
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_checking")
+                    scenario.onActivity { controller.timeout(controller.state.attemptId) }
+                    captureReviewScreen(scenario, "catalog_prep_check_timeout")
+                    click(scenario, "primary")
+                    click(scenario, "connection_cancel")
+                    captureReviewScreen(scenario, "catalog_prep_connection_cancelled")
+                    click(scenario, "primary")
+                    scenario.onActivity {
+                        transport.listener.onConnection("测试连接完成", true)
+                        fillMetadata(transport.listener)
+                    }
+                    await(scenario, "catalog ready") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "准备完成"
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_ready")
+
+                    click(scenario, "details")
+                    captureReviewScreen(scenario, "catalog_prep_more_debug_menu")
+                    scenario.onActivity { activity ->
+                        val menu = StepPreparationActivity::class.java.getDeclaredField("moreMenu")
+                            .apply { isAccessible = true }.get(activity) as PopupMenu
+                        menu.dismiss()
+                        assertTrue(menu.menu.performIdentifierAction(1, 0))
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_device_details")
+                    clickCatalogDialogButton("更换戒指")
+                    awaitHeading(scenario, "选择戒指")
+                    freezeCatalogSearch(scenario)
+                    captureReviewScreen(scenario, "catalog_prep_replace_ring_search")
+                    click(scenario, "back")
+                    awaitHeading(scenario, "步数采集")
+                    click(scenario, "primary")
+                    scenario.onActivity {
+                        transport.listener.onConnection("测试连接完成", true)
+                        fillMetadata(transport.listener, bytes = 2048, records = 12)
+                    }
+                    await(scenario, "catalog existing ring records") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "戒指已连接"
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_ring_records")
+
+                    val ledger = FreeLivingSessionStore(journal)
+                    val prepared = requireNotNull(PreparationStore(profile).read())
+                    val session = ledger.requestStart(prepared, 1_000, "Asia/Shanghai")
+                    completeFixture(ledger, journal, session)
+                    replaceCollectionJournal(scenario, journal)
+                    await(scenario, "catalog completed collection history") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "采集记录" &&
+                            tagged<Button>(activity, "edit_placement").isEnabled
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_collection_history_home")
+                    ledger.requestStart(prepared, 7_000, "Asia/Shanghai")
+                    replaceCollectionJournal(scenario, journal)
+                    await(scenario, "catalog pending collection history") { activity ->
+                        tagged<TextView>(activity, "device_status").text.toString() == "采集记录" &&
+                            !tagged<Button>(activity, "edit_placement").isEnabled
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_pending_collection_home")
+                }
+                writeDurably(profile, "version=1\nparticipant_id=navcorrupt\n".toByteArray(Charsets.UTF_8))
+                launch().use { scenario ->
+                    replaceCollectionJournal(scenario, journal)
+                    await(scenario, "catalog unreadable preparation") { activity ->
+                        tagged<TextView>(activity, "feedback").text.contains("准备信息读取失败")
+                    }
+                    captureReviewScreen(scenario, "catalog_prep_profile_read_failure")
+                }
+            }
+        }
+    }
+
+    /** Stop native discovery; keep the real Activity callback and its current scan generation. */
+    private fun freezeCatalogSearch(scenario: ActivityScenario<StepPreparationActivity>): RingBleClient.Listener {
+        instrumentation.waitForIdleSync()
+        lateinit var listener: RingBleClient.Listener
+        scenario.onActivity { activity ->
+            val scanner = StepPreparationActivity::class.java.getDeclaredField("scanner")
+                .apply { isAccessible = true }.get(activity) as RingBleClient
+            scanner.stop()
+            listener = RingBleClient::class.java.getDeclaredField("listener")
+                .apply { isAccessible = true }.get(scanner) as RingBleClient.Listener
+            StepPreparationActivity::class.java.getDeclaredField("scanning")
+                .apply { isAccessible = true }.setBoolean(activity, true)
+            listener.onRingsFound(emptyList())
+            listener.onBleState("正在搜索附近的 Ringo 戒指…", false)
+        }
+        await(scenario, "catalog search state") { activity ->
+            tagged<Button>(activity, "primary").text.toString() == "停止搜索"
+        }
+        return listener
+    }
+
+    private fun clickCatalogDialogButton(text: String) {
+        instrumentation.waitForIdleSync()
+        val root = requireNotNull(instrumentation.uiAutomation.rootInActiveWindow)
+        val node = root.findAccessibilityNodeInfosByText(text).first { it.text?.toString() == text }
+        assertTrue("Catalog dialog action '$text'", node.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+        instrumentation.waitForIdleSync()
+    }
 
     @Test fun pendingCollectionLocksPreparationUntilItsFilesArePreservedThenResumeUnlocksIt() = withProfile { profile ->
         assumeBluetoothUiPrerequisites()
@@ -660,7 +865,8 @@ class PreparationNavigationInstrumentedTest {
         instrumentation.waitForIdleSync()
         val screenshot = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
         try {
-            FileOutputStream(File(instrumentation.targetContext.cacheDir, "prep-review-$page.png")).use {
+            val filename = if (page.startsWith("catalog_")) "$page.png" else "prep-review-$page.png"
+            FileOutputStream(File(instrumentation.targetContext.cacheDir, filename)).use {
                 assertTrue(screenshot.compress(Bitmap.CompressFormat.PNG, 100, it))
                 it.fd.sync()
             }
