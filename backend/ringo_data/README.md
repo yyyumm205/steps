@@ -2,9 +2,23 @@
 
 本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录及 IMU/PPG CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)及[功能规格](../../specs/independent-step-collection/requirements.md)。
 
+当前导入器版本为 **0.2.1**，可用 `python -m backend.ringo_data --version` 查询。该版本统一公开版本与导入回执，补齐 START→STOP→最终记录的计数顺序及恢复证据同连接校验；拒绝未知嵌套字段和非法时区。ZIP 目录在完整加载前按流检查条目配额，异常云端文件名或地址按文件报告并继续后续条目。索引遇到记录目录损坏、复制导致的身份不符或产物校验失败时保留上一次完整文件。
+
+本轮证据与适用范围见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
+
 ## 运行与复现
 
-从仓库根目录执行；输入、输出路径由研究者指定。实验文件放在受控本地目录，例如已被 Git 忽略的 `research-data/`。
+以下命令均从仓库根目录执行，使 Python 能找到 `backend.ringo_data` 模块。先安装 Python 3.10+，确认 `python --version` 返回所选解释器的版本，再建立独立测试环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements-test.txt
+.\.venv\Scripts\python.exe -m pytest backend/ringo_data/tests -q
+```
+
+[requirements-test.txt](../requirements-test.txt)固定测试框架为 pytest 9.1.1；业务运行继续只使用标准库。命令直接调用虚拟环境解释器，无需激活环境。macOS/Linux 对应解释器为 `.venv/bin/python`。历史验证使用的本机 `PYTHONPATH` 和 `.local/python-test-deps` 是本地便捷配置，团队复现使用上述虚拟环境，无需复制个人路径或依赖目录。
+
+输入、输出路径由研究者指定。实验文件放在受控本地目录，例如已被 Git 忽略的 `research-data/`。下列 `python` 表示已选定的 Python 3.10+ 解释器；使用上述 Windows 虚拟环境时，替换为 `.\.venv\Scripts\python.exe`：
 
 ```powershell
 python -m backend.ringo_data import --output research-data/imported research-data/incoming/session.zip
@@ -12,7 +26,6 @@ python -m backend.ringo_data summary --root research-data/imported --output rese
 python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported --once
 python -m backend.ringo_data sync --incoming research-data/incoming --output research-data/imported
 python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.json --once
-python -m pytest backend/ringo_data/tests -q
 ```
 
 `import` 支持一次传入多份 ZIP，同批副本保持幂等。标准输出逐包报告 `imported`、`already_imported` 或 `conflict`；任何冲突或拒收使退出码为 2，其他包继续处理。
@@ -33,19 +46,21 @@ python -m pytest backend/ringo_data/tests -q
 
 ## 输入与输出
 
-新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。新包采用 `version=4`、`activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
+新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。新包通常采用 `version=4`；携带下述未知日期旧记录兼容证据时采用 `version=5`。走跑包均使用 `activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
 
 历史 `version=2/3` 包继续采用 `daily_activity_v2/free_living`，保持原有字段与含义。所有版本均要求 `step_schema_version=1`、`rfbin_version=2`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
 
-普通记录沿用版本 2，其开始基线必须为空闲且 `error_code=0`。版本 3 专门保存充电错误兼容路径：开始基线保留真实的空闲状态和 `error_code=-16`，并要求 `start_baseline.charging_recovery_evidence` 同时证明原因是 `charging`、电量接口报告未充电、两条回复来自同一次连接且在检查时均不超过 5 秒。证据保存原因码、电量充电状态、两条回复的接收时间与连接代次、检查时间；STATUS 接收时间必须等于基线观察时间。缺失、过期或相互矛盾的证据拒收。版本 2 不接受此兼容字段；所有版本的成功开始、停止与下载记录证据仍要求 `error_code=0`。兼容证据随原清单保留，冻结旧包保持原字节内容。
+历史自由活动的普通记录使用版本 2，其开始基线必须为空闲且 `error_code=0`。历史版本 3 专门保存充电错误兼容路径：开始基线保留真实的空闲状态和 `error_code=-16`，并要求 `start_baseline.charging_recovery_evidence` 同时证明原因是 `charging`、电量接口报告未充电、两条回复来自同一次连接且在检查时均不超过 5 秒。证据保存原因码、电量充电状态、两条回复的接收时间与连接代次、检查时间；STATUS 接收时间必须等于基线观察时间。缺失、过期或相互矛盾的证据拒收。版本 2 不接受此兼容字段；所有版本的成功开始、停止与下载记录证据仍要求 `error_code=0`。兼容证据随原清单保留，冻结旧包保持原字节内容。
 
-版本 4 同时支持普通开始与充电错误兼容路径。普通开始要求空闲且 `error_code=0`，省略 `charging_recovery_evidence` 字段；兼容路径要求空闲且 `error_code=-16`，保留与版本 3 同样完整、有效的证据对象。显式 null、字段缺失或冲突组合均拒收。版本 2/3 保持原有校验，版本 4/5 支持新增活动选择字段。
+版本 4 同时支持普通开始与充电错误兼容路径。普通开始要求空闲且 `error_code=0`，省略 `charging_recovery_evidence` 字段；兼容路径要求空闲且 `error_code=-16`，保留与版本 3 同样完整、有效的证据对象。兼容路径缺少证据或证据显式为 null 时拒收；普通开始携带该字段、或其他状态与证据冲突时也拒收。版本 2/3 保持原有校验，版本 4/5 支持新增活动选择字段。
 
 版本5用于开始基线中存在一条设备日期未知的旧记录。`unknown_time_start_evidence`保存完整重读备份的身份及哈希、连接owner/代次、保全时间和手机校时请求/回复。旧记录仍为`unix_ms=0`；新记录必须符合本次TIME锚及时间窗口，数值ID复用时uptime也须改变。v5支持走路/跑步或历史自由活动，以及已有充电兼容证据；缺失、冲突或过期的证据拒收。这里的时钟证据用于记录归属检查，样本精确时间仍依原有质量规则。冻结v2–v4包原文保持。
 
 手机的“稍后上传”和放弃审计仅控制本地工作流。放弃段不产生研究上传包；暂缓段手动上传时沿用同一session及冻结内容。后台接收后仍按session与ZIP哈希去重。
 
 校验包括严格整数类型、有效零步/缺失/不可靠参考、明确停止、记录指纹与开始基线、原始头部、记录数、载荷 CRC32、整文件 SHA-256、sidecar 对应关系，以及 ZIP 路径、重复条目和资源配额。参考原因保存在原 manifest 中；每个 session 的 `reference.csv` 只有一行，整段总数关联所有原始文件。软件可导入同一 session 的多个片段文件并标记重叠待核对；设备多文件能力仍待实测。
+
+嵌套设备证据按对应版本精确校验字段；两类恢复证据同时存在时要求连接代次一致。时区采用 Android `ZoneId` 语法，固定偏移须在 ±18 小时内且与保存的秒数一致；地区时区保留采集时的偏移，不依赖研究电脑的时区数据库推翻历史记录。已有合法 v2–v5 包保持格式与原文；历史导入产物保持原样。异常包保留到拒收目录，供复核。
 
 ```text
 输出目录/

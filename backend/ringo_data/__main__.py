@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from . import __version__
 from .importer import ArchiveRejected, Limits, import_archive, summarize
 from .schema import ValidationError
 from .sync import DirectorySync
@@ -16,6 +17,7 @@ from .cloud import CloudConfig, CloudSync
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Validate and import frozen activity collection ZIPs")
+    parser.add_argument("--version", action="version", version=f"ringo_data {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("import", help="validate, preserve and decode local archives")
     ingest.add_argument("archives", nargs="+", type=Path)
@@ -40,9 +42,13 @@ def main(argv=None):
     cloud.add_argument("--once", action="store_true", help="download and import one batch, then exit")
     args = parser.parse_args(argv)
     if args.command == "summary":
-        rows = summarize(args.root, args.output)
-        print(json.dumps({"sessions": len(rows), "daily_total_generated": False}))
-        return 0
+        try:
+            rows = summarize(args.root, args.output)
+            print(json.dumps({"sessions": len(rows), "daily_total_generated": False}))
+            return 0
+        except (OSError, ValidationError) as error:
+            print(json.dumps({"status": "index_error", "reason": str(error)}, ensure_ascii=False), file=sys.stderr)
+            return 2
     if args.command == "cloud-sync":
         try:
             config = CloudConfig.load(args.config)

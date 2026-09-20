@@ -1,0 +1,2 @@
+# Test-only dependency; runtime uses the Python 3.10+ standard library.
+pytest==9.1.1

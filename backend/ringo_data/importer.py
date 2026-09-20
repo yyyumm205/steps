@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from . import __version__
+from .archive_limits import check_zip_directory
 from .health_raw_v2 import OutputBudget, decode_to_csv, read_header
 from .phone_time import add_phone_time
 from .schema import ValidationError, integer, object_value, require, safe_name, strict_json, validate_manifest
@@ -280,7 +282,7 @@ def existing_result(destination, session_id, digest):
     require(sha256(destination / "source.zip") == receipt.get("zip_sha256"), "existing archive checksum mismatch")
     artifacts = object_value(receipt.get("artifacts"), "existing artifact hashes")
     actual = {p.relative_to(destination).as_posix() for p in destination.rglob("*")
-              if p.is_file() and p.name != "import.json"}
+              if p.is_file() and p != destination / "import.json"}
     require(actual == set(artifacts), "existing import file inventory changed")
     for name, expected in artifacts.items():
         require(sha256(destination / name) == expected, "existing import artifact checksum mismatch")
@@ -316,6 +318,7 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
                 out.flush()
                 os.fsync(out.fileno())
             digest = h.hexdigest()
+            check_zip_directory(frozen, limits.entries)
             with zipfile.ZipFile(frozen) as archive:
                 entries = inspect_zip(archive, limits)
                 manifest_bytes = archive.read(entries["manifest.json"])
@@ -335,7 +338,7 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
                     require(existing_result(destination, session_id, digest), "existing conflict archive is inconsistent")
                     return ImportResult("conflict", session_id, digest, str(destination))
             artifacts = {p.relative_to(stage).as_posix(): sha256(p) for p in stage.rglob("*") if p.is_file()}
-            write_json(stage / "import.json", {"importer_version": "0.2.0", "session_id": session_id,
+            write_json(stage / "import.json", {"importer_version": __version__, "session_id": session_id,
                        "zip_sha256": digest, "status": status, "analysis_status": quality["analysis_status"],
                        "artifacts": artifacts})
             publish(stage, destination)
@@ -369,10 +372,13 @@ def summarize(root: Path, output: Path):
 def _summarize_locked(root: Path, output: Path):
     rows, raw_owners = [], {}
     root = local_path(root)
-    for directory in sorted((root / "sessions").glob("*")):
-        if not directory.is_dir():
-            continue
+    sessions = root / "sessions"
+    require(not sessions.is_symlink() and (not sessions.exists() or sessions.is_dir()),
+            "session storage is not a regular directory")
+    for directory in sorted(sessions.glob("*")):
+        require(directory.is_dir() and not directory.is_symlink(), "session entry is not a regular directory")
         manifest = validate_manifest(strict_json((directory / "manifest.json").read_bytes()))
+        require(directory.name == manifest["session_id"], "session directory identity differs from manifest")
         quality = object_value(strict_json((directory / "quality.json").read_bytes()), "existing quality report")
         require({"analysis_status", "analysis_reasons"} <= set(quality), "existing quality report fields missing")
         require(quality["analysis_status"] == "pending_review", "existing analysis status is invalid")

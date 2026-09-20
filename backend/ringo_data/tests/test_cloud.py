@@ -174,6 +174,19 @@ def test_remote_file_names_cannot_escape_the_configured_directory(tmp_path, name
     assert result["failed"] and len(http.calls) == 1
 
 
+@pytest.mark.parametrize("name", ["bad\ud800.zip", "bad\udfff.zip"])
+def test_unpaired_surrogate_file_name_does_not_stop_the_next_valid_download(tmp_path, name):
+    data = data_at(tmp_path)
+    http = FakeHttp([listing_for(name, data), listing_for("good.zip", data, "b" * 40)], {"good.zip": data})
+    result = reader(config_at(tmp_path), http).once()
+    assert result["failed"]
+    assert [event["status"] for event in result["cloud"]["files"]] == ["download_error", "downloaded"]
+    assert result["cloud"]["files"][0]["reason"] == "cloud file name is invalid"
+    assert result["local"]["index"]["sessions"] == 1
+    assert len([url for url, token in http.calls if token is None]) == 1
+    assert TOKEN not in json.dumps(result) and "synthetic-download-secret" not in json.dumps(result)
+
+
 @pytest.mark.parametrize("kind", ["files", "response", "archive"])
 def test_remote_quotas_limit_download_work(tmp_path, kind):
     data = data_at(tmp_path)
@@ -406,6 +419,37 @@ def test_foreign_download_link_is_rejected_before_any_request(tmp_path):
     assert TOKEN not in json.dumps(result)
 
 
+@pytest.mark.parametrize("download_path", ["/bad\ud800", "/未编码路径"])
+def test_non_ascii_download_url_is_rejected_without_stopping_other_downloads(tmp_path, download_path):
+    data = data_at(tmp_path)
+
+    class MalformedLink(FakeHttp):
+        @contextmanager
+        def open(self, url, token=None):
+            parts = urllib.parse.urlsplit(url)
+            if parts.path.endswith("/file/") and urllib.parse.parse_qs(parts.query)["p"] == ["/study/bad.zip"]:
+                self.calls.append((url, token))
+                with Response(json.dumps(BASE_URL + download_path + "?access=" + TOKEN).encode()) as response:
+                    yield response
+            else:
+                with super().open(url, token) as response:
+                    yield response
+
+    http = MalformedLink([listing_for("bad.zip", data), listing_for("good.zip", data, "b" * 40)],
+                         {"good.zip": data})
+    result = reader(config_at(tmp_path), http).once()
+    assert result["failed"]
+    assert [event["status"] for event in result["cloud"]["files"]] == ["download_error", "downloaded"]
+    assert result["local"]["index"]["sessions"] == 1
+    assert len([url for url, token in http.calls if token is None]) == 1
+    assert TOKEN not in json.dumps(result)
+
+
+def test_percent_encoded_unicode_url_still_uses_the_trusted_origin():
+    address = BASE_URL + "/" + urllib.parse.quote("合法路径")
+    assert trusted_url(address) == address
+
+
 def test_config_paths_resolve_locally_and_inbox_output_must_stay_separate(tmp_path):
     path = tmp_path / "config.json"
     value = {"base_url": BASE_URL, "repo_id": REPO, "remote_path": "/study", "account_db": "accounts.db",
@@ -418,3 +462,13 @@ def test_config_paths_resolve_locally_and_inbox_output_must_stay_separate(tmp_pa
     path.write_text(json.dumps(value))
     with pytest.raises(ValidationError, match="separate"):
         CloudConfig.load(path)
+
+
+def test_config_rejects_unpaired_surrogate_in_remote_directory(tmp_path):
+    path = tmp_path / "config.json"
+    value = {"base_url": BASE_URL, "repo_id": REPO, "remote_path": "/study\ud800/", "account_db": "accounts.db",
+             "local_inbox": "inbox", "research_output": "research"}
+    path.write_text(json.dumps(value))
+    with pytest.raises(CloudSyncError, match="invalid configured cloud directory"):
+        CloudConfig.load(path)
+    assert not (tmp_path / "inbox").exists() and not (tmp_path / "research").exists()

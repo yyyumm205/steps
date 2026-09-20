@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from . import __version__
 from .importer import Limits, import_lock, sha256, sync_directory
 from .schema import ValidationError, object_value, require, strict_json
 from .sync import DirectorySync
@@ -33,6 +34,14 @@ class CloudSyncError(ValidationError):
 
 class CloudScopeError(CloudSyncError):
     """The inbox's persisted scope is untrusted; do not feed it into this research output."""
+
+
+def utf8(value, message):
+    """Reject unpaired JSON surrogate escapes before URL or identity encoding."""
+    try:
+        return value.encode("utf-8")
+    except UnicodeError:
+        raise CloudSyncError(message) from None
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,7 @@ class CloudConfig:
         require(type(remote) is str and remote.startswith("/") and len(remote) <= 2048 and
                 not any(c in remote for c in ("\\", "\0", "\r", "\n", "%")) and
                 all(part not in (".", "..") for part in remote.split("/")), "invalid configured cloud directory")
+        utf8(remote, "invalid configured cloud directory")
         value["remote_path"] = remote.rstrip("/") + "/" if remote != "/" else "/"
         for key in ("account_db", "local_inbox", "research_output"):
             require(type(value[key]) is str and value[key], "local cloud paths must be configured")
@@ -103,7 +113,8 @@ def read_client_token(account_db, base_url):
 
 
 def trusted_url(url):
-    require(type(url) is str and 0 < len(url) <= 8192 and not any(c in url for c in ("\r", "\n", "\0")),
+    require(type(url) is str and 0 < len(url) <= 8192 and url.isascii() and
+            not any(c in url for c in ("\r", "\n", "\0")),
             "cloud address is invalid")
     try:
         parsed = urllib.parse.urlsplit(url)
@@ -128,7 +139,7 @@ class ReadOnlyCloudHttp:
     def open(self, url, token=None):
         trusted_url(url)
         headers = {"Accept": "application/json,application/zip", "Accept-Encoding": "identity",
-                   "User-Agent": "RingFitnessResearch/0.1"}
+                   "User-Agent": f"RingFitnessResearch/{__version__}"}
         if token is not None:
             headers["Authorization"] = "Token " + token
         request = urllib.request.Request(url, headers=headers, method="GET")
@@ -150,7 +161,8 @@ class CloudDownloader:
         self.token_reader = token_reader
         config.local_inbox.mkdir(parents=True, exist_ok=True)
         self.state_path = config.local_inbox / ".cloud-downloads.json"
-        self.scope = hashlib.sha256((config.base_url + "\n" + config.repo_id + "\n" + config.remote_path).encode()).hexdigest()
+        self.scope = hashlib.sha256(utf8(config.base_url + "\n" + config.repo_id + "\n" + config.remote_path,
+                                         "invalid configured cloud directory")).hexdigest()
 
     def _json(self, url, token):
         deadline = time.monotonic() + 60
@@ -248,7 +260,7 @@ class CloudDownloader:
                 size, remote_id = row.get("size"), row.get("id")
                 require(type(size) is int and 0 < size <= self.config.max_archive_bytes, "cloud archive size exceeds quota")
                 require(type(remote_id) is str and 0 < len(remote_id) <= 128 and remote_id.isalnum(), "cloud file identity is invalid")
-                identity = hashlib.sha256((name + "\0" + remote_id).encode()).hexdigest()
+                identity = hashlib.sha256(utf8(name + "\0" + remote_id, "cloud file name is invalid")).hexdigest()
                 previous = state["files"].get(identity)
                 if previous is not None:
                     previous = object_value(previous, "local cloud file receipt")

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.ringo_data import __version__
 from backend.ringo_data.importer import ArchiveRejected, Limits, import_archive, sha256, summarize
 from backend.ringo_data.tests.test_importer import archive_at, imu, manifest_for, ppg, raw_bytes, read_rows
 
@@ -59,7 +60,7 @@ def test_alignment_preserves_frozen_bytes_reference_and_idempotency(tmp_path):
     assert import_archive(source, root.parent.parent).status == "already_imported"
     assert before == {p.relative_to(root): sha256(p) for p in root.rglob("*") if p.is_file()}
     receipt = json.loads((root / "import.json").read_text())
-    assert receipt["importer_version"] == "0.2.0"
+    assert receipt["importer_version"] == __version__
     assert receipt["artifacts"]["quality.json"] == sha256(root / "quality.json")
 
 

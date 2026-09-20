@@ -36,6 +36,45 @@ def object_value(value, name: str):
     return value
 
 
+def object_fields(value, name: str, fields):
+    value = object_value(value, name)
+    require(set(value) == set(fields), f"invalid fields: {name}")
+    return value
+
+
+def validate_time_zone(value):
+    """Check Java ZoneId syntax and return a fixed offset, or None for a region."""
+    value = text(value, "time_zone_id", 128)
+    if value in ("Z", "UTC", "GMT", "UT"):
+        return 0
+    offset = value
+    for prefix in ("UTC", "GMT", "UT"):
+        if value.startswith(prefix) and value[len(prefix):len(prefix) + 1] in ("+", "-"):
+            offset = value[len(prefix):]
+            break
+    if offset.startswith(("+", "-")):
+        digits = offset[1:]
+        if re.fullmatch(r"[0-9]{1,2}", digits):
+            hours, minutes, seconds = int(digits), 0, 0
+        elif re.fullmatch(r"[0-9]{4}(?:[0-9]{2})?", digits):
+            hours, minutes, seconds = int(digits[:2]), int(digits[2:4]), int(digits[4:] or "0")
+        elif re.fullmatch(r"[0-9]{2}:[0-9]{2}(?::[0-9]{2})?", digits):
+            parts = [int(part) for part in digits.split(":")]
+            hours, minutes, seconds = (*parts, 0) if len(parts) == 2 else parts
+        else:
+            raise ValidationError("invalid fixed-offset time_zone_id")
+        require(hours <= 18 and minutes <= 59 and seconds <= 59 and
+                (hours < 18 or minutes == seconds == 0), "invalid fixed-offset time_zone_id")
+        seconds = hours * 3600 + minutes * 60 + seconds
+        return seconds if offset[0] == "+" else -seconds
+    else:
+        # Region existence belongs to the Android tzdb that saved the ID. Later
+        # host tzdb changes must not rewrite or invalidate a frozen capture.
+        require(re.fullmatch(r"[A-Za-z][A-Za-z0-9~/._+-]+", value) is not None,
+                "invalid region time_zone_id")
+    return None
+
+
 def strict_json(data: bytes):
     def pairs(items):
         result = {}
@@ -73,7 +112,7 @@ def safe_name(name):
 
 
 def validate_status(value, name, *, allow_charging_error=False):
-    value = object_value(value, name)
+    value = object_fields(value, name, ("collecting", "bytes", "records", "device_session_id", "error_code"))
     require(type(value.get("collecting")) is bool, f"invalid collecting: {name}")
     for key in ("bytes", "records"):
         integer(value.get(key), f"{name}.{key}", maximum=MAX_UINT)
@@ -108,7 +147,7 @@ def validate_charging_recovery(baseline):
 
 
 def validate_record(value, name):
-    value = object_value(value, name)
+    value = object_fields(value, name, ("device_session_id", "bytes", "records", "uptime_ms", "unix_ms"))
     integer(value.get("device_session_id"), f"{name}.device_session_id", minimum=1, maximum=65535)
     for key in ("bytes", "records", "uptime_ms"):
         integer(value.get(key), f"{name}.{key}", maximum=MAX_UINT)
@@ -131,6 +170,10 @@ def validate_unknown_time_start(baseline, manifest, record):
     require([item for item in baseline["records"] if item["unix_ms"] == 0] == [previous],
             "unknown record proof differs from baseline")
     generation = integer(evidence["connection_generation"], "preservation connection", 1)
+    charging = baseline.get("charging_recovery_evidence")
+    if charging is not None:
+        require(charging["status_connection_generation"] == generation,
+                "charging recovery and preservation evidence came from different connections")
     preserved = integer(evidence["preserved_at_ms"], "preservation time", 1)
     clock = object_value(evidence["clock"], "preservation clock evidence")
     require(set(clock) == {"attempt_id", "ring_address", "connection_generation", "requested_at_ms", "received_at_ms",
@@ -208,8 +251,10 @@ def validate_manifest(value):
             re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", m["ring_address"]) is not None,
             "invalid ring address")
     require(type(m["ring_name"]) is str and len(m["ring_name"]) <= 256, "invalid ring name")
-    text(m["time_zone_id"], "time_zone_id", 128)
+    fixed_offset = validate_time_zone(m["time_zone_id"])
     integer(m["utc_offset_seconds"], "utc_offset_seconds", -64800, 64800)
+    require(fixed_offset is None or m["utc_offset_seconds"] == fixed_offset,
+            "fixed time_zone_id and utc_offset_seconds disagree")
     for key in ("start_requested_at_ms", "reference_saved_at_ms", "download_completed_at_ms"):
         integer(m[key], key, 1)
     for key in ("start_confirmed_at_ms", "stop_requested_at_ms", "stop_confirmed_at_ms",
@@ -256,7 +301,7 @@ def validate_manifest(value):
         if evidence is None:
             require(actual is None, "known boundary requires evidence")
         else:
-            object_value(evidence, key)
+            object_fields(evidence, key, ("source", "epoch_ms", "device_uptime_ms", "raw_evidence"))
             require(evidence.get("source") in ("device_time_anchor", "raw_sample"), "invalid boundary source")
             integer(evidence.get("epoch_ms"), "boundary epoch", 1)
             integer(evidence.get("device_uptime_ms"), "boundary uptime", maximum=MAX_UINT, nullable=True)
@@ -276,7 +321,7 @@ def validate_manifest(value):
         validate_status(evidence, key)
         require(evidence["device_session_id"] == device_id and evidence["collecting"] is collecting
                 and evidence["error_code"] == 0, "status evidence inconsistent")
-    current = object_value(m["device_record_evidence"], "device_record_evidence")
+    current = object_fields(m["device_record_evidence"], "device_record_evidence", ("record", "status", "observed_at_ms"))
     record = validate_record(current.get("record"), "record")
     device_status = validate_status(current.get("status"), "record status")
     integer(current.get("observed_at_ms"), "record observation time", 1)
@@ -291,6 +336,8 @@ def validate_manifest(value):
     for key in ("start_status_evidence", "stop_status_evidence"):
         require(all(m[key][counter] <= record[counter] for counter in ("bytes", "records")),
                 "device record counters moved backwards")
+    require(all(m["start_status_evidence"][counter] <= m["stop_status_evidence"][counter]
+                for counter in ("bytes", "records")), "STOP counters moved backwards from START")
     baseline = object_value(m["start_baseline"], "start_baseline")
     has_charging_recovery = version == 3 or (version in (4, 5) and "charging_recovery_evidence" in baseline)
     baseline_status = validate_status(baseline.get("status"), "baseline status",
@@ -319,6 +366,12 @@ def validate_manifest(value):
     else:
         require("unknown_time_start_evidence" not in baseline, "unknown time start evidence requires manifest version 5")
         preserved_unknown = None
+    baseline_fields = {"status", "records", "observed_at_ms"}
+    if has_charging_recovery:
+        baseline_fields.add("charging_recovery_evidence")
+    if version == 5:
+        baseline_fields.add("unknown_time_start_evidence")
+    object_fields(baseline, "start_baseline", baseline_fields)
     if previous is None:
         require(device_id != baseline_status["device_session_id"], "record not distinguishable from baseline")
     else:
