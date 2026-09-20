@@ -118,7 +118,14 @@ abstract class StepCollectionActivity : Activity() {
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
         if (state.page == CollectionPage.REFERENCE && old?.page == CollectionPage.REFERENCE &&
-            old.copy(records = state.records, fault = state.fault) == state) return
+            old.copy(records = state.records, fault = state.fault, connected = state.connected,
+                connecting = state.connecting, canRetry = state.canRetry, error = state.error) == state) {
+            window.decorView.findViewWithTag<TextView>("flow_error")?.apply {
+                text = state.error.orEmpty()
+                visibility = if (state.error == null) View.GONE else View.VISIBLE
+            }
+            return
+        }
         stepsInput = null; reasonInput = null; participantInput = null; placementPicker = null; elapsedLabel = null
         val root = ui.column().apply {
             setBackgroundColor(ui.background)
@@ -166,9 +173,10 @@ abstract class StepCollectionActivity : Activity() {
         val body = ui.column(padding = 20).apply { setPadding(ui.dp(20), ui.dp(16), ui.dp(20), ui.dp(12)) }
         scroll.addView(body)
         val footer = ui.column(root, 20).apply { setPadding(ui.dp(20), ui.dp(12), ui.dp(20), ui.dp(12)) }
-        if (state.error != null && !(state.page == CollectionPage.HOME && homeTask(state).hint == state.error)) {
-            ui.text(footer, state.error, 14f).apply {
+        if (state.page == CollectionPage.REFERENCE || (state.error != null && !(state.page == CollectionPage.HOME && homeTask(state).hint == state.error))) {
+            ui.text(footer, state.error.orEmpty(), 14f).apply {
                 tag = "flow_error"
+                visibility = if (state.error == null) View.GONE else View.VISIBLE
                 setTextColor(ui.error)
                 accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
             }
@@ -282,8 +290,9 @@ abstract class StepCollectionActivity : Activity() {
             }
         }
         action(footer, if (state.canStart && state.selectedActivity == null) "请先选择活动" else task.action,
-            !state.busy && !state.connecting && (!state.canStart || state.selectedActivity != null)) {
+            !state.busy && (state.canRecordReferenceLocally || !state.connecting) && (!state.canStart || state.selectedActivity != null)) {
             when {
+                state.canRecordReferenceLocally -> flow.enterReference()
                 !state.connected -> flow.reconnect()
                 state.canStopUnconfirmedStart -> flow.stop()
                 state.canStart -> flow.start()
@@ -297,6 +306,9 @@ abstract class StepCollectionActivity : Activity() {
     private data class HomeTask(val title: String, val status: String, val action: String, val hint: String? = null)
 
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
+        state.canRecordReferenceLocally -> if (state.session?.completionPolicy == null)
+            HomeTask("采集已结束", "待保存本段", "继续收尾")
+        else HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
         state.connecting -> HomeTask("本次采集", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
         state.session?.startAbort?.stoppedObservation != null && state.session.isPending ->
@@ -540,7 +552,10 @@ abstract class StepCollectionActivity : Activity() {
                     ?: if (session.reference != null) "已记录原因" else "待填写")
             }
         }
-        if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
+        if (state.canRecordReferenceLocally) {
+            ui.button(body, if (session?.completionPolicy == null) "继续收尾" else "填写步数",
+                tag = "preserve_reference") { flow.enterReference() }
+        } else if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
             ui.button(body, "先记下步数", tag = "preserve_reference") { flow.enterReference() }
         }
         if (state.canEndStartAttempt && !state.canStopUnconfirmedStart) {

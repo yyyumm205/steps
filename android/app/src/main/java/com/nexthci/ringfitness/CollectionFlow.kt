@@ -44,7 +44,11 @@ data class CollectionFlowState(
     val records: List<FlowRecordSummary> = emptyList(),
     val fault: FlowTestFault = FlowTestFault.NONE,
     val selectedActivity: SessionActivity? = null,
-)
+) {
+    val canRecordReferenceLocally: Boolean get() = session?.let {
+        it.isPending && it.stopConfirmedAtMs != null && it.reference == null && it.startAbort == null
+    } == true
+}
 
 interface CollectionFlow {
     val state: CollectionFlowState

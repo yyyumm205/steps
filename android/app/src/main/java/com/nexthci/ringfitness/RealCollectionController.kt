@@ -216,7 +216,7 @@ class RealCollectionController(
         stopEvidenceGeneration = null
         closeDownload()
         coordinator.onDisconnected(connection)
-        publish(CollectionPage.RECOVERY, message)
+        publish(pendingReferencePage() ?: CollectionPage.RECOVERY, message)
         if (store.readPending() != null && reconnectCount < 3) {
             val failedGeneration = generation
             reconnectCount++
@@ -589,13 +589,14 @@ class RealCollectionController(
         require(kind == ReferenceStatus.VALID || reason.isNotBlank()) { "请填写简短原因" }
         val reference = SessionReference(kind, steps, clock.nowEpochMs(), if (kind == ReferenceStatus.VALID) null else reason.trim())
         saving = true
-        try {
+        val saved = try {
             publish(CollectionPage.SAVING)
-            val saved = store.saveReference(current.sessionId, reference)
-            check(store.read(current.sessionId)?.reference == saved.reference)
-            if (saved.stopConfirmedAtMs == null) publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
-            else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
+            store.saveReference(current.sessionId, reference).also {
+                check(store.read(current.sessionId)?.reference == it.reference)
+            }
         } finally { saving = false }
+        if (saved.stopConfirmedAtMs == null) publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
+        else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
     }
 
     override fun retry() = safely {
@@ -702,7 +703,8 @@ class RealCollectionController(
         connected = false; connecting = true
         val id = ++generation
         port.disconnect()
-        publish(if (store.readPending() == null) CollectionPage.HOME else CollectionPage.RECOVERY, "正在连接戒指")
+        publish(pendingReferencePage() ?: if (store.readPending() == null) CollectionPage.HOME else CollectionPage.RECOVERY,
+            "正在连接戒指")
         check(port.connect(requireNotNull(profile?.ring), id)) { "连接未成功，请检查手机蓝牙" }
         scheduler.schedule(30_000) {
             if (!closed && generation == id && connecting) safely {
@@ -1065,11 +1067,18 @@ class RealCollectionController(
     fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && timeRound == null && downloader == null && backupObservation == null &&
         coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
 
+    /** Confirmed-stop choices and reference entry are local work, including during BLE recovery. */
+    private fun pendingReferencePage(): CollectionPage? = store.readPending()?.takeIf {
+        it.stopConfirmedAtMs != null && it.reference == null && it.startAbort == null
+    }?.let { if (it.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE }
+
     private fun publish(page: CollectionPage, error: String? = null) {
         val current = store.read()?.takeUnless { it.startAttemptArchive != null || it.isDiscarded || it.startAbort?.completedAtMs != null }
         val pending = current?.takeIf { it.isPending }
-        if (page != CollectionPage.HOME) { taskPage = page; taskError = error }
-        val visible = if (browsingHome) CollectionPage.HOME else page
+        val task = if (page == CollectionPage.RECOVERY) pendingReferencePage() ?: page else page
+        if (task != CollectionPage.HOME) { taskPage = task; taskError = error }
+        val visible = if (browsingHome) CollectionPage.HOME else task
+        val localReference = pending?.stopConfirmedAtMs != null && pending.reference == null && pending.startAbort == null
         val idle = lastIdle
         val checkingDevice = pending == null && connected && (query != null || readinessWait != null || timeRound != null)
         val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null
@@ -1078,7 +1087,7 @@ class RealCollectionController(
             placement = (pending?.preparation ?: profile)?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
             preservingExisting = backupObservation != null,
-            busy = connecting || query != null || readinessWait != null || timeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null ||
+            busy = saving || (!localReference && (connecting || query != null || readinessWait != null || timeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null)) ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,

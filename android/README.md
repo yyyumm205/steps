@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.8.0-session-finish（versionCode 42）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
+当前开发版：**步数采集 0.8.1-local-recovery（versionCode 43）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
 
 ## 当前可运行范围
 
@@ -8,7 +8,7 @@
 
 0.8.0增加每段必选的走路/跑步，以及停止确认后的“保存并上传”“保存，稍后上传”“放弃本段”。保存先可靠记录参考步数，再下载并校验原始文件；稍后上传保持暂停，直到用户主动上传。放弃经二次确认后清理本段手机任务和文件，保留排除标记；戒指Flash的单段物理删除尚无已核实协议支持。已有充电错误恢复与未知日期旧记录保全继续按证据校验，时间异常的未确认开始提供单次保护停止及独立备份出口。
 
-本版本的JVM、Python契约检查、构建及模拟器页面验证通过，范围见[验证记录E26](../specs/independent-step-collection/validation.md#e26连续使用兼容与分段收尾2026-09-20)。真实校时、短采与三种收尾仍待真机复验；历史真机、云盘和研究端结果保持各自的版本范围。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
+0.8.0的软件与模拟器基线见[验证记录E26](../specs/independent-step-collection/validation.md#e26连续使用兼容与分段收尾2026-09-20)，后续真机短采和0.8.1恢复修复见E27。停止确认后可离线填写读数，重连保留输入焦点；后台下载完成后释放准备页操作，网络上传独立执行。真实三种收尾、完整异常和长时仍按计划验收。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
 
 ### 历史独立版本证据（0.7.2–0.7.4）
 
@@ -24,7 +24,7 @@
 
 Debug从“更多 → 流程演示（模拟）”进入完整交互演示，复用原生页面、协调器与持久化规则，设备、信号和传输使用替身；演示目录与正式记录隔离。Release不提供该入口。页面色彩、字号、容器和主要操作沿用功能规格的最小视觉规则。
 
-当前已验证的是限定设备上的短段技术链路。戒指时钟偏差、实际样本与参考时段对应、完整采集/下载故障矩阵及逐级长时继续验收，最长支持时长尚未确定。云端自动读取、试用版本与测试者独立操作以执行计划和最新证据为准。[被试操作说明](../docs/participant-guide.md)为待发放前核对的草稿。
+当前已验证的是限定设备上的短段技术链路。戒指时钟偏差、实际样本与参考时段对应、完整采集/下载故障矩阵及逐级长时继续验收，最长支持时长尚未确定。云端自动读取、可用版本交付与测试者独立操作以执行计划和最新证据为准。[被试操作说明](../docs/participant-guide.md)为待发放前核对的草稿。
 
 ## 构建与本地配置
 

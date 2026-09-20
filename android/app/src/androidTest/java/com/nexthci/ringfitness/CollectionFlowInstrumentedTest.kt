@@ -33,6 +33,68 @@ import org.junit.runner.RunWith
 class CollectionFlowInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
 
+    @Test fun stoppedRecordOffersLocalFinishFromHomeAndRecoveryWhileBluetoothReconnects() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            reachReference(scenario, handle)
+            val stopped = session(handle)
+            for (policy in listOf(null, CompletionPolicy.SAVE_LATER)) {
+                val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME,
+                    taskPage = CollectionPage.RECOVERY, isSimulation = false, hasProfile = true,
+                    participantId = stopped.preparation.participantId, placement = stopped.preparation.placement,
+                    session = stopped.copy(completionPolicy = policy), connected = false, connecting = true))
+                renderFixture(scenario, fixture)
+                scenario.onActivity {
+                    val primary = tagged<Button>(it, "flow_primary")
+                    assertEquals(if (policy == null) "继续收尾" else "填写步数", primary.text.toString())
+                    assertTrue(primary.isEnabled)
+                    primary.performClick()
+                }
+                assertEquals(1, fixture.referenceEntries)
+                assertEquals(0, fixture.reconnects)
+                fixture.state = fixture.state.copy(page = CollectionPage.RECOVERY)
+                renderFixture(scenario, fixture)
+                click(scenario, "preserve_reference")
+                assertEquals(2, fixture.referenceEntries)
+                assertEquals(0, fixture.reconnects)
+            }
+        }
+    }
+
+    @Test fun bluetoothRecoveryKeepsTheSameReferenceInputFocusAndCursor() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            reachReference(scenario, handle)
+            val stopped = session(handle)
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.REFERENCE,
+                taskPage = CollectionPage.REFERENCE, isSimulation = false, hasProfile = true,
+                participantId = stopped.preparation.participantId, placement = stopped.preparation.placement,
+                session = stopped, connected = true))
+            renderFixture(scenario, fixture)
+            lateinit var input: EditText
+            scenario.onActivity {
+                input = tagged(it, "flow_steps")
+                input.setText("731")
+                input.requestFocus()
+                input.setSelection(1)
+            }
+            for (connecting in listOf(false, true, false)) {
+                fixture.state = fixture.state.copy(connected = false, connecting = connecting,
+                    canRetry = !connecting, error = if (connecting) "正在连接戒指" else "连接中断")
+                renderFixture(scenario, fixture)
+                scenario.onActivity {
+                    assertSame(input, tagged<EditText>(it, "flow_steps"))
+                    assertTrue(input.hasFocus())
+                    assertEquals("731", input.text.toString())
+                    assertEquals(1, input.selectionStart)
+                    assertTrue(tagged<Button>(it, "flow_primary").isEnabled)
+                }
+            }
+            click(scenario, "flow_primary")
+            assertEquals(Triple("731", "valid", ""), fixture.savedReference)
+        }
+    }
+
     @Test fun deferredSaveReopensWithTheSameZeroAndOnlyUploadsFromTheRecordAction() = withFlow { handle ->
         lateinit var saved: FreeLivingSession
         launch().use { scenario ->
@@ -754,18 +816,19 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_back")
             awaitHeading(scenario, "采集已结束")
             click(scenario, "flow_back")
-            await(scenario, "finish task is available from home") {
-                taggedOrNull<Button>(it, "flow_primary")?.text?.toString() == "继续收尾"
+            await(scenario, "saved finish choice resumes reference entry from home") {
+                taggedOrNull<Button>(it, "flow_primary")?.text?.toString() == "填写步数"
             }
-            scenario.onActivity { assertEquals("继续收尾", tagged<Button>(it, "flow_primary").text.toString()) }
+            awaitHeading(scenario, "待填写步数")
+            assertEquals(CompletionPolicy.SAVE_UPLOAD, session(handle).completionPolicy)
             captureReviewScreen(scenario, "reference_pending_home")
         }
         launch().use { reopened ->
-            awaitHeading(reopened, "采集已结束")
+            awaitHeading(reopened, "待填写步数")
             click(reopened, "flow_primary")
-            chooseSaveAfterStop(reopened)
             awaitHeading(reopened, "填写计步器读数")
             assertEquals(id, session(handle).sessionId)
+            assertEquals(CompletionPolicy.SAVE_UPLOAD, session(handle).completionPolicy)
             assertNull(session(handle).reference)
             assertFalse(handle.flow.state.canStart)
             type(reopened, "flow_steps", "127")
@@ -1032,6 +1095,7 @@ class CollectionFlowInstrumentedTest {
     /** Rendering checks share the native Activity while isolating all collection and network calls. */
     private class RenderingFlow(override var state: CollectionFlowState) : CollectionFlow {
         var reconnects = 0
+        var referenceEntries = 0
         var protectiveStops = 0
         val uploadRetries = mutableListOf<String>()
         val endedStartAttempts = mutableListOf<String>()
@@ -1050,7 +1114,7 @@ class CollectionFlowInstrumentedTest {
             check(state.canStopUnconfirmedStart) { "Unexpected stop" }
             protectiveStops++
         }
-        override fun enterReference() = error("Unexpected navigation")
+        override fun enterReference() { referenceEntries++ }
         override fun retry() = error("Unexpected retry")
         override fun endStartAttempt(reason: String) { endedStartAttempts += reason }
         override fun retryUpload(sessionId: String) { uploadRetries += sessionId }

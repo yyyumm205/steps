@@ -13,8 +13,11 @@ import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.nio.file.Files
 
-/** Bridge lifecycle only: fake Context intercepts service starts; no Activity, BLE or files. */
+/** Emulator-only bridge lifecycle; real owner/file fixtures replace BLE and serial scheduling. */
 @RunWith(AndroidJUnit4::class)
 class RealCollectionBridgeInstrumentedTest {
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
@@ -266,6 +269,229 @@ class RealCollectionBridgeInstrumentedTest {
         assertEquals(2, context.requests)
         assertFalse(RealCollectionBridge.isRunning())
     }
+
+    @Test fun leavingBeforeOwnerInitializationReleasesOnceItBecomesIdle() = withIdleBridge {
+        OwnerFixture().use { f ->
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            f.runWorker()
+            assertTrue(RealCollectionBridge.isRunning())
+            assertEquals(0, f.releases)
+
+            f.owner.initialize()
+            f.runWorker()
+            assertFalse(RealCollectionBridge.isRunning())
+            assertEquals(1, f.releases)
+            assertNull(f.store.read())
+        }
+    }
+
+    @Test fun leavingDuringDownloadReleasesAfterLocalCommitWhileUploadRemainsInFlight() = withIdleBridge {
+        OwnerFixture().use { f ->
+            f.beginDownload()
+            val sessionId = requireNotNull(f.store.readPending()).sessionId
+            val disconnects = f.port.disconnects
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            f.runWorker()
+            assertTrue(RealCollectionBridge.isRunning())
+            assertEquals(disconnects, f.port.disconnects)
+            assertNull(f.store.readPending()!!.localData)
+
+            f.finishDownload()
+            assertNull(f.store.readPending())
+            assertNotNull(f.store.read(sessionId)!!.localData)
+            assertTrue(f.uploads.isInFlight(sessionId))
+            f.runWorker()
+
+            assertFalse("Preparation can change ring/placement once its background download is safe", RealCollectionBridge.isRunning())
+            assertEquals(1, f.releases)
+            assertEquals(disconnects + 1, f.port.disconnects)
+            assertTrue("Releasing collection leaves the independent upload alive", f.uploads.isInFlight(sessionId))
+            assertEquals(listOf(sessionId), f.uploads.requests)
+            assertEquals(17L, f.store.read(sessionId)!!.reference!!.steps)
+            RealCollectionBridge.publish(f.token, f.owner.state)
+            f.runWorker()
+            assertEquals("Late completion callbacks cannot release twice", 1, f.releases)
+        }
+    }
+
+    @Test fun reopeningAfterDownloadCancelsTheAlreadyQueuedRelease() = withIdleBridge {
+        OwnerFixture().use { f ->
+            f.beginDownload()
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            f.runWorker()
+            f.finishDownload()
+            assertTrue("Completion has queued another release attempt", f.hasWorkerTasks())
+
+            val nextPage = Any()
+            RealCollectionBridge.ensureStarted(f.context, nextPage)
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            val disconnects = f.port.disconnects
+            f.runWorker()
+            assertTrue(RealCollectionBridge.isRunning())
+            assertEquals(0, f.releases)
+            assertEquals(disconnects, f.port.disconnects)
+            assertTrue(f.owner.canReleaseIfIdle())
+
+            RealCollectionBridge.releaseIfIdle(nextPage)
+            f.runWorker()
+            assertFalse(RealCollectionBridge.isRunning())
+            assertEquals(1, f.releases)
+        }
+    }
+
+    @Test fun aQueuedIdlePublicationCannotReleaseANewerPendingCapture() = withIdleBridge {
+        OwnerFixture().use { f ->
+            f.beginDownload()
+            val previousSession = requireNotNull(f.store.readPending()).sessionId
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            f.runWorker()
+            f.finishDownload()
+            assertTrue(f.hasWorkerTasks())
+
+            val nextPage = Any()
+            RealCollectionBridge.ensureStarted(f.context, nextPage)
+            // The next owner's operation is already running when an older progress callback arrives.
+            f.owner.home()
+            f.owner.selectActivity(SessionActivity.RUNNING)
+            f.owner.start()
+            f.observe(f.stopped(), listOf(f.finalRecord))
+            val nextSession = requireNotNull(f.store.readPending())
+            assertNotEquals(previousSession, nextSession.sessionId)
+            assertEquals(SessionActivity.RUNNING, nextSession.activity)
+            assertFalse(f.owner.canReleaseIfIdle())
+            RealCollectionBridge.releaseIfIdle(nextPage)
+            val disconnects = f.port.disconnects
+            f.runWorker()
+
+            assertTrue(RealCollectionBridge.isRunning())
+            assertEquals(0, f.releases)
+            assertEquals(disconnects, f.port.disconnects)
+            assertEquals(nextSession.sessionId, f.store.readPending()!!.sessionId)
+            assertTrue(f.uploads.isInFlight(previousSession))
+        }
+    }
+
+    /** The queue models the service worker; all release attempts read the actual owner's current state. */
+    private inner class OwnerFixture : AutoCloseable {
+        val token = Any()
+        val context = FakeStartContext()
+        private val directory = Files.createTempDirectory(instrumentation.targetContext.cacheDir.toPath(), "bridge-owner-").toFile()
+        private val ring = PreparedRing("AA:BB:CC:DD:EE:07", "Bridge fixture")
+        private var now = 1_789_804_800_000L
+        private val firstPacket = imu(2, 1_000)
+        private val payload = firstPacket + imu(3, 1_060)
+        private val initialRecord = HealthMessage.ListItem(7, firstPacket.size.toLong(), 1, 900, now)
+        val finalRecord = initialRecord.copy(bytes = payload.size.toLong(), records = 2)
+        private val preparation = PreparationStore(File(directory, "profile")).apply {
+            register("bridge001", RingPlacement.LEFT_INDEX)
+            selectRing(ring)
+        }
+        val store = FreeLivingSessionStore(File(directory, "session.json"))
+        val port = FixturePort()
+        val uploads = FixtureUploads()
+        private val workerTasks = ArrayDeque<() -> Unit>()
+        private val errors = mutableListOf<Exception>()
+        var releases = 0
+            private set
+        val owner = RealCollectionController(directory, preparation, store, port,
+            CollectionScheduler { delay, action ->
+                if (delay in setOf(500L, 1_000L, 5_000L)) action()
+            }, object : CaptureClock {
+                override fun nowEpochMs() = now
+                override fun nowElapsedMs() = now - 1_789_804_790_000L
+                override fun timeZoneId() = "Asia/Shanghai"
+            }, uploads = uploads, reportError = { errors += it })
+        private val subscription: AutoCloseable
+
+        init {
+            RealCollectionBridge.ensureStarted(context, pageLease)
+            RealCollectionBridge.begin(token)
+            subscription = owner.observe { RealCollectionBridge.publish(token, it) }
+            RealCollectionBridge.attach(token, { action -> workerTasks.addLast { action(owner) } }, {
+                workerTasks.addLast {
+                    if (owner.canReleaseIfIdle() && RealCollectionBridge.beginRelease(token)) {
+                        owner.close()
+                        releases++
+                        RealCollectionBridge.detach(token)
+                    }
+                }
+            })
+        }
+
+        fun hasWorkerTasks() = workerTasks.isNotEmpty()
+        fun runWorker() {
+            while (workerTasks.isNotEmpty()) workerTasks.removeFirst().invoke()
+            assertTrue("Controller operations should succeed: $errors", errors.isEmpty())
+        }
+
+        private fun idle() = HealthMessage.Status(false, 0, 0, 0, 6)
+        fun stopped() = HealthMessage.Status(false, finalRecord.bytes, finalRecord.records, 0, 7)
+        fun observe(status: HealthMessage.Status, records: List<HealthMessage.ListItem> = emptyList()) {
+            health(status)
+            records.forEach(::health)
+            health(HealthMessage.ListEnd(records.size))
+        }
+
+        private fun health(message: HealthMessage) = owner.onHealth(port.generation, SensorPacket.Health(message, ++now))
+
+        fun beginDownload() {
+            owner.initialize()
+            owner.onConnected(port.generation)
+            observe(idle())
+            owner.selectActivity(SessionActivity.WALKING)
+            owner.start()
+            observe(idle())
+            observe(HealthMessage.Status(true, initialRecord.bytes, initialRecord.records, 0, 7), listOf(initialRecord))
+            now += 60_000
+            owner.stop()
+            observe(stopped(), listOf(finalRecord))
+            owner.chooseFinish(true)
+            owner.saveReference("17", "valid", "")
+            observe(stopped(), listOf(finalRecord))
+            assertEquals("errors=$errors", CollectionPage.DOWNLOADING, owner.state.taskPage)
+            assertFalse(owner.canReleaseIfIdle())
+        }
+
+        fun finishDownload() {
+            health(HealthMessage.DataChunk(0, payload))
+            health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            assertTrue("Download and durable commit should succeed: $errors", errors.isEmpty())
+        }
+
+        override fun close() {
+            subscription.close()
+            owner.close()
+            RealCollectionBridge.detach(token)
+            check(directory.deleteRecursively())
+        }
+    }
+
+    private class FixturePort : RealCollectionPort {
+        var generation = 0L
+        var disconnects = 0
+        override fun connect(ring: PreparedRing, generation: Long): Boolean { this.generation = generation; return true }
+        override fun disconnect() { disconnects++ }
+        override fun queryStatus() = true
+        override fun queryBattery() = true
+        override fun queryRecords() = true
+        override fun start() = true
+        override fun stop() = true
+        override fun read(sessionId: Int, offset: Long, length: Int) = true
+    }
+
+    private class FixtureUploads : RealUploadPort {
+        val requests = mutableListOf<String>()
+        private val inFlight = mutableSetOf<String>()
+        override fun enqueue(sessionId: String, retry: Boolean) { requests += sessionId; inFlight += sessionId }
+        override fun isInFlight(sessionId: String) = sessionId in inFlight
+        override fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) { inFlight -= sessionId }
+    }
+
+    private fun imu(count: Int, uptime: Long): ByteArray = ByteArrayOutputStream().apply {
+        write(0x32); write(0x12); write(count)
+        repeat(4) { write((uptime ushr (it * 8)).toInt()) }
+        repeat(count * 6) { write(it + 1) }
+    }.toByteArray()
 
     private fun withIdleBridge(test: () -> Unit) {
         assumeTrue("Explicit collection opt-in is required",

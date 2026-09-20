@@ -306,7 +306,7 @@ object RealCollectionBridge : CollectionFlow {
         restartContext = null
         release?.invoke()
     }
-    internal fun shouldRelease(token: Any) = owner === token && releasePending
+    internal fun shouldRelease(token: Any) = owner === token && pageLease == null && releasePending
     internal fun beginRelease(token: Any): Boolean {
         if (!shouldRelease(token) || retiring != null) return false
         beginDestroy(token)
@@ -344,7 +344,12 @@ object RealCollectionBridge : CollectionFlow {
         publish(state.copy(busy = false, connecting = false, connected = false, canStart = false, canStop = false))
     }
     internal fun publish(token: Any, next: CollectionFlowState) {
-        if (owner === token && retiring !== token) publish(next)
+        if (owner !== token || retiring === token) return
+        publish(next)
+        // Leaving during capture/download keeps the release request alive. Retry when the
+        // owner publishes progress; the serial worker checks its current pending work and
+        // beginRelease rechecks the page lease before closing the connection.
+        if (shouldRelease(token)) release?.invoke()
     }
     private fun publishWaiting() = publish(state.copy(busy = true, connecting = true,
         connected = false, canStart = false, canStop = false, canRetry = false, canEndStartAttempt = false))

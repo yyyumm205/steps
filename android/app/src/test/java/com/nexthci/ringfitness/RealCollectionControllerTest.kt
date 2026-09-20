@@ -758,6 +758,56 @@ class RealCollectionControllerTest {
         assertEquals(1, f.port.count("stop"))
     }
 
+    @Test fun confirmedStopKeepsFinishAndReferenceAvailableWhileDisconnectedAndReconnecting() = Fixture().use { f ->
+        f.beginCollecting()
+        f.owner.stop()
+        f.observe(stopped(), listOf(finalRecord))
+        val stoppedSession = requireNotNull(f.store.readPending())
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertFalse(f.owner.state.busy)
+        f.runDelay(3_000)
+        assertTrue(f.owner.state.connecting)
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertFalse(f.owner.state.busy)
+        f.owner.chooseFinish(false)
+        assertEquals(CollectionPage.REFERENCE, f.owner.state.page)
+        f.owner.saveReference("73", "valid", "")
+        val saved = requireNotNull(f.store.readPending())
+        assertEquals(stoppedSession.sessionId, saved.sessionId)
+        assertEquals(stoppedSession.stopConfirmedAtMs, saved.stopConfirmedAtMs)
+        assertEquals(73L, saved.reference!!.steps)
+        assertEquals(CompletionPolicy.SAVE_LATER, saved.completionPolicy)
+        assertTrue(f.port.reads.isEmpty())
+        f.reopen()
+        assertEquals(saved.reference, f.store.readPending()!!.reference)
+        assertEquals(CompletionPolicy.SAVE_LATER, f.store.readPending()!!.completionPolicy)
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.finishDownload()
+        assertEquals(saved.reference, f.store.read()!!.reference)
+        assertEquals(0, f.store.read()!!.transfer.attempts)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun referenceFormRemainsAvailableThroughAReconnectTimeoutAndProcessRestart() = Fixture().use { f ->
+        f.reachReference()
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        assertEquals(CollectionPage.REFERENCE, f.owner.state.page)
+        f.reopen()
+        assertEquals(CollectionPage.REFERENCE, f.owner.state.page)
+        assertFalse(f.owner.state.busy)
+        f.runAllDelays(30_000)
+        assertFalse(f.owner.state.connecting)
+        assertEquals(CollectionPage.REFERENCE, f.owner.state.page)
+        f.owner.saveReference("0", "valid", "")
+        assertEquals(0L, f.store.readPending()!!.reference!!.steps)
+        assertFalse(f.owner.state.busy)
+        assertTrue(f.owner.state.canRetry)
+        assertTrue(f.port.reads.isEmpty())
+    }
+
     @Test fun changedRecordCannotBeDownloadedUnderTheOriginalReference() = Fixture().use { f ->
         f.reachReference()
         f.saveReference("71", "valid", "")
@@ -1490,6 +1540,13 @@ class RealCollectionControllerTest {
             val index = scheduled.indexOfFirst { it.first == delay }
             check(index >= 0) { "Expected a scheduled wait" }
             scheduled.removeAt(index).second()
+        }
+
+        fun runAllDelays(delay: Long) {
+            val due = scheduled.filter { it.first == delay }
+            check(due.isNotEmpty()) { "Expected scheduled waits" }
+            scheduled.removeAll(due.toSet())
+            due.forEach { it.second() }
         }
 
         fun connectReady() {
