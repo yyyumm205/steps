@@ -178,6 +178,28 @@ class DeviceRecordBackupStoreTest {
         assertFalse(directory.exists())
     }
 
+    @Test fun unknownClockRereadsUseIndependentOriginalsEvenWithTheSameDescriptor() {
+        val directory = directory()
+        val store = store(directory)
+        val unknown = record.copy(unixMs = 0)
+        val attempts = listOf(java.util.UUID.randomUUID().toString(), java.util.UUID.randomUUID().toString())
+        val variants = listOf(payload, payload.copyOf().apply { this[lastIndex] = (this[lastIndex] + 1).toByte() })
+        val hashes = attempts.zip(variants).map { (id, bytes) ->
+            store.open(address, unknown, id).use { download ->
+                assertEquals(0L, download.nextOffset)
+                download.append(HealthMessage.DataChunk(0, bytes))
+                val completed = download.finish(end())
+                store.accept(address, unknown, completed, now, id)
+                download.releaseTemporary()
+                store.verifyUnknown(address, unknown, id).sha256
+            }
+        }
+        assertEquals(2, hashes.toSet().size)
+        assertEquals(hashes, attempts.map { store.verifyUnknown(address, unknown, it).sha256 })
+        assertThrows(IllegalArgumentException::class.java) { store.isPreserved(address, unknown) }
+        assertEquals(2, directory.listFiles()!!.size)
+    }
+
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
         .joinToString("") { "%02x".format(it.toInt() and 0xff) }
 }

@@ -84,7 +84,7 @@ object PhoneClockSync {
         }
     }
 
-    private fun validate(evidence: PhoneClockSyncEvidence) {
+    fun validate(evidence: PhoneClockSyncEvidence) {
         validateUuid(evidence.attemptId)
         require(addressPattern.matches(evidence.ringAddress) && evidence.connectionGeneration > 0) {
             "校时连接信息无效"

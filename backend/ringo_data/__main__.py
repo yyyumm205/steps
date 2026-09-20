@@ -15,7 +15,7 @@ from .cloud import CloudConfig, CloudSync
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Validate and import frozen free-living activity ZIPs")
+    parser = argparse.ArgumentParser(description="Validate and import frozen activity collection ZIPs")
     commands = parser.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("import", help="validate, preserve and decode local archives")
     ingest.add_argument("archives", nargs="+", type=Path)

@@ -140,7 +140,8 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
         return [manifest["session_id"], manifest["participant_id"], source_path.name, header.session_id,
                 "", "", uptime, packet_uptime, uptime - stats["first_uptime_ms"], anchor_delta,
                 estimated, iso(estimated), "uncalibrated_device_clock", packet_index, sequence,
-                stats["samples"], "free_living", "", "unlabelled", "none"]
+                stats["samples"], manifest["activity_code"], "", manifest["activity_label_status"],
+                manifest["activity_label_source"]]
 
     with source_path.open("rb") as source:
         source.seek(HEADER_SIZE)

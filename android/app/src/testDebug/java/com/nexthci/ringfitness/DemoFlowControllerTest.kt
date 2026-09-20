@@ -14,6 +14,154 @@ class DemoFlowControllerTest {
     @get:Rule val temporary = TemporaryFolder()
     private data class Task(val time: Long, val order: Long, val action: () -> Unit)
 
+    @Test fun confirmedStopRestoresTheFinishChoiceWithoutInventingAReferenceOrTransfer() {
+        val f = Fixture()
+        f.begin()
+        f.stopAtFinish()
+        val stopped = f.store.read()!!
+        assertNotNull(stopped.stopConfirmedAtMs)
+        assertNull(stopped.completionPolicy)
+        assertNull(stopped.reference)
+        assertNull(stopped.localData)
+        f.restart(); f.drain()
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        assertEquals(stopped, f.store.read())
+        f.flow.chooseFinish(false)
+        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+        assertEquals(CompletionPolicy.SAVE_LATER, f.store.read()!!.completionPolicy)
+        f.restart()
+        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+        assertNull(f.store.read()!!.reference)
+    }
+
+    @Test fun deferredZeroSurvivesDownloadAndProcessRestartUntilExplicitUpload() {
+        val f = Fixture()
+        f.begin(SessionActivity.RUNNING); f.stopAtFinish()
+        f.flow.chooseFinish(false)
+        f.flow.saveReference("0"); f.advance(350)
+        val id = f.store.read()!!.sessionId
+        assertEquals(CompletionPolicy.SAVE_LATER, f.store.read()!!.completionPolicy)
+        assertEquals(0L, f.store.read()!!.reference!!.steps)
+        f.restart(); f.drain()
+        val saved = f.store.read()!!
+        assertEquals(id, saved.sessionId)
+        assertEquals(SessionActivity.RUNNING, saved.activity)
+        assertNotNull(saved.localData)
+        assertEquals(0, saved.transfer.attempts)
+        assertNull(saved.transfer.receipt)
+        assertEquals(CollectionPage.COMPLETE, f.flow.state.page)
+        assertTrue(f.flow.state.canStart)
+        f.flow.home(); f.flow.reconnect(); f.restart(); f.drain()
+        assertEquals(saved, f.store.read())
+        assertTrue(f.flow.state.records.single().uploadDeferred)
+        f.flow.retryUpload(id); f.drain()
+        assertEquals(CompletionPolicy.SAVE_UPLOAD, f.store.read()!!.completionPolicy)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(saved.reference, f.store.read()!!.reference)
+        assertEquals(saved.localData, f.store.read()!!.localData)
+    }
+
+    @Test fun archivedDeferredSessionStaysLocalWhileTheNextSessionUploadsAndRestarts() {
+        val f = Fixture()
+        f.begin(); f.stopAtFinish(); f.flow.chooseFinish(false)
+        f.flow.saveReference("8"); f.drain()
+        val first = f.store.read()!!
+        val firstRaw = File(f.directory, first.localData!!.files.single().fileName).readBytes()
+        f.complete("23")
+        val second = f.store.read()!!
+        f.restart(); f.drain()
+        assertEquals(first, f.store.read(first.sessionId))
+        assertEquals(SessionTransferStatus.COMPLETE, second.transfer.status)
+        assertEquals(second, f.store.read())
+        f.flow.retryUpload(first.sessionId); f.drain()
+        assertEquals(second, f.store.read())
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read(first.sessionId)!!.transfer.status)
+        assertArrayEquals(firstRaw, File(f.directory, first.localData.files.single().fileName).readBytes())
+    }
+
+    @Test fun everyNewSessionRequiresAFreshActivityChoiceAndFreezesItsOwnSelection() {
+        val f = Fixture()
+        assertNull(f.flow.state.selectedActivity)
+        f.flow.start(); f.drain()
+        assertNull(f.store.read())
+        f.begin(SessionActivity.WALKING)
+        assertNull(f.flow.state.selectedActivity)
+        f.flow.selectActivity(SessionActivity.RUNNING)
+        assertEquals(SessionActivity.WALKING, f.store.read()!!.activity)
+        assertNull(f.flow.state.selectedActivity)
+        f.stop(); f.flow.saveReference("12"); f.drain()
+        val first = f.store.read()!!
+        f.flow.home(); f.flow.start(); f.drain()
+        assertEquals(first, f.store.read())
+        assertEquals(1, f.store.listSessions().size)
+        f.begin(SessionActivity.RUNNING)
+        assertEquals(SessionActivity.RUNNING, f.store.read()!!.activity)
+        assertEquals(SessionActivity.WALKING, f.store.read(first.sessionId)!!.activity)
+        assertNull(f.flow.state.selectedActivity)
+    }
+
+    @Test fun discardNeedsNoReadingAndKeepsOtherSavedFilesAndReceiptAcrossRestart() {
+        val f = Fixture()
+        f.complete("73")
+        val first = f.store.read()!!
+        val preserved = f.directory.listFiles()!!.filter { it.name.startsWith(first.sessionId) }
+            .associate { it.name to it.readBytes() }
+        f.begin(SessionActivity.RUNNING); f.stopAtFinish()
+        val discardedId = f.store.read()!!.sessionId
+        f.flow.discardSession(); f.drain()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertTrue(f.flow.state.canStart)
+        assertTrue(f.store.read(discardedId)!!.isDiscarded)
+        assertNull(f.store.read(discardedId)!!.reference)
+        assertNull(f.store.read(discardedId)!!.localData)
+        assertNull(f.store.read(discardedId)!!.transfer.receipt)
+        assertEquals(listOf(first.sessionId), f.flow.state.records.map { it.sessionId })
+        f.restart(); f.flow.reconnect(); f.drain()
+        assertEquals(CollectionPage.HOME, f.flow.state.page)
+        assertTrue(f.flow.state.canStart)
+        assertEquals(first, f.store.read(first.sessionId))
+        preserved.forEach { (name, bytes) -> assertArrayEquals(name, bytes, File(f.directory, name).readBytes()) }
+        f.begin()
+        assertNotEquals(discardedId, f.store.read()!!.sessionId)
+        assertTrue(f.store.read(discardedId)!!.isDiscarded)
+    }
+
+    @Test fun finishChoiceCommitFailureKeepsTheUnchosenSessionAndCanRetryAfterRestart() {
+        val f = Fixture()
+        f.begin(); f.stopAtFinish()
+        val stopped = f.store.read()!!
+        f.failNextSessionCommit = true
+        f.flow.chooseFinish(false)
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        assertNotNull(f.flow.state.error)
+        assertEquals(stopped, f.store.read())
+        f.restart()
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        f.flow.chooseFinish(false)
+        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+        assertEquals(CompletionPolicy.SAVE_LATER, f.store.read()!!.completionPolicy)
+        assertEquals(stopped.sessionId, f.store.read()!!.sessionId)
+    }
+
+    @Test fun discardCommitFailurePreservesStoppedEvidenceAndRetriesTheSameSession() {
+        val f = Fixture()
+        f.begin(); f.stopAtFinish()
+        val stopped = f.store.read()!!
+        val device = File(f.directory, "device.json").readBytes()
+        f.failNextSessionCommit = true
+        f.flow.discardSession()
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        assertEquals(stopped, f.store.read())
+        assertArrayEquals(device, File(f.directory, "device.json").readBytes())
+        assertFalse(f.flow.state.canStart)
+        f.restart(); f.flow.discardSession(); f.drain()
+        assertTrue(f.store.read(stopped.sessionId)!!.isDiscarded)
+        assertTrue(f.flow.state.canStart)
+        assertTrue(f.flow.state.records.isEmpty())
+        assertArrayEquals(device, File(f.directory, "device.json").readBytes())
+    }
+
     @Test fun normalFlowPersistsOneReferenceBeforeSyntheticTransferAndRecoversAfterRestart() {
         val f = Fixture()
         f.begin()
@@ -139,7 +287,7 @@ class DemoFlowControllerTest {
     @Test fun startTimeoutRecoveryQueriesDurableDemoEvidenceWithoutRestartingCapture() {
         val f = Fixture()
         f.flow.setFault(FlowTestFault.START_TIMEOUT)
-        f.flow.start(); f.drain()
+        f.startWalking(); f.drain()
         assertEquals(CollectionPage.RECOVERY, f.flow.state.page)
         val deviceBefore = File(f.directory, "device.json").readBytes()
         val id = f.store.read()!!.sessionId
@@ -167,7 +315,19 @@ class DemoFlowControllerTest {
         assertNull(f.store.read()!!.endedAtMs)
         f.flow.retry(); f.drain()
         assertArrayEquals(stoppedDevice, File(f.directory, "device.json").readBytes())
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        assertNull(f.store.read()!!.completionPolicy)
+        assertNull(f.store.read()!!.localData)
+        assertEquals(0, f.store.read()!!.transfer.attempts)
+        val reference = f.store.read()!!.reference
+        f.restart()
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        f.flow.chooseFinish(false); f.drain()
         assertEquals(CollectionPage.COMPLETE, f.flow.state.page)
+        assertEquals(reference, f.store.read()!!.reference)
+        assertEquals(CompletionPolicy.SAVE_LATER, f.store.read()!!.completionPolicy)
+        assertEquals(0, f.store.read()!!.transfer.attempts)
+        assertNull(f.store.read()!!.transfer.receipt)
         assertEquals(ReferenceStatus.UNRELIABLE, f.store.read()!!.reference!!.status)
         assertFalse(f.store.read()!!.deviceRecordEvidence!!.status.collecting)
         assertNull(f.store.read()!!.endedAtMs)
@@ -257,7 +417,7 @@ class DemoFlowControllerTest {
     @Test fun restartAtStartAndStopRequestsAdoptsOnlyTheMatchingSyntheticEvidence() {
         val f = Fixture()
         f.flow.setFault(FlowTestFault.START_TIMEOUT)
-        f.flow.start(); f.advance(1100) // Complete preflight plus the 500 ms start settling window.
+        f.startWalking(); f.advance(1100) // Complete preflight plus the 500 ms start settling window.
         assertEquals(FreeLivingSessionPhase.START_REQUESTED, f.store.read()!!.phase)
         val id = f.store.read()!!.sessionId
         val startedDevice = File(f.directory, "device.json").readBytes()
@@ -270,7 +430,7 @@ class DemoFlowControllerTest {
         assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, f.store.read()!!.phase)
         val stoppedDevice = File(f.directory, "device.json").readBytes()
         f.restart()
-        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
         assertEquals(id, f.store.read()!!.sessionId)
         assertArrayEquals(stoppedDevice, File(f.directory, "device.json").readBytes())
     }
@@ -281,7 +441,7 @@ class DemoFlowControllerTest {
         val original = f.store.read()!!
         val before = File(f.directory, "device.json").readBytes()
         File(f.directory, original.localData!!.files.single().fileName).appendText("corrupt")
-        f.flow.start()
+        f.startWalking()
         assertEquals(CollectionPage.ERROR, f.flow.state.page)
         assertEquals(original.sessionId, f.store.read()!!.sessionId)
         assertArrayEquals(before, File(f.directory, "device.json").readBytes())
@@ -289,7 +449,7 @@ class DemoFlowControllerTest {
 
     @Test fun homeDuringPendingConfirmationDoesNotIssueASecondStart() {
         val f = Fixture()
-        f.flow.start()
+        f.startWalking()
         f.flow.home()
         f.flow.start()
         f.drain()
@@ -361,7 +521,7 @@ class DemoFlowControllerTest {
         f.begin(); f.stop(); f.flow.saveReference("41"); f.advance(1550)
         val firstId = f.store.read()!!.sessionId
         assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
-        f.flow.home(); f.flow.start(); f.advance(2700) // Preflight, start/poll waits, then a complete STATUS/LIST.
+        f.flow.home(); f.startWalking(); f.advance(2700) // Preflight, start/poll waits, then a complete STATUS/LIST.
         val secondId = f.store.read()!!.sessionId
         assertNotEquals(firstId, secondId)
         assertEquals(CollectionPage.COLLECTING, f.flow.state.page)
@@ -375,7 +535,7 @@ class DemoFlowControllerTest {
 
     @Test fun homeDuringPreflightShowsStartingAndCannotOfferAnotherStartBeforeASessionExists() {
         val f = Fixture()
-        f.flow.start()
+        f.startWalking()
         assertNull(f.store.read())
         f.flow.home()
         assertEquals(CollectionPage.HOME, f.flow.state.page)
@@ -393,7 +553,7 @@ class DemoFlowControllerTest {
 
     @Test fun homeDoesNotHideAsynchronousTaskProgressOrNavigateAwayFromHome() {
         val f = Fixture()
-        f.flow.start()
+        f.startWalking()
         f.flow.home()
         f.drain()
         assertEquals(CollectionPage.HOME, f.flow.state.page)
@@ -419,7 +579,7 @@ class DemoFlowControllerTest {
         assertEquals(scheduled, f.scheduledCount)
         assertArrayEquals(deviceBefore, File(f.directory, "device.json").readBytes())
         f.drain()
-        assertEquals(CollectionPage.REFERENCE, f.flow.state.page)
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
     }
 
     @Test fun returningHomeWhileSavingRetainsTheInFlightReferenceAndDoesNotReopenItsForm() {
@@ -466,7 +626,7 @@ class DemoFlowControllerTest {
     @Test fun homeShowsConfirmationTimeoutAndReconnectRecoveryWithoutResendingStart() {
         val f = Fixture()
         f.flow.setFault(FlowTestFault.START_TIMEOUT)
-        f.flow.start(); f.flow.home(); f.drain()
+        f.startWalking(); f.flow.home(); f.drain()
         assertEquals(CollectionPage.HOME, f.flow.state.page)
         assertEquals(CollectionPage.RECOVERY, f.flow.state.taskPage)
         val before = File(f.directory, "device.json").readBytes()
@@ -486,7 +646,7 @@ class DemoFlowControllerTest {
         f.begin(); f.stop(); f.flow.saveReference("41"); f.advance(2450)
         val firstId = f.store.read()!!.sessionId
         assertEquals(CollectionPage.UPLOADING, f.flow.state.page)
-        f.flow.home(); f.flow.start(); f.flow.home()
+        f.flow.home(); f.startWalking(); f.flow.home()
         f.advance(300)
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read(firstId)!!.transfer.status)
         assertEquals(CollectionPage.HOME, f.flow.state.page)
@@ -513,6 +673,7 @@ class DemoFlowControllerTest {
         val directory = File(parent, "collection-demo")
         var now = 1_789_804_800_000L
         var failNextUploadCommit = false
+        var failNextSessionCommit = false
         var rejectNextDelay: Long? = null
         var rejectUploadScheduling = false
         var uploadExtraDelayMs = 0L
@@ -542,13 +703,25 @@ class DemoFlowControllerTest {
                 val extra = if (delay == 1200L && store.read()?.transfer?.status == SessionTransferStatus.TRANSFERRING) uploadExtraDelayMs else 0L
                 tasks += Task(now + delay + extra, order++, action)
             }, clock, syncDirectory = {}, beforeSessionCommit = { source ->
+                if (failNextSessionCommit) {
+                    failNextSessionCommit = false
+                    throw IOException("test session journal failure")
+                }
                 if (failNextUploadCommit && source.readText().contains("transferring")) {
                     failNextUploadCommit = false
                     throw IOException("test upload journal failure")
                 }
             })
-        fun begin() { flow.start(); drain(); assertEquals(CollectionPage.COLLECTING, flow.state.page) }
-        fun stop() { flow.stop(); drain(); assertEquals(CollectionPage.REFERENCE, flow.state.page) }
+        fun startWalking() { flow.selectActivity(SessionActivity.WALKING); flow.start() }
+        fun begin(activity: SessionActivity = SessionActivity.WALKING) {
+            flow.selectActivity(activity); flow.start(); drain()
+            assertEquals(CollectionPage.COLLECTING, flow.state.page)
+        }
+        fun stopAtFinish() { flow.stop(); drain(); assertEquals(CollectionPage.FINISH, flow.state.page) }
+        fun stop() {
+            stopAtFinish(); flow.chooseFinish(true)
+            assertEquals(CollectionPage.REFERENCE, flow.state.page)
+        }
         fun complete(steps: String, status: String = "valid", reason: String = "") {
             begin(); stop(); flow.saveReference(steps, status, reason); drain()
             assertEquals(CollectionPage.COMPLETE, flow.state.page)

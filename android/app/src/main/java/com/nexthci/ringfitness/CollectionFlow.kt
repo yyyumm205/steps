@@ -2,7 +2,7 @@ package com.nexthci.ringfitness
 
 /** UI contract shared by the native collection pages and their environment-specific owner. */
 enum class CollectionPage {
-    HOME, STARTING, COLLECTING, STOPPING, REFERENCE, SAVING, DOWNLOADING, UPLOADING, COMPLETE, RECOVERY, ERROR,
+    HOME, STARTING, COLLECTING, STOPPING, FINISH, REFERENCE, SAVING, DOWNLOADING, UPLOADING, COMPLETE, RECOVERY, ERROR,
 }
 
 enum class FlowTestFault { NONE, START_TIMEOUT, STOP_TIMEOUT, SAVE_FAILURE, DOWNLOAD_FAILURE, UPLOAD_FAILURE }
@@ -15,6 +15,8 @@ data class FlowRecordSummary(
     val localComplete: Boolean,
     val transferInFlight: Boolean = false,
     val localReviewRequired: Boolean = false,
+    val activity: SessionActivity = SessionActivity.FREE_LIVING,
+    val uploadDeferred: Boolean = false,
 )
 
 data class CollectionFlowState(
@@ -36,10 +38,12 @@ data class CollectionFlowState(
     val referenceStatus: String? = null,
     val canStart: Boolean = false,
     val canStop: Boolean = false,
+    val canStopUnconfirmedStart: Boolean = false,
     val canRetry: Boolean = false,
     val canEndStartAttempt: Boolean = false,
     val records: List<FlowRecordSummary> = emptyList(),
     val fault: FlowTestFault = FlowTestFault.NONE,
+    val selectedActivity: SessionActivity? = null,
 )
 
 interface CollectionFlow {
@@ -47,7 +51,11 @@ interface CollectionFlow {
     fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable
     fun register(participantId: String, placement: RingPlacement)
     fun start()
+    fun selectActivity(activity: SessionActivity) = Unit
     fun stop()
+    fun chooseFinish(uploadNow: Boolean) = Unit
+    fun enterFinish() = Unit
+    fun discardSession() = Unit
     fun enterReference()
     fun saveReference(stepsText: String, status: String = "valid", reason: String = "")
     fun retry()

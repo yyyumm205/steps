@@ -127,6 +127,9 @@ class RealCollectionService : Service() {
                         override fun isInFlight(sessionId: String) = RealUploadScheduler.isInFlight(sessionId)
                         override fun needsLocalReview(sessionId: String) =
                             RealUploadScheduler.queue(applicationContext).needsLocalReview(sessionId)
+                        override fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) {
+                            RealUploadScheduler.discard(applicationContext, sessionId, atMs, ownerId, generation)
+                        }
                     })
                 controller = owner
                 subscription = owner.observe { state ->
@@ -188,6 +191,7 @@ class RealCollectionService : Service() {
             state.preservingExisting -> "正在保存戒指中的已有数据"
             state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
             state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
+            state.taskPage == CollectionPage.FINISH -> "采集已结束，请选择保存方式"
             state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
                 "采集已结束，请填写计步器读数" else "结束状态待确认，可先记录读数"
             state.taskPage == CollectionPage.DOWNLOADING -> "正在保存戒指数据"
@@ -357,7 +361,11 @@ object RealCollectionBridge : CollectionFlow {
     }
     override fun register(participantId: String, placement: RingPlacement) = Unit
     override fun start() { dispatch?.invoke { it.start() } }
+    override fun selectActivity(activity: SessionActivity) { dispatch?.invoke { it.selectActivity(activity) } }
     override fun stop() { dispatch?.invoke { it.stop() } }
+    override fun chooseFinish(uploadNow: Boolean) { dispatch?.invoke { it.chooseFinish(uploadNow) } }
+    override fun enterFinish() { dispatch?.invoke { it.enterFinish() } }
+    override fun discardSession() { dispatch?.invoke { it.discardSession() } }
     override fun enterReference() { dispatch?.invoke { it.enterReference() } }
     override fun saveReference(stepsText: String, status: String, reason: String) { dispatch?.invoke { it.saveReference(stepsText, status, reason) } }
     override fun retry() { dispatch?.invoke { it.retry() } }

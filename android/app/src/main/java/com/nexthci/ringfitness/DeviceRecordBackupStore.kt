@@ -44,14 +44,14 @@ class DeviceRecordBackupStore internal constructor(
         true
     }
 
-    fun open(address: String, record: HealthMessage.ListItem): RealSessionDownload = synchronized(lock) {
-        val folder = folder(address, record)
+    fun open(address: String, record: HealthMessage.ListItem, unknownAttemptId: String? = null): RealSessionDownload = synchronized(lock) {
+        val folder = folder(address, record, unknownAttemptId)
         ensureDirectory(directory, requireNotNull(directory.parentFile))
         ensureDirectory(folder, directory)
         val metadataFile = File(folder, "metadata.json")
         if (!metadataFile.exists()) {
             require(folder.listFiles()?.isEmpty() == true) { "设备备份信息缺失，原文件已保留" }
-            writeAtomic(metadataFile, encodeMetadata(Metadata(UUID.randomUUID().toString(), address, record)))
+            writeAtomic(metadataFile, encodeMetadata(Metadata(unknownAttemptId ?: UUID.randomUUID().toString(), address, record)))
         }
         val metadata = readMetadata(folder, address, record)
         require(!File(folder, "receipt.json").exists()) { "设备记录已备份，请使用已有原文件" }
@@ -60,9 +60,9 @@ class DeviceRecordBackupStore internal constructor(
 
     /** Commit the receipt before the caller releases the downloader's durable partial files. */
     fun accept(address: String, record: HealthMessage.ListItem, completed: RealSessionDownload.Completed,
-        savedAtMs: Long) = synchronized(lock) {
+        savedAtMs: Long, unknownAttemptId: String? = null) = synchronized(lock) {
         require(savedAtMs > 0)
-        val folder = folder(address, record)
+        val folder = folder(address, record, unknownAttemptId)
         val metadata = readMetadata(folder, address, record)
         validateFile(folder, metadata, completed.file)
         require(completed.evidence.payloadBytes == record.bytes && completed.evidence.records == record.records)
@@ -76,13 +76,24 @@ class DeviceRecordBackupStore internal constructor(
         require(verifyReceipt(folder, metadata) == completed.file)
     }
 
-    private fun folder(address: String, record: HealthMessage.ListItem): File {
+    /** This verifies a local original only; its zero clock never identifies a reconnected device record. */
+    fun verifyUnknown(address: String, record: HealthMessage.ListItem, attemptId: String): SessionRawFile = synchronized(lock) {
+        val folder = folder(address, record, attemptId)
+        val metadata = readMetadata(folder, address, record)
+        require(metadata.backupId == attemptId)
+        verifyReceipt(folder, metadata).also { syncDirectory(directory); syncDirectory(requireNotNull(directory.parentFile)) }
+    }
+
+    private fun folder(address: String, record: HealthMessage.ListItem, unknownAttemptId: String? = null): File {
         require(Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$").matches(address))
         require(record.sessionId in 1..65535 && record.bytes in 1..0xFFFF_FFFFL &&
-            record.records in 1..0xFFFF_FFFFL && record.uptimeMs in 1..0xFFFF_FFFFL && record.unixMs > 0) {
+            record.records in 1..0xFFFF_FFFFL && record.uptimeMs in 1..0xFFFF_FFFFL &&
+            ((unknownAttemptId == null && record.unixMs > 0) || (unknownAttemptId != null && record.unixMs == 0L))) {
             "戒指记录指纹不完整，请保留原数据并联系研究者"
         }
-        val key = sha256("$address|${record.sessionId}|${record.bytes}|${record.records}|${record.uptimeMs}|${record.unixMs}".toByteArray())
+        unknownAttemptId?.let { require(UUID.fromString(it).toString() == it) }
+        val key = unknownAttemptId?.let { "unknown-$it" }
+            ?: sha256("$address|${record.sessionId}|${record.bytes}|${record.records}|${record.uptimeMs}|${record.unixMs}".toByteArray())
         return File(directory, key).canonicalFile.also { require(it.parentFile == directory && it.name == key) }
     }
 

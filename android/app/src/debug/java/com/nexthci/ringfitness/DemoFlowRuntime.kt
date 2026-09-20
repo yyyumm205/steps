@@ -53,7 +53,11 @@ object DemoFlowRuntime {
             override fun observe(observer: (CollectionFlowState) -> Unit) = controller.observe(observer)
             override fun register(participantId: String, placement: RingPlacement) { executor.execute { controller.register(participantId, placement) } }
             override fun start() { executor.execute { controller.start() } }
+            override fun selectActivity(activity: SessionActivity) { executor.execute { controller.selectActivity(activity) } }
             override fun stop() { executor.execute { controller.stop() } }
+            override fun chooseFinish(uploadNow: Boolean) { executor.execute { controller.chooseFinish(uploadNow) } }
+            override fun enterFinish() { executor.execute { controller.enterFinish() } }
+            override fun discardSession() { executor.execute { controller.discardSession() } }
             override fun enterReference() { executor.execute { controller.enterReference() } }
             override fun saveReference(stepsText: String, status: String, reason: String) { executor.execute { controller.saveReference(stepsText, status, reason) } }
             override fun retry() { executor.execute { controller.retry() } }

@@ -55,6 +55,17 @@ object RealUploadScheduler {
         schedule(context)
     }
 
+    /** The collection owner commits the tombstone before calling this asynchronous cleanup. */
+    fun discard(context: Context, sessionId: String, atMs: Long, connectionOwnerId: String? = null,
+        connectionGeneration: Long? = null) {
+        val application = context.applicationContext
+        enqueueWorker.execute {
+            runCatching { queue(application).discardSession(sessionId, atMs, connectionOwnerId, connectionGeneration) }
+                .onFailure { Log.e("RingFitnessUpload", "Discarded session cleanup will retry on restore", it) }
+            notifyChanged()
+        }
+    }
+
     private fun schedule(context: Context) {
         val application = context.applicationContext
         main.post {

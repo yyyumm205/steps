@@ -402,7 +402,7 @@ class FreeLivingSessionStoreTest {
         assertEquals(requested, reopened)
         assertEquals(-16, reopened.startBaseline!!.status.errorCode)
         assertEquals(baseline.chargingRecoveryEvidence, reopened.startBaseline.chargingRecoveryEvidence)
-        assertEquals(5, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(9, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
 
         assertThrows(IllegalArgumentException::class.java) {
             openStore(file).confirmStart(requested.sessionId, address, status(true).copy(errorCode = -16), t + 100)
@@ -465,11 +465,15 @@ class FreeLivingSessionStoreTest {
         val envelope = JsonParser.parseString(file.readText()).asJsonObject
         envelope.addProperty("journal_version", 4)
         file.writeText(envelope.toString())
-        editPayloadWithUpdatedDigest(file) { it.getAsJsonObject("start_baseline").remove("charging_recovery_evidence") }
+        editPayloadWithUpdatedDigest(file) {
+            it.remove("completion_policy"); it.remove("discarded"); it.remove("start_abort")
+            it.getAsJsonObject("start_baseline").remove("charging_recovery_evidence")
+            it.getAsJsonObject("start_baseline").remove("unknown_time_start_evidence")
+        }
         assertEquals(requested, openStore(file).read())
         openStore(file).confirmStart(requested.sessionId, address, status(true), t + 100)
         val migrated = JsonParser.parseString(file.readText()).asJsonObject
-        assertEquals(5, migrated["journal_version"].asInt)
+        assertEquals(9, migrated["journal_version"].asInt)
         assertTrue(migrated.getAsJsonObject("session").getAsJsonObject("start_baseline")["charging_recovery_evidence"].isJsonNull)
         assertNull(openStore(file).read()!!.startBaseline!!.chargingRecoveryEvidence)
     }
@@ -484,6 +488,110 @@ class FreeLivingSessionStoreTest {
         assertFalse(archived.isPending)
         assertEquals(-16, archived.startBaseline!!.status.errorCode)
         assertEquals(archived, openStore(file).read())
+    }
+
+    @Test fun selectedActivitySurvivesReopenAndConflictingRepeatCannotOverwriteIt() {
+        listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEach { activity ->
+            val file = file()
+            val store = openStore(file)
+            val requested = store.requestStart(preparation, t, "UTC", activity = activity)
+            val before = file.readBytes()
+            assertEquals(activity, openStore(file).read()!!.activity)
+            assertEquals(requested, store.requestStart(preparation, t + 100, "UTC", activity = activity))
+            SessionActivity.entries.filter { it != activity }.forEach { conflict ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    store.requestStart(preparation, t + 200, "UTC", activity = conflict)
+                }
+            }
+            assertArrayEquals(before, file.readBytes())
+            store.confirmStart(requested.sessionId, address, status(true), t + 300)
+            assertEquals(activity, openStore(file).readPending()!!.activity)
+            assertThrows(IllegalArgumentException::class.java) { store.requestStart(preparation, t + 400, "UTC") }
+        }
+    }
+
+    @Test fun versionsOneThroughFiveKeepHistoricalActivityDuringMigration() {
+        for (version in 1..5) {
+            val file = file()
+            val store = openStore(file)
+            val requested = store.requestStart(preparation, t, "UTC")
+            downgradeJournal(file, version)
+            val oldBytes = file.readBytes()
+            assertEquals(requested, openStore(file).read())
+            assertEquals(SessionActivity.FREE_LIVING, openStore(file).read()!!.activity)
+            assertArrayEquals(oldBytes, file.readBytes())
+            store.confirmStart(requested.sessionId, address, status(true), t + 100)
+            assertEquals(9, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+            val migrated = openStore(file).read()!!
+            assertEquals(SessionActivity.FREE_LIVING, migrated.activity)
+            val payload = JsonParser.parseString(file.readText()).asJsonObject.getAsJsonObject("session")
+            assertEquals("daily_activity_v2", payload["activity_schema"].asString)
+            assertFalse(payload.has("activity_selection_source"))
+        }
+    }
+
+    @Test fun historicalVersionsRejectSelectedActivityEvenWithAnUpdatedDigest() {
+        for (version in 1..5) {
+            val file = file()
+            openStore(file).requestStart(preparation, t, "UTC")
+            downgradeJournal(file, version)
+            editPayloadWithUpdatedDigest(file) {
+                it.addProperty("activity_code", "walking")
+                it.addProperty("activity_schema", "daily_activity_v3")
+                it.addProperty("activity_selection_source", "participant")
+            }
+            val before = file.readBytes()
+            assertThrows(IOException::class.java) { openStore(file).read() }
+            assertArrayEquals(before, file.readBytes())
+        }
+    }
+
+    @Test fun selectedActivityRejectsMissingOrContradictoryFieldsAndSampleLabels() {
+        val changes: List<(JsonObject) -> Unit> = listOf(
+            { it.remove("activity_code") },
+            { it.addProperty("activity_code", "other") },
+            { it.addProperty("activity_code", true) },
+            { it.addProperty("activity_code", "free_living") },
+            { it.remove("activity_schema") },
+            { it.addProperty("activity_schema", "daily_activity_v2") },
+            { it.remove("activity_selection_source") },
+            { it.addProperty("activity_selection_source", "researcher") },
+            { it.add("activity_selection_source", com.google.gson.JsonNull.INSTANCE) },
+            { it.addProperty("activity_label_status", "labelled") },
+            { it.addProperty("activity_label_source", "participant") },
+        )
+        for (activity in listOf(SessionActivity.WALKING, SessionActivity.RUNNING)) {
+            changes.forEach { change ->
+                val file = file()
+                openStore(file).requestStart(preparation, t, "UTC", activity = activity)
+                editPayloadWithUpdatedDigest(file, change)
+                val before = file.readBytes()
+                assertThrows(IOException::class.java) { openStore(file).read() }
+                assertArrayEquals(before, file.readBytes())
+            }
+        }
+        val historical = file()
+        openStore(historical).requestStart(preparation, t, "UTC")
+        editPayloadWithUpdatedDigest(historical) { it.addProperty("activity_selection_source", "participant") }
+        assertThrows(IOException::class.java) { openStore(historical).read() }
+    }
+
+    private fun downgradeJournal(file: File, version: Int) {
+        val envelope = JsonParser.parseString(file.readText()).asJsonObject
+        envelope.addProperty("journal_version", version)
+        if (version == 1) envelope.remove("archived_sessions")
+        file.writeText(envelope.toString())
+        editPayloadWithUpdatedDigest(file) { payload ->
+            payload.remove("completion_policy"); payload.remove("discarded"); payload.remove("start_abort")
+            payload.get("start_baseline")?.takeIf { it.isJsonObject }?.asJsonObject?.remove("unknown_time_start_evidence")
+            payload.get("start_attempt_archive")?.takeIf { it.isJsonObject }?.asJsonObject?.remove("unknown_preservation")
+            if (version < 2) listOf("reference_saved_at_ms", "ground_truth_reason", "raw_files", "transfer").forEach(payload::remove)
+            if (version < 3) listOf("start_baseline", "device_record_evidence", "device_association_invalidated").forEach(payload::remove)
+            if (version < 4) payload.remove("start_attempt_archive")
+            if (version < 5 && payload.get("start_baseline")?.isJsonObject == true) {
+                payload.getAsJsonObject("start_baseline").remove("charging_recovery_evidence")
+            }
+        }
     }
 
     private fun chargingBaseline() = DeviceStartBaseline(HealthMessage.Status(false, 0, 0, -16, 0), emptyList(), t,

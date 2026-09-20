@@ -37,8 +37,11 @@ class RealUploadQueue(
     /** Reopening the app resumes durable work, including a manual retry queued before exit. */
     fun restore(configuredLink: String): Boolean {
         var pending = false
+        store.listSessions().filter { it.isDiscarded }.forEach { session ->
+            runCatching { synchronized(taskLock) { store.cleanupDiscardedSession(session.sessionId) } }
+        }
         store.listSessions().filter { session ->
-            session.transfer.status != SessionTransferStatus.COMPLETE &&
+            session.uploadAllowed && session.transfer.status != SessionTransferStatus.COMPLETE &&
                 session.localData?.files?.let { it.isNotEmpty() && it.none { file -> file.simulated } } == true
         }.forEach { session ->
             try {
@@ -53,6 +56,7 @@ class RealUploadQueue(
 
     fun enqueue(sessionId: String, configuredLink: String, retry: Boolean): Boolean = synchronized(taskLock) {
         val session = requireNotNull(store.read(sessionId))
+        if (!session.uploadAllowed) return false
         require(session.localData != null && session.reference != null && session.localData.files.none { it.simulated })
         if (session.transfer.status == SessionTransferStatus.COMPLETE) return false
         var task = read(sessionId)
@@ -74,7 +78,7 @@ class RealUploadQueue(
     }
 
     fun queuedIds(): List<String> = synchronized(taskLock) {
-        store.listSessions().filter { it.localData != null }.mapNotNull { session ->
+        store.listSessions().filter { it.uploadAllowed && it.localData != null }.mapNotNull { session ->
             try {
                 read(session.sessionId)?.takeIf { it.state in setOf("queued", "sending") }?.sessionId
             } catch (_: Exception) {
@@ -93,6 +97,7 @@ class RealUploadQueue(
         try {
             if (cancelled()) return true
             val session = requireNotNull(store.read(sessionId))
+            if (!session.uploadAllowed) return false
             if (session.transfer.status == SessionTransferStatus.COMPLETE) {
                 synchronized(taskLock) { save(task.copy(state = "complete", failureStage = null)) }
                 return false
@@ -129,6 +134,7 @@ class RealUploadQueue(
             changed()
             false
         } catch (error: Exception) {
+            if (store.read(sessionId)?.uploadAllowed == false) return false
             // A received-but-not-committed receipt stays queued and will be reconciled without resending.
             val paused = cancelled() || error is InterruptedException || task.receipt != null
             task = task.copy(state = if (paused) "queued" else "failed",
@@ -143,8 +149,25 @@ class RealUploadQueue(
 
     fun task(sessionId: String): RealUploadTask? = synchronized(taskLock) { read(sessionId) }
 
+    /** Lock order: delivery -> task -> journal. Never cancel or erase another session's work. */
+    fun discardSession(sessionId: String, atMs: Long, connectionOwnerId: String? = null,
+        connectionGeneration: Long? = null) {
+        val before = requireNotNull(store.read(sessionId))
+        require(before.transfer.attempts == 0 && before.transfer.receipt == null) { "本段已开始上传，保留当前上传任务" }
+        synchronized(deliveryLock) {
+            synchronized(taskLock) {
+                if (store.read(sessionId)?.isDiscarded != true) {
+                    store.discardStoppedSession(sessionId, atMs, connectionOwnerId, connectionGeneration)
+                }
+                store.cleanupDiscardedSession(sessionId)
+            }
+        }
+        changed()
+    }
+
     /** Also reports damaged task metadata without replacing its destination binding. */
     fun needsLocalReview(sessionId: String): Boolean = synchronized(taskLock) {
+        if (store.read(sessionId)?.uploadAllowed == false) return false
         try {
             val task = read(sessionId)
             if (task != null) task.failureStage == "preparation"
@@ -157,6 +180,7 @@ class RealUploadQueue(
 
     private fun markFailed(sessionId: String) {
         val session = store.read(sessionId) ?: return
+        if (!session.uploadAllowed) return
         if (session.transfer.status == SessionTransferStatus.PENDING) store.markTransferStarted(sessionId)
         if (session.transfer.status in setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING)) {
             store.markTransferFailed(sessionId)

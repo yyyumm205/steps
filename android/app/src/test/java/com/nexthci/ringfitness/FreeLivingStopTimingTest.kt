@@ -29,7 +29,7 @@ class FreeLivingStopTimingTest {
         assertEquals(1, f.count("stop"))
         assertTrue(f.coordinator.state.settling)
         assertNull(f.coordinator.state.timeoutOperationId)
-        f.advance(999)
+        f.advance(4_999)
         assertEquals(before, f.count("status"))
         f.wallTime -= 86_400_000L
         f.advance(1)
@@ -45,7 +45,7 @@ class FreeLivingStopTimingTest {
         val f = Fixture()
         f.begin()
         f.coordinator.requestStop()
-        f.advance(1_000)
+        f.advance(5_000)
         f.observe(active.copy(bytes = 40, records = 3), record.copy(bytes = 48, records = 3))
         assertTrue(f.coordinator.state.settling)
         assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
@@ -69,7 +69,7 @@ class FreeLivingStopTimingTest {
         f.coordinator.requestStop()
         val request = f.store.readPending()!!.stopRequestedAtMs
         repeat(3) { index ->
-            f.advance(if (index == 0) 1_000 else 1_500)
+            f.advance(if (index == 0) 5_000 else 1_500)
             f.observe(active, record)
         }
         f.advance(30_000)
@@ -94,7 +94,7 @@ class FreeLivingStopTimingTest {
             val f = Fixture()
             f.begin()
             f.coordinator.requestStop()
-            f.advance(1_000)
+            f.advance(5_000)
             f.observe(status, item)
             val before = f.calls.toList()
             f.advance(30_000)
@@ -110,7 +110,7 @@ class FreeLivingStopTimingTest {
         val f = Fixture()
         f.begin()
         f.coordinator.requestStop()
-        f.advance(1_000)
+        f.advance(5_000)
         f.observe(active.copy(bytes = 80, records = 5), record.copy(bytes = 96, records = 6))
         f.advance(1_500)
         f.observe(stopped, finalRecord)
@@ -127,7 +127,7 @@ class FreeLivingStopTimingTest {
         f.observe(active.copy(collecting = false), record)
         assertEquals(before, f.calls)
         assertNull(f.store.readPending()!!.stopConfirmedAtMs)
-        f.advance(1_000)
+        f.advance(5_000)
         f.observe(stopped, finalRecord)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
     }
@@ -139,7 +139,7 @@ class FreeLivingStopTimingTest {
                 val f = Fixture()
                 f.begin()
                 f.coordinator.requestStop()
-                if (afterFirstPoll) { f.advance(1_000); f.observe(active, record) }
+                if (afterFirstPoll) { f.advance(5_000); f.observe(active, record) }
                 f.health(message)
                 val before = f.calls.toList()
                 f.advance(30_000)
@@ -164,7 +164,7 @@ class FreeLivingStopTimingTest {
             val coordinator = if (reopen) {
                 f.coordinator.close()
                 f.newCoordinator().also { it.onConnected(address, 2); it.reconcile() }
-            } else { f.advance(1_000); f.coordinator }
+            } else { f.advance(5_000); f.coordinator }
             val connection = if (reopen) 2L else 1L
             coordinator.onHealth(connection, SensorPacket.Health(stopped, epoch + 5_000))
             coordinator.onHealth(connection, SensorPacket.Health(finalRecord, epoch + 5_001))
@@ -189,7 +189,7 @@ class FreeLivingStopTimingTest {
             val coordinator = if (reopen) {
                 f.coordinator.close()
                 f.newCoordinator().also { it.onConnected(address, 2); it.reconcile() }
-            } else { f.advance(1_000); f.coordinator }
+            } else { f.advance(5_000); f.coordinator }
             val connection = if (reopen) 2L else 1L
             coordinator.onHealth(connection, SensorPacket.Health(stopped, epoch + 5_000))
             coordinator.onHealth(connection, SensorPacket.Health(finalRecord, epoch + 5_001))
@@ -233,7 +233,7 @@ class FreeLivingStopTimingTest {
             val f = Fixture()
             f.begin()
             f.coordinator.requestStop()
-            if (afterFirstPoll) { f.advance(1_000); f.observe(active, record) }
+            if (afterFirstPoll) { f.advance(5_000); f.observe(active, record) }
             val saved = f.store.readPending()
             interrupt(f)
             val before = f.calls.toList()
@@ -250,7 +250,7 @@ class FreeLivingStopTimingTest {
         f.coordinator.requestStop()
         val before = f.calls.toList()
         f.journal.writeText("corrupt stop fixture")
-        f.advance(1_000)
+        f.advance(5_000)
         assertEquals(before, f.calls)
         assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
         assertFalse(f.coordinator.state.settling)
@@ -260,7 +260,7 @@ class FreeLivingStopTimingTest {
         val f = Fixture()
         f.begin()
         f.coordinator.requestStop()
-        f.advance(1_000)
+        f.advance(5_000)
         f.failCommit = true
         f.observe(active.copy(bytes = 40, records = 3), record.copy(bytes = 48, records = 3))
         val before = f.calls.toList()
@@ -274,7 +274,7 @@ class FreeLivingStopTimingTest {
         val f = Fixture()
         f.begin()
         f.coordinator.requestStop()
-        f.advance(1_000)
+        f.advance(5_000)
         f.observe(active.copy(bytes = 40, records = 3), record.copy(bytes = 48, records = 3))
         f.coordinator.onDisconnected(1)
         f.coordinator.onConnected(address, 2)

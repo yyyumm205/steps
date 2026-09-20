@@ -116,8 +116,54 @@ def validate_record(value, name):
     return value
 
 
+def validate_unknown_time_start(baseline, manifest, record):
+    evidence = object_value(baseline.get("unknown_time_start_evidence"), "unknown time start evidence")
+    require(set(evidence) == {"version", "record", "backup_id", "raw_sha256", "owner_id",
+                              "connection_generation", "preserved_at_ms", "clock"}, "invalid unknown time evidence fields")
+    require(integer(evidence["version"], "unknown time evidence version") == 1, "unsupported unknown time evidence")
+    for field in ("backup_id", "owner_id"):
+        uuid_value(evidence[field], field)
+    require(type(evidence["raw_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", evidence["raw_sha256"]) is not None,
+            "invalid preserved raw digest")
+    previous = validate_record(evidence["record"], "preserved unknown record")
+    require(previous["unix_ms"] == 0 and all(previous[key] > 0 for key in ("uptime_ms", "bytes", "records")),
+            "invalid unknown record fingerprint")
+    require([item for item in baseline["records"] if item["unix_ms"] == 0] == [previous],
+            "unknown record proof differs from baseline")
+    generation = integer(evidence["connection_generation"], "preservation connection", 1)
+    preserved = integer(evidence["preserved_at_ms"], "preservation time", 1)
+    clock = object_value(evidence["clock"], "preservation clock evidence")
+    require(set(clock) == {"attempt_id", "ring_address", "connection_generation", "requested_at_ms", "received_at_ms",
+                          "requested_elapsed_ms", "received_elapsed_ms", "device_unix_ms", "device_uptime_ms"},
+            "invalid preservation clock fields")
+    uuid_value(clock["attempt_id"], "clock attempt")
+    require(clock["ring_address"] == manifest["ring_address"] and
+            integer(clock["connection_generation"], "clock connection", 1) == generation, "preservation clock identity mismatch")
+    for field in ("requested_at_ms", "received_at_ms", "device_unix_ms"):
+        integer(clock[field], field, 1)
+    for field in ("requested_elapsed_ms", "received_elapsed_ms"):
+        integer(clock[field], field)
+    integer(clock["device_uptime_ms"], "clock device uptime", maximum=MAX_UINT)
+    elapsed = clock["received_elapsed_ms"] - clock["requested_elapsed_ms"]
+    wall = clock["received_at_ms"] - clock["requested_at_ms"]
+    require(0 <= elapsed <= 3000 and wall >= 0 and abs(wall - elapsed) <= 250,
+            "invalid preservation clock reply window")
+    require(-250 <= clock["device_unix_ms"] - clock["requested_at_ms"] and
+            clock["device_unix_ms"] - clock["received_at_ms"] <= 250, "preservation clock is outside phone window")
+    require(preserved <= clock["requested_at_ms"] and 0 <= baseline["observed_at_ms"] - clock["received_at_ms"] <= 30000,
+            "preservation clock is stale or precedes preservation")
+    age = record["uptime_ms"] - clock["device_uptime_ms"]
+    require(record["unix_ms"] > 0 and 0 <= age <= 30000 and
+            (previous["device_session_id"] != record["device_session_id"] or record["uptime_ms"] != previous["uptime_ms"]) and
+            abs((record["unix_ms"] - clock["device_unix_ms"]) - age) <= 250,
+            "new record is not supported by same-connection synchronized clock")
+    return previous
+
+
 def validate_manifest(value):
     m = object_value(value, "manifest")
+    version = integer(m.get("version"), "version")
+    require(version in (2, 3, 4, 5), "unsupported version")
     required = {
         "version", "step_schema_version", "rfbin_version", "simulated", "session_id",
         "participant_id", "participant_name", "installation_id", "ring_placement",
@@ -132,16 +178,21 @@ def validate_manifest(value):
         "start_boundary_evidence", "end_boundary_evidence", "start_baseline",
         "device_record_evidence", "device_association_invalidated", "files",
     }
-    require(set(m) == required, "manifest fields do not match activity schema v2")
-    version = integer(m["version"], "version")
-    require(version in (2, 3), "unsupported version")
+    has_activity_selection = version == 4 or (version == 5 and m.get("activity_schema") == "daily_activity_v3")
+    if has_activity_selection:
+        required.add("activity_selection_source")
+    require(set(m) == required, "manifest fields do not match activity schema")
     for key, expected in (("step_schema_version", 1), ("rfbin_version", 2)):
         require(integer(m[key], key) == expected, f"unsupported {key}")
     require(m["simulated"] is False, "simulated archives require the isolated demo path")
-    fixed = {"capture_purpose": "daily_activity", "activity_schema": "daily_activity_v2",
-             "activity_code": "free_living", "activity_label_status": "unlabelled",
+    fixed = {"capture_purpose": "daily_activity", "activity_label_status": "unlabelled",
              "activity_label_source": "none", "ground_truth_source": "external_pedometer",
              "data_integrity_status": "complete"}
+    if has_activity_selection:
+        fixed.update(activity_schema="daily_activity_v3", activity_selection_source="participant")
+        require(m["activity_code"] in ("walking", "running"), "unsupported activity_code")
+    else:
+        fixed.update(activity_schema="daily_activity_v2", activity_code="free_living")
     for key, expected in fixed.items():
         require(m[key] == expected, f"unsupported or inconsistent {key}")
     uuid_value(m["session_id"], "session_id")
@@ -241,15 +292,17 @@ def validate_manifest(value):
         require(all(m[key][counter] <= record[counter] for counter in ("bytes", "records")),
                 "device record counters moved backwards")
     baseline = object_value(m["start_baseline"], "start_baseline")
-    baseline_status = validate_status(baseline.get("status"), "baseline status", allow_charging_error=version == 3)
-    require(baseline_status["collecting"] is False and baseline_status["error_code"] == (-16 if version == 3 else 0),
+    has_charging_recovery = version == 3 or (version in (4, 5) and "charging_recovery_evidence" in baseline)
+    baseline_status = validate_status(baseline.get("status"), "baseline status",
+                                      allow_charging_error=has_charging_recovery)
+    require(baseline_status["collecting"] is False and baseline_status["error_code"] == (-16 if has_charging_recovery else 0),
             "invalid start baseline")
     integer(baseline.get("observed_at_ms"), "baseline observation time", 1)
-    if version == 3:
+    if has_charging_recovery:
         validate_charging_recovery(baseline)
     else:
         require("charging_recovery_evidence" not in baseline,
-                "charging recovery evidence requires manifest version 3")
+                "charging recovery evidence requires manifest version 3, 4 or 5")
     require(type(baseline.get("records")) is list and len(baseline["records"]) <= 255, "invalid baseline records")
     for item in baseline["records"]:
         validate_record(item, "baseline record")
@@ -261,11 +314,17 @@ def validate_manifest(value):
         require(any(all(item[key] == baseline_status[key] for key in ("device_session_id", "bytes", "records"))
                     for item in baseline["records"]), "baseline STATUS and LIST disagree")
     previous = next((item for item in baseline["records"] if item["device_session_id"] == device_id), None)
+    if version == 5:
+        preserved_unknown = validate_unknown_time_start(baseline, m, record)
+    else:
+        require("unknown_time_start_evidence" not in baseline, "unknown time start evidence requires manifest version 5")
+        preserved_unknown = None
     if previous is None:
         require(device_id != baseline_status["device_session_id"], "record not distinguishable from baseline")
     else:
-        require(previous["unix_ms"] > 0 and record["unix_ms"] > 0 and previous["uptime_ms"] > 0 and record["uptime_ms"] > 0
-                and previous["unix_ms"] != record["unix_ms"] and previous["uptime_ms"] != record["uptime_ms"],
+        require(previous == preserved_unknown or
+                (previous["unix_ms"] > 0 and record["unix_ms"] > 0 and previous["uptime_ms"] > 0 and record["uptime_ms"] > 0
+                and previous["unix_ms"] != record["unix_ms"] and previous["uptime_ms"] != record["uptime_ms"]),
                 "reused record id lacks two changed nonzero time anchors")
     files = m["files"]
     require(type(files) is list and len(files) > 0, "empty file list")

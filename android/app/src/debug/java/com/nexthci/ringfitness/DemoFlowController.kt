@@ -42,6 +42,7 @@ class DemoFlowController(
     private var browsingHome = false
     private var taskPage: CollectionPage? = null
     private var taskError: String? = null
+    private var selectedActivity: SessionActivity? = null
 
     @Volatile override var state = CollectionFlowState(isSimulation = true, busy = true)
         private set
@@ -67,10 +68,11 @@ class DemoFlowController(
     fun initialize() = safely {
         if (initialized) return@safely
         initialized = true
+        store.listSessions().filter { it.isDiscarded }.forEach { runCatching { store.cleanupDiscardedSession(it.sessionId) } }
         recoverStored(resumeTransfer = true)
         val currentId = store.read()?.sessionId
         store.listSessions().filter {
-            it.sessionId != currentId && it.localData != null &&
+            it.sessionId != currentId && it.uploadAllowed && it.localData != null &&
                 it.transfer.status in setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING)
         }.forEach { upload(it.sessionId) }
     }
@@ -97,16 +99,55 @@ class DemoFlowController(
         val profile = requireNotNull(preparation.read()) { "请先填写体验编号" }
         require(profile.ring == DEMO_RING && profile.placement != null) { "请先完成准备" }
         val current = store.read()
-        if (current != null && current.localData == null) { showStored(current); return@safely }
+        if (current?.isPending == true) { showStored(current); return@safely }
+        val activity = requireNotNull(selectedActivity) { "请选择本次活动" }
+        require(activity != SessionActivity.FREE_LIVING)
         if (!connected) { publish(CollectionPage.RECOVERY, "连接已断开，请重新连接"); return@safely }
         // This synthetic reset is allowed only after the previous record is verified on disk.
-        if (current != null) verifyLocalFiles(current)
+        if (current != null && !current.isDiscarded) verifyLocalFiles(current)
         device.save(null)
         recoveryOwner = false
         blockedQuery = false
         operationEpoch++
         attachCoordinator()
-        coordinator!!.requestStart(profile)
+        selectedActivity = null
+        coordinator!!.requestStart(profile, activity = activity)
+    }
+
+    override fun selectActivity(activity: SessionActivity) = safely {
+        require(activity != SessionActivity.FREE_LIVING)
+        if (store.readPending() != null || state.busy) return@safely
+        selectedActivity = activity
+        publish(state.page, state.error)
+    }
+
+    override fun enterFinish() = safely {
+        val current = requireNotNull(store.readPending())
+        require(current.stopConfirmedAtMs != null && current.localData == null && !savingReference)
+        browsingHome = false
+        publish(CollectionPage.FINISH)
+    }
+
+    override fun chooseFinish(uploadNow: Boolean) = safely(CollectionPage.FINISH) {
+        val current = requireNotNull(store.readPending())
+        store.setCompletionPolicy(current.sessionId, if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
+        browsingHome = false
+        if (current.reference != null) download(current.sessionId) else publish(CollectionPage.REFERENCE)
+    }
+
+    override fun discardSession() = safely(CollectionPage.FINISH) {
+        val current = requireNotNull(store.readPending())
+        require(!savingReference && current.sessionId !in transferring)
+        store.discardStoppedSession(current.sessionId, clock.nowEpochMs())
+        val cleaned = runCatching { store.cleanupDiscardedSession(current.sessionId) }.isSuccess
+        operationEpoch++
+        coordinator?.close(); coordinator = null
+        downloading.remove(current.sessionId)
+        selectedActivity = null
+        taskPage = null
+        taskError = if (cleaned) null else "本段已放弃，剩余文件将在下次打开时继续清理。"
+        browsingHome = true
+        publish(CollectionPage.HOME)
     }
 
     override fun stop() = safely {
@@ -135,7 +176,7 @@ class DemoFlowController(
         if (savingReference) { publish(CollectionPage.SAVING); return@safely }
         val current = store.read() ?: return@safely
         require(current.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE))
-        publish(CollectionPage.REFERENCE)
+        publish(if (current.stopConfirmedAtMs != null && current.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE)
     }
 
     override fun saveReference(stepsText: String, status: String, reason: String) = safely(CollectionPage.REFERENCE) {
@@ -143,6 +184,7 @@ class DemoFlowController(
         if (savingReference) { publish(CollectionPage.SAVING); return@safely }
         val current = requireNotNull(store.read())
         if (current.reference != null) { showStored(current); return@safely }
+        require(current.stopConfirmedAtMs == null || current.completionPolicy != null) { "请选择保存方式" }
         val referenceStatus = when (status) {
             "valid" -> ReferenceStatus.VALID
             "missing" -> ReferenceStatus.MISSING
@@ -188,15 +230,18 @@ class DemoFlowController(
         if (state.busy) return@safely
         blockedQuery = false
         val current = store.read()
-        if (current == null) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return@safely }
+        if (current == null || current.isDiscarded) {
+            current?.let { store.cleanupDiscardedSession(it.sessionId) }
+            taskPage = null; taskError = null; publish(CollectionPage.HOME); return@safely
+        }
         if (current.localData != null) {
             if (current.transfer.status == SessionTransferStatus.COMPLETE) publish(CollectionPage.COMPLETE)
-            else upload(current.sessionId)
-        } else if (current.reference != null && current.stopConfirmedAtMs != null) download(current.sessionId)
+            else if (current.uploadAllowed) upload(current.sessionId) else publish(CollectionPage.COMPLETE)
+        } else if (current.reference != null && current.stopConfirmedAtMs != null && current.completionPolicy != null) download(current.sessionId)
         else recoverStored(false)
     }
 
-    override fun retryUpload(sessionId: String) = safely { upload(sessionId) }
+    override fun retryUpload(sessionId: String) = safely { store.allowUpload(sessionId); upload(sessionId) }
 
     override fun home() = safely { browsingHome = true; publish(CollectionPage.HOME) }
 
@@ -274,7 +319,7 @@ class DemoFlowController(
                 CaptureControlPhase.CHECKING, CaptureControlPhase.STARTING -> publish(CollectionPage.STARTING)
                 CaptureControlPhase.COLLECTING -> publish(CollectionPage.COLLECTING)
                 CaptureControlPhase.STOPPING -> publish(CollectionPage.STOPPING)
-                CaptureControlPhase.AWAITING_REFERENCE -> publish(CollectionPage.REFERENCE)
+                CaptureControlPhase.AWAITING_REFERENCE -> publish(CollectionPage.FINISH)
                 CaptureControlPhase.NEEDS_REVIEW -> publish(CollectionPage.RECOVERY, "暂未收到确认，请重新检查")
                 CaptureControlPhase.STORAGE_ERROR -> publish(CollectionPage.ERROR, "暂时无法保存，请重试")
             }
@@ -290,7 +335,7 @@ class DemoFlowController(
     private fun recoverStored(resumeTransfer: Boolean) {
         recoveryOwner = false
         val current = store.read()
-        if (current == null) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return }
+        if (current == null || current.isDiscarded) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return }
         if (current.localData != null) {
             verifyLocalFiles(current)
             if (resumeTransfer && current.transfer.status == SessionTransferStatus.COMPLETE) {
@@ -298,7 +343,7 @@ class DemoFlowController(
                 browsingHome = true
                 publish(CollectionPage.HOME)
             }
-            else if (resumeTransfer && current.transfer.status in setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING)) upload(current.sessionId)
+            else if (resumeTransfer && current.uploadAllowed && current.transfer.status in setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING)) upload(current.sessionId)
             else showStored(current)
             return
         }
@@ -332,17 +377,18 @@ class DemoFlowController(
             publish(CollectionPage.RECOVERY, "请重新检查戒指，本次记录已保留")
             return
         }
-        if (recovered.reference != null && recovered.stopConfirmedAtMs != null) download(recovered.sessionId)
+        if (recovered.reference != null && recovered.stopConfirmedAtMs != null && recovered.completionPolicy != null) download(recovered.sessionId)
         else showStored(recovered)
     }
 
     private fun showStored(current: FreeLivingSession) {
         when {
+            current.stopConfirmedAtMs != null && current.completionPolicy == null -> publish(CollectionPage.FINISH)
             current.localData != null && current.transfer.status == SessionTransferStatus.COMPLETE -> publish(CollectionPage.COMPLETE)
-            current.localData != null -> publish(CollectionPage.ERROR, "数据已保存在手机，传输可以重试")
+            current.localData != null -> publish(CollectionPage.COMPLETE)
             current.reference != null && current.stopConfirmedAtMs == null -> publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
             current.reference != null -> publish(CollectionPage.ERROR, "读数已保存，请继续保存戒指数据")
-            current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE -> publish(CollectionPage.REFERENCE)
+            current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE -> publish(if (current.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE)
             current.phase == FreeLivingSessionPhase.COLLECTING -> publish(CollectionPage.COLLECTING)
             else -> publish(CollectionPage.RECOVERY, "本次记录已保留，请重新检查")
         }
@@ -350,6 +396,7 @@ class DemoFlowController(
 
     private fun download(sessionId: String) {
         val session = requireNotNull(store.read(sessionId))
+        if (session.isDiscarded) return
         if (session.localData != null) { upload(sessionId); return }
         require(session.stopConfirmedAtMs != null && session.reference != null)
         if (!connected) { publish(CollectionPage.RECOVERY, "读数已保存，请重新连接下载数据"); return }
@@ -363,6 +410,7 @@ class DemoFlowController(
                     if (!connected) throw IOException("读数已保存，请重新连接下载数据")
                     if (consume(FlowTestFault.DOWNLOAD_FAILURE)) throw IOException("读数已保存，数据下载请重试")
                     val current = requireNotNull(store.read(sessionId))
+                    if (current.isDiscarded) return@safely
                     val record = requireOwnedDevice(current)
                     require(!record.collecting)
                     val raw = File(directory, "$sessionId-simulated-signal.txt")
@@ -383,6 +431,10 @@ class DemoFlowController(
 
     private fun upload(sessionId: String) {
         val current = requireNotNull(store.read(sessionId))
+        if (!current.uploadAllowed) {
+            if (!current.isDiscarded && isCurrentTransferTask(sessionId)) publish(CollectionPage.COMPLETE)
+            return
+        }
         requireNotNull(current.localData)
         verifyLocalFiles(current)
         if (current.transfer.status == SessionTransferStatus.COMPLETE) {
@@ -401,6 +453,7 @@ class DemoFlowController(
             scheduler.schedule(1200) {
                 transferring.remove(sessionId)
                 safely {
+                    if (store.read(sessionId)?.uploadAllowed != true) return@safely
                     if (consume(FlowTestFault.UPLOAD_FAILURE)) {
                         store.markTransferFailed(sessionId)
                         if (isCurrentTransferTask(sessionId)) publish(CollectionPage.COMPLETE, "数据已保存在手机，上传请重试")
@@ -467,7 +520,7 @@ class DemoFlowController(
 
     private fun publish(page: CollectionPage, error: String? = null) {
         val profile = preparation.read()
-        val session = store.read()
+        val session = store.read()?.takeUnless { it.isDiscarded }
         val reference = session?.reference
         if (page != CollectionPage.HOME) {
             taskPage = page
@@ -484,9 +537,11 @@ class DemoFlowController(
             canStop = !busy && connected && session?.phase == FreeLivingSessionPhase.COLLECTING &&
                 (recoveryOwner || coordinator?.state?.phase == CaptureControlPhase.COLLECTING),
             canRetry = !busy && (taskPage != null || session != null || !connected),
-            records = store.listSessions().map { FlowRecordSummary(it.sessionId, it.reference?.steps,
+            selectedActivity = selectedActivity,
+            records = store.listSessions().filterNot { it.isDiscarded }.map { FlowRecordSummary(it.sessionId, it.reference?.steps,
                 it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null,
-                transferInFlight = it.sessionId in transferring) }, fault = fault)
+                transferInFlight = it.sessionId in transferring, activity = it.activity,
+                uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER) }, fault = fault)
         broadcast()
     }
 

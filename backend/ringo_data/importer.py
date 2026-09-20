@@ -385,6 +385,7 @@ def _summarize_locked(root: Path, output: Path):
             if entry["role"] == "raw":
                 raw_owners.setdefault(entry["sha256"], set()).add(manifest["session_id"])
         rows.append({"session_id": manifest["session_id"], "participant_id": manifest["participant_id"],
+                     "activity_code": manifest["activity_code"],
                      "ground_truth_steps": manifest["ground_truth_steps"], "ground_truth_status": manifest["ground_truth_status"],
                      "started_at_ms": manifest["started_at_ms"], "ended_at_ms": manifest["ended_at_ms"],
                      "analysis_status": quality["analysis_status"], "daily_aggregation_eligible": False,
@@ -401,7 +402,7 @@ def _summarize_locked(root: Path, output: Path):
             row["analysis_reasons"] += ";overlapping_session_intervals"
     output = local_path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["session_id", "participant_id", "ground_truth_steps", "ground_truth_status", "started_at_ms",
+    fields = ["session_id", "participant_id", "activity_code", "ground_truth_steps", "ground_truth_status", "started_at_ms",
               "ended_at_ms", "analysis_status", "daily_aggregation_eligible", "analysis_reasons"]
     fd, name = tempfile.mkstemp(prefix=".session-index-", suffix=".tmp", dir=output.parent)
     temporary = Path(name)

@@ -1,4 +1,4 @@
-# 自由活动数据导入
+# 活动采集数据导入
 
 本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录及 IMU/PPG CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)及[功能规格](../../specs/independent-step-collection/requirements.md)。
 
@@ -33,9 +33,17 @@ python -m pytest backend/ringo_data/tests -q
 
 ## 输入与输出
 
-新入口接收 `version=2/3`、`step_schema_version=1`、`rfbin_version=2`、`daily_activity_v2/free_living`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
+新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。新包采用 `version=4`、`activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
+
+历史 `version=2/3` 包继续采用 `daily_activity_v2/free_living`，保持原有字段与含义。所有版本均要求 `step_schema_version=1`、`rfbin_version=2`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
 
 普通记录沿用版本 2，其开始基线必须为空闲且 `error_code=0`。版本 3 专门保存充电错误兼容路径：开始基线保留真实的空闲状态和 `error_code=-16`，并要求 `start_baseline.charging_recovery_evidence` 同时证明原因是 `charging`、电量接口报告未充电、两条回复来自同一次连接且在检查时均不超过 5 秒。证据保存原因码、电量充电状态、两条回复的接收时间与连接代次、检查时间；STATUS 接收时间必须等于基线观察时间。缺失、过期或相互矛盾的证据拒收。版本 2 不接受此兼容字段；所有版本的成功开始、停止与下载记录证据仍要求 `error_code=0`。兼容证据随原清单保留，冻结旧包保持原字节内容。
+
+版本 4 同时支持普通开始与充电错误兼容路径。普通开始要求空闲且 `error_code=0`，省略 `charging_recovery_evidence` 字段；兼容路径要求空闲且 `error_code=-16`，保留与版本 3 同样完整、有效的证据对象。显式 null、字段缺失或冲突组合均拒收。版本 2/3 保持原有校验，版本 4/5 支持新增活动选择字段。
+
+版本5用于开始基线中存在一条设备日期未知的旧记录。`unknown_time_start_evidence`保存完整重读备份的身份及哈希、连接owner/代次、保全时间和手机校时请求/回复。旧记录仍为`unix_ms=0`；新记录必须符合本次TIME锚及时间窗口，数值ID复用时uptime也须改变。v5支持走路/跑步或历史自由活动，以及已有充电兼容证据；缺失、冲突或过期的证据拒收。这里的时钟证据用于记录归属检查，样本精确时间仍依原有质量规则。冻结v2–v4包原文保持。
+
+手机的“稍后上传”和放弃审计仅控制本地工作流。放弃段不产生研究上传包；暂缓段手动上传时沿用同一session及冻结内容。后台接收后仍按session与ZIP哈希去重。
 
 校验包括严格整数类型、有效零步/缺失/不可靠参考、明确停止、记录指纹与开始基线、原始头部、记录数、载荷 CRC32、整文件 SHA-256、sidecar 对应关系，以及 ZIP 路径、重复条目和资源配额。参考原因保存在原 manifest 中；每个 session 的 `reference.csv` 只有一行，整段总数关联所有原始文件。软件可导入同一 session 的多个片段文件并标记重叠待核对；设备多文件能力仍待实测。
 
@@ -62,8 +70,8 @@ python -m pytest backend/ringo_data/tests -q
 - `timestamp_unix_ms`、`timestamp_iso` 当前留空：尚无验证通过的样本绝对时间标定。真实起止未知时 manifest 使用 null，rfbin 头使用 0；解码保持未知。
 - `packet_uptime_ms` 保留包内端点；`ring_uptime_ms` 按包内样本位置及标称周期展开。IMU 为 20 ms，PPG 为 40 ms。`relative_sample_offset_ms` 相对当前文件该通道首样本，`relative_to_device_anchor_ms` 相对原始设备锚点；回退和环绕保持原差值。
 - `device_anchor_estimated_unix_ms/iso` 单列设备锚推算值，仅用于诊断，不能作为真实采集边界。质量报告保留缺口、重叠及 uptime 回退统计，不插值、补点、重采样或拼成连续时间。
-- 加速度换算沿用原解码器的 `raw / 2048 × 9.80665`。场景为 `free_living`，逐样本 `activity_truth` 为空，标签状态/来源固定为 `unlabelled/none`。
+- 加速度换算沿用原解码器的 `raw / 2048 × 9.80665`。每行 `activity_code` 保留 session 的 `walking`、`running` 或历史 `free_living`。走路、跑步选择声明整次采集任务；逐样本 `activity_truth` 保持空值，标签状态/来源固定为 `unlabelled/none`。逐样本分类评价仍需独立的活动时间标注。
 - `quality.json` 当前将分析资格保持 `pending_review`，分别报告未知边界、未校准样本时钟、参考异常、信号间隔和多文件风险。CRC/SHA 通过证明传输与保存一致性；信号覆盖、计步器时间对应和设备时钟仍需另行验证。
-- `summary` 输出逐 session 索引并标记跨 session 重复原始文件和已知时间区间重叠。当前不生成每日总数；跨午夜、未知边界或未评估覆盖均保留为整段记录。日汇总的有效覆盖与排除规则将在时间质量验收后接入。
+- `reference.csv` 与 `summary` 的逐 session 索引均包含 `activity_code`，可据此筛选走路和跑步记录。`summary` 从已验证的清单重建索引，可覆盖旧版缺少活动列的索引；已归档的 ZIP、清单及派生产物保持原样。跨活动同样检查重复原始文件和已知时间区间重叠。当前不生成每日总数；跨午夜、未知边界或未评估覆盖均保留为整段记录。日汇总的有效覆盖与排除规则将在时间质量验收后接入。
 
 原始 `daily_activity_v1`、CSV v1 及睡眠相关包继续使用原交接后端，其含义保持原契约。它们不进入这个独立活动入口。云盘下载负责将同一测试文件夹中的冻结 ZIP 交给本 CLI；凭据及真实位置保存在本地配置。

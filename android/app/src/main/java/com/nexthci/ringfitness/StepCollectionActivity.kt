@@ -92,7 +92,10 @@ abstract class StepCollectionActivity : Activity() {
     override fun onBackPressed() = back()
 
     private fun back() {
-        if (current?.page == CollectionPage.HOME) finish() else flow.home()
+        val state = current
+        if (state?.page == CollectionPage.REFERENCE && state.session?.stopConfirmedAtMs != null && state.session.reference == null)
+            flow.enterFinish()
+        else if (state?.page == CollectionPage.HOME) finish() else flow.home()
     }
 
     private fun rememberDrafts() {
@@ -133,6 +136,7 @@ abstract class StepCollectionActivity : Activity() {
         val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(row)
         val returnLabel = when {
+            state.page == CollectionPage.REFERENCE && state.session?.stopConfirmedAtMs != null && state.session.reference == null -> "返回"
             state.page != CollectionPage.HOME -> "首页"
             state.isSimulation -> "退出演示"
             else -> "返回"
@@ -179,6 +183,7 @@ abstract class StepCollectionActivity : Activity() {
             CollectionPage.HOME -> home(body, footer, state)
             CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING -> waiting(body, footer, state)
             CollectionPage.COLLECTING -> collecting(body, footer, state)
+            CollectionPage.FINISH -> finishSession(body, footer, state)
             CollectionPage.REFERENCE -> reference(body, footer, state)
             CollectionPage.DOWNLOADING, CollectionPage.UPLOADING, CollectionPage.COMPLETE -> transfer(body, footer, state)
             CollectionPage.RECOVERY, CollectionPage.ERROR -> recovery(body, footer, state)
@@ -228,6 +233,17 @@ abstract class StepCollectionActivity : Activity() {
         val ready = ui.card(body, if (state.canStart) ui.statusSurface else ui.surface)
         ui.text(ready, task.status, 24f, bold = true).tag = "home_task_status"
         task.hint?.let { ui.gap(ready, 12); ui.text(ready, it) }
+        if (state.canStart) {
+            ui.gap(ready, 18)
+            ui.text(ready, "本次活动", 14f, muted = true)
+            val choices = LinearLayout(this)
+            ready.addView(choices, LinearLayout.LayoutParams(-1, -2))
+            listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEachIndexed { index, activity ->
+                ui.button(choices, activity.label, primary = state.selectedActivity == activity,
+                    tag = "activity_${activity.wireValue}") { flow.selectActivity(activity) }.layoutParams =
+                    LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = ui.dp(12) }
+            }
+        }
         val profile = ui.card(body)
         detail(profile, "被试编号", state.participantId)
         ui.gap(profile, 18)
@@ -242,12 +258,15 @@ abstract class StepCollectionActivity : Activity() {
             ui.gap(body, 12)
             recentRecords.forEach { record ->
                 val card = ui.card(body)
+                ui.text(card, record.activity.label, 14f, muted = true)
+                ui.gap(card, 8)
                 ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true)
                 ui.gap(card, 8)
                 ui.text(card, when {
                     record.localReviewRequired -> "戒指数据需要检查"
                     record.transferStatus == "complete" -> if (state.isSimulation) "已保存 · 模拟上传完成" else "已上传"
                     record.transferInFlight -> "已保存 · 正在上传"
+                    record.uploadDeferred -> "已保存 · 稍后上传"
                     record.transferStatus in setOf("failed", "transferring") -> "已保存 · 上传待重试"
                     else -> "已保存 · 等待上传"
                 }, 14f, muted = true).tag = "record_status_${record.sessionId}"
@@ -262,10 +281,13 @@ abstract class StepCollectionActivity : Activity() {
                 }
             }
         }
-        action(footer, task.action, !state.busy && !state.connecting) {
+        action(footer, if (state.canStart && state.selectedActivity == null) "请先选择活动" else task.action,
+            !state.busy && !state.connecting && (!state.canStart || state.selectedActivity != null)) {
             when {
                 !state.connected -> flow.reconnect()
+                state.canStopUnconfirmedStart -> flow.stop()
                 state.canStart -> flow.start()
+                state.taskPage == CollectionPage.FINISH -> flow.enterFinish()
                 state.taskPage == CollectionPage.REFERENCE -> flow.enterReference()
                 else -> flow.retry()
             }
@@ -277,19 +299,27 @@ abstract class StepCollectionActivity : Activity() {
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
         state.connecting -> HomeTask("本次采集", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("本次采集", "戒指连接中断", "重新连接", "请将戒指放在手机附近。")
+        state.session?.startAbort?.stoppedObservation != null && state.session.isPending ->
+            if (state.preservingExisting || state.taskPage == CollectionPage.DOWNLOADING)
+                HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
+            else HomeTask("数据待保存", "戒指已停止", "继续保存", state.error)
         state.preservingExisting -> HomeTask("准备戒指", "正在保存已有数据", "保存中…", "保存完成后即可开始。")
         state.checkingDevice -> HomeTask("采集准备", "正在检查戒指", "检查中…")
+        state.canStopUnconfirmedStart -> HomeTask("请先停止戒指", "本次时间信息异常", "停止并保留数据", "停止后会保留数据。")
         state.canStart -> HomeTask("开始这一段", "采集准备", "开始采集", "佩戴好设备，站定后将计步器清零。")
         state.session == null -> HomeTask("采集准备", "戒指暂未就绪", "重新检查", state.error)
         else -> when (state.taskPage) {
             CollectionPage.STARTING -> HomeTask("本次采集", "正在确认开始", "查看进度", "请站定等候。")
             CollectionPage.COLLECTING -> HomeTask("采集进行中", "正在采集", "查看采集")
             CollectionPage.STOPPING -> HomeTask("本次采集", "正在确认结束", "查看进度", "请站定等候。")
+            CollectionPage.FINISH -> HomeTask("采集已结束", "待保存本段", "继续收尾")
             CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
                 HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
             else HomeTask("本次采集", "结束状态待确认", "先填写步数", "可以先填写计步器读数。")
             CollectionPage.SAVING -> HomeTask("正在保存步数", "正在保存", "查看进度")
-            CollectionPage.DOWNLOADING -> HomeTask("正在下载数据", "步数已保存", "查看下载")
+            CollectionPage.DOWNLOADING -> if (state.session.startAbort != null)
+                HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
+            else HomeTask("正在下载数据", "步数已保存", "查看下载")
             CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
             CollectionPage.ERROR -> when {
                 state.session?.localData != null -> if (state.uploadAvailable)
@@ -325,6 +355,8 @@ abstract class StepCollectionActivity : Activity() {
         detail(device, "戒指", connectionLabel(state))
         ui.gap(device, 16)
         detail(device, "佩戴位置", state.placement?.displayName ?: "—")
+        ui.gap(device, 16)
+        detail(device, "活动", state.session?.activity?.label ?: "—")
         ui.text(footer, "站定后结束，再查看计步器读数。", 14f, muted = true)
         action(footer, "结束采集", state.canStop && !state.busy) { flow.stop() }
         updateElapsed()
@@ -346,8 +378,34 @@ abstract class StepCollectionActivity : Activity() {
         action(footer, "$heading…", false) {}
     }
 
+    private fun finishSession(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
+        title(body, "采集已结束", "选择本段记录的保存方式。")
+        val card = ui.card(body, ui.statusSurface)
+        detail(card, "活动", state.session?.activity?.label ?: "—")
+        ui.gap(card, 18)
+        detail(card, "开始时间", startDateTime(state.session))
+        action(footer, "保存并上传", !state.busy) { flow.chooseFinish(true) }
+        ui.button(footer, "保存，稍后上传", tag = "finish_defer") { flow.chooseFinish(false) }.isEnabled = !state.busy
+        ui.button(footer, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.isEnabled = !state.busy
+    }
+
+    private fun showDiscardConfirmation() {
+        val confirmation = AlertDialog.Builder(this).setTitle("放弃本段？")
+            .setMessage("删除手机中的本段记录并停止上传。戒指原始记录会保留。")
+            .setNegativeButton("继续保存", null).setPositiveButton("放弃本段", null).create()
+        dialog = confirmation
+        confirmation.setOnShowListener {
+            confirmation.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (!confirmation.isShowing) return@setOnClickListener
+                confirmation.dismiss()
+                flow.discardSession()
+            }
+        }
+        confirmation.show()
+    }
+
     private fun reference(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        title(body, "本次走了多少步？", "等计步器数字稳定后，填写显示的总数。")
+        title(body, "填写计步器读数", "等计步器数字稳定后，填写显示的总数。")
         val card = ui.card(body)
         val uncertain = state.session?.stopConfirmedAtMs == null
         if (uncertain && referenceKind == "valid") referenceKind = "unreliable"
@@ -370,7 +428,7 @@ abstract class StepCollectionActivity : Activity() {
             else -> "读数有问题？"
         }, tag = "reference_options") { showReferenceOptions(uncertain) }
         if (uncertain) { ui.gap(body, 14); ui.text(body, "还未确认结束，可以先记下读数。", 14f, muted = true) }
-        action(footer, if (state.uploadAvailable) "保存并上传" else "保存本次记录", !state.busy) {
+        action(footer, "保存本次记录", !state.busy) {
             rememberDrafts(); hideKeyboard()
             flow.saveReference(stepsDraft, referenceKind, if (referenceKind == "valid") "" else reasonDraft)
         }
@@ -379,6 +437,16 @@ abstract class StepCollectionActivity : Activity() {
     private fun transfer(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val complete = state.page == CollectionPage.COMPLETE
         val session = state.session
+        if (session?.startAbort != null) {
+            title(body, "正在保留戒指数据", "戒指已停止，请稍等片刻。")
+            val progress = ui.card(body)
+            detail(progress, "本次数据", "保存中")
+            progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
+                topMargin = ui.dp(20); gravity = Gravity.CENTER
+            })
+            action(footer, "返回首页") { flow.home() }
+            return
+        }
         val reference = session?.reference
         val localReviewRequired = state.records.any { it.sessionId == session?.sessionId && it.localReviewRequired }
         val localComplete = session?.localData?.files?.let { files ->
@@ -419,6 +487,7 @@ abstract class StepCollectionActivity : Activity() {
             uploaded -> "已完成"
             !state.uploadAvailable -> "待上传"
             uploadInFlight -> "正在上传…"
+            session?.completionPolicy == CompletionPolicy.SAVE_LATER -> "稍后上传"
             localComplete && session?.transfer?.status in setOf(SessionTransferStatus.FAILED, SessionTransferStatus.TRANSFERRING) -> "上传待重试"
             localComplete -> "待上传"
             else -> "等待下载完成"
@@ -439,15 +508,21 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun recovery(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val session = state.session?.takeIf { it.isPending }
-        val needsStop = session != null && session.stopConfirmedAtMs == null
+        val abortedStopConfirmed = session?.startAbort?.stoppedObservation != null
+        val needsStop = session != null && session.stopConfirmedAtMs == null && !abortedStopConfirmed
         val unconfirmedStart = session?.phase == FreeLivingSessionPhase.START_REQUESTED
         title(body, when {
+            state.canStopUnconfirmedStart -> "请先停止戒指"
+            abortedStopConfirmed -> "数据待保存"
+            session?.startAbort != null -> "停止待确认"
             session == null && state.connected -> "戒指暂未就绪"
             session == null -> "连接尚未完成"
             unconfirmedStart -> "开始待确认"
             needsStop -> "还需要确认一下"
             else -> "这一步未完成"
         }, when {
+            state.canStopUnconfirmedStart -> "本次时间信息异常，停止后会保留数据。"
+            abortedStopConfirmed -> "戒指已停止，重新连接后继续保存。"
             session == null && state.connected -> null
             session == null -> "请将戒指放在手机附近后重试。"
             needsStop -> "连接恢复后，重新检查戒指状态。"
@@ -456,7 +531,10 @@ abstract class StepCollectionActivity : Activity() {
         val card = ui.card(body)
         if (session == null) detail(card, "戒指", connectionLabel(state)) else {
             detail(card, "本次记录", "已保留")
-            if (!unconfirmedStart) {
+            if (abortedStopConfirmed) {
+                ui.gap(card, 18)
+                detail(card, "戒指", "已停止")
+            } else if (!unconfirmedStart) {
                 ui.gap(card, 18)
                 detail(card, "计步器读数", session.reference?.steps?.let { "$it 步" }
                     ?: if (session.reference != null) "已记录原因" else "待填写")
@@ -465,13 +543,20 @@ abstract class StepCollectionActivity : Activity() {
         if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
             ui.button(body, "先记下步数", tag = "preserve_reference") { flow.enterReference() }
         }
-        if (state.canEndStartAttempt) {
+        if (state.canEndStartAttempt && !state.canStopUnconfirmedStart) {
             ui.button(body, "结束本次尝试", tag = "end_start_attempt") { showEndStartAttempt() }
         }
-        action(footer, if (state.connecting) "连接中…" else if (!state.connected) "重新连接" else if (needsStop) "重新检查" else "重试",
-            state.canRetry && !state.busy && !state.connecting) {
+        val retryLabel = if (state.connecting) "连接中…" else if (!state.connected) "重新连接" else if (needsStop) "重新检查" else "重试"
+        val retryEnabled = state.canRetry && !state.busy && !state.connecting
+        val retry = {
             if (!state.connected) flow.reconnect() else flow.retry()
         }
+        if (state.canStopUnconfirmedStart) {
+            action(footer, "停止并保留数据", !state.busy) { flow.stop() }
+        } else if (session == null) {
+            ui.button(body, retryLabel, tag = "recovery_retry", action = retry).isEnabled = retryEnabled
+            action(footer, if (state.isSimulation) "退出演示" else "返回设备页") { finish() }
+        } else action(footer, retryLabel, retryEnabled, retry)
     }
 
     private fun showEndStartAttempt() {

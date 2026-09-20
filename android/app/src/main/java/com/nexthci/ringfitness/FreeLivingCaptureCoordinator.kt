@@ -42,6 +42,8 @@ data class ExistingRecordAuthorization(
     val ringAddress: String,
     val status: HealthMessage.Status,
     val records: List<HealthMessage.ListItem>,
+    val connectionGeneration: Long? = null,
+    val unknownTimeStartEvidence: UnknownTimeStartEvidence? = null,
 )
 
 data class CaptureControlState(
@@ -51,6 +53,7 @@ data class CaptureControlState(
     val observation: HealthRecordObservation? = null,
     val timeoutOperationId: Long? = null,
     val settling: Boolean = false,
+    val unconfirmedStartStopCandidate: HealthRecordObservation? = null,
 )
 
 /**
@@ -88,7 +91,7 @@ class FreeLivingCaptureCoordinator(
         var latestStopStatus: SensorPacket.Health? = null,
     )
     private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String,
-        val allowedExisting: ExistingRecordAuthorization?)
+        val allowedExisting: ExistingRecordAuthorization?, val activity: SessionActivity)
     private data class RecordIdentity(val sessionId: Int, val uptimeMs: Long, val unixMs: Long)
     private enum class StartWaitStage { BEFORE_START, BEFORE_STATUS }
     private data class StartWait(val id: Long, val generation: Long, val sessionId: String, val stage: StartWaitStage)
@@ -116,6 +119,8 @@ class FreeLivingCaptureCoordinator(
     private var stopPollCount = 0
     private var closed = false
     private var chargingRecoveryDeadline: Long? = null
+    private var startCommandIssued = false
+    private var unconfirmedStartStopCandidate: HealthRecordObservation? = null
 
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
     fun restore() = dispatch { if (!restored) readJournal() }
@@ -150,10 +155,11 @@ class FreeLivingCaptureCoordinator(
         publish(CaptureControlPhase.NEEDS_REVIEW, CaptureControlIssue.CONNECTION_LOST)
     }
 
-    fun requestStart(preparation: PreparationSnapshot, allowedExisting: ExistingRecordAuthorization? = null) = dispatch {
+    fun requestStart(preparation: PreparationSnapshot, allowedExisting: ExistingRecordAuthorization? = null,
+        activity: SessionActivity = SessionActivity.FREE_LIVING) = dispatch {
         if (!ensureRestored() || round != null || intent != null || session != null) return@dispatch
         if (!connectedTo(preparation.ring?.address)) return@dispatch
-        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting)
+        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting, activity)
         beginRound(Purpose.PREFLIGHT)
     }
 
@@ -507,7 +513,9 @@ class FreeLivingCaptureCoordinator(
                 val existing = try { store.readPending() } catch (_: Exception) { storageFailure(); return }
                 if (existing != null) { session = existing; publishRestored(); return }
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
-                    DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs, chargingRecovery)) } ?: return
+                    DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs, chargingRecovery,
+                        requested.allowedExisting?.unknownTimeStartEvidence),
+                    requested.activity) } ?: return
                 baseline = observed
                 startPollCount = 0
                 check(saved.phase == FreeLivingSessionPhase.START_REQUESTED)
@@ -518,6 +526,7 @@ class FreeLivingCaptureCoordinator(
                         return@waitForStart
                     }
                     if (send(port::start)) {
+                        startCommandIssued = true
                         // This delay starts at local enqueue, not at confirmed device execution.
                         waitForStart(StartWaitStage.BEFORE_STATUS, START_FIRST_POLL_DELAY_MS) {
                             beginRound(Purpose.START)
@@ -573,13 +582,21 @@ class FreeLivingCaptureCoordinator(
         val before = baseline
         val current = session ?: return
         val candidate = observed.records.singleOrNull { record -> before?.let {
-            FreeLivingSessionStore.isDistinctStartRecord(DeviceStartBaseline(it.status, it.records, it.statusReceivedAtMs), record)
+            FreeLivingSessionStore.isDistinctStartRecord(requireNotNull(current.startBaseline), record)
         } == true }
         if (before == null || before.connectionGeneration != generation || !observed.status.collecting || candidate == null ||
             candidate.sessionId == 0 ||
             candidate.sessionId != observed.status.sessionId || (candidate.unixMs == 0L && candidate.uptimeMs == 0L) ||
             candidate.bytes < observed.status.bytes || candidate.records < observed.status.records ||
             !onlyKnownRecords(observed, candidate)) {
+            val proof = current.startBaseline?.unknownTimeStartEvidence
+            val pendingRecord = observed.records.singleOrNull { it.sessionId == observed.status.sessionId }
+            if (startCommandIssued && before?.connectionGeneration == generation && observed.status.collecting &&
+                observed.status.errorCode == 0 && proof != null && pendingRecord != null &&
+                proof.canStopWithoutUnix(pendingRecord) && pendingRecord.bytes >= observed.status.bytes &&
+                pendingRecord.records >= observed.status.records && onlyKnownRecords(observed, pendingRecord)) {
+                unconfirmedStartStopCandidate = observed
+            }
             review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
             return
         }
@@ -657,7 +674,16 @@ class FreeLivingCaptureCoordinator(
         if (observed.records.none { it.sessionId == observed.status.sessionId && it.bytes == observed.status.bytes &&
                 it.records == observed.status.records }) return false
         if (authorization?.ringAddress?.uppercase(Locale.ROOT) == observed.address && authorization.status == observed.status &&
-            authorization.records.toSet() == observed.records.toSet()) return true
+            authorization.records.toSet() == observed.records.toSet()) {
+            val proof = authorization.unknownTimeStartEvidence
+            if (proof != null) {
+                if (authorization.connectionGeneration != generation || proof.connectionGeneration != generation ||
+                    proof.clock.ringAddress != observed.address) return false
+                return runCatching { proof.validate(DeviceStartBaseline(observed.status, observed.records,
+                    observed.statusReceivedAtMs)) }.isSuccess
+            }
+            return authorization.connectionGeneration == null || authorization.connectionGeneration == generation
+        }
         return try { store.hasPreservedDeviceRecords(observed.address, observed.records) }
         catch (_: Exception) { storageFailure(); false }
     }
@@ -733,6 +759,8 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun clearAssociation() {
+        startCommandIssued = false
+        unconfirmedStartStopCandidate = null
         chargingRecoveryDeadline = null
         startWait = null
         startPollCount = 0
@@ -795,7 +823,8 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun publish(phase: CaptureControlPhase, issue: CaptureControlIssue? = null, observed: HealthRecordObservation? = null) {
-        state = CaptureControlState(phase, session, issue, observed, round?.id, settling = startWait != null || stopWait != null)
+        state = CaptureControlState(phase, session, issue, observed, round?.id, settling = startWait != null || stopWait != null,
+            unconfirmedStartStopCandidate = unconfirmedStartStopCandidate)
         onState(state)
     }
 
@@ -829,7 +858,7 @@ class FreeLivingCaptureCoordinator(
         const val START_FIRST_POLL_DELAY_MS = 1_000L
         const val START_POLL_INTERVAL_MS = 1_500L
         const val START_POLL_LIMIT = 3
-        const val STOP_FIRST_POLL_DELAY_MS = 1_000L
+        const val STOP_FIRST_POLL_DELAY_MS = 5_000L
         const val STOP_POLL_INTERVAL_MS = 1_500L
         const val STOP_POLL_LIMIT = 3
     }
