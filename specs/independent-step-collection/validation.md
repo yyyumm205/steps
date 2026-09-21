@@ -892,15 +892,17 @@ UI静态审查发现的连接／ready冲突、忙碌时管理入口、重复设�
 | 页面与可达性 | 三种收尾同页呈现；空数字就地提示；返回、重开恢复同一任务 | API31相关套件52项行为通过、1项按需目录导出跳过；最终4项定向检查及130%字号2项通过，字号已恢复。检查实际收尾、暂存卡和记录页面截图。修复新段准备时短暂借用上一段活动的显示问题 |
 | 自动检查、构建与审查 | Store／Controller／Queue与页面回归；JVM、Debug、AndroidTest、Release及lintVitalRelease；独立只读审查 | 604项JVM通过，0失败／跳过；520项Python通过。构建及lintVitalRelease通过。独立审查及修复复核未发现新增确定阻断；后台网络恢复仍须设备覆盖 |
 | 后台权限与电池限制 | API33+首次进入采集询问一次通知权限；设置按实际状态提供通知、电池系统入口；拒绝仍可继续 | 权限策略单元检查通过；三星现有通知权限下进入真实采集成功。首次拒绝及华为／小米后台限制另行设备验证 |
-| 长上传前台保护 | 上传任务使用`dataSync`通知；停止、销毁与超时取消当前执行并保留持久队列 | 编译、Manifest运行检查与只读审查通过；完全后台网络恢复、真实弱网／网络切换和长文件尚待验证 |
+| 长上传前台保护 | 上传任务使用`dataSync`通知；停止、销毁与超时取消当前执行并保留持久队列 | 编译、Manifest运行检查与只读审查通过；三星App可见时网络恢复后，系统自动执行上传任务并成功取得回执，无强制调度。完全后台网络恢复、真实弱网／网络切换和长文件尚待验证 |
 | 可升级签名包 | 专用release证书、签名轮换lineage和SHA核验；原位升级保留私有文件；发布包无开发入口 | 三星SM-F7310／API34从Debug原位升级成功，111个持久文件名与SHA一致；最终APK在API31再次通过原位升级及所有持久文件SHA核对。两系统版本50、non-debuggable、无Demo Activity运行检查均通过；脚本只读审查通过 |
-| 真机三分支 | 逐段操作立即保存、暂存恢复与放弃；核对TX、账本、文件、回执与研究端读回 | 三星API34真实走路段已由用户结束并填写1步；账本确认SAVE_UPLOAD、参考valid、下载完成。raw为282,998字节，独立SHA重算一致，解析证据含1,647条记录、26,464个IMU样本。当前无可用网络，任务pending、尝试0、无回执；真实暂存和放弃分支仍待执行 |
+| 真机三分支 | 逐段操作立即保存、暂存恢复与放弃；核对TX、账本、文件、回执与研究端读回 | 三星API34真实走路段已由用户结束并填写1步；账本确认SAVE_UPLOAD、参考valid、下载完成。raw为282,998字节，独立SHA重算一致，解析证据含1,647条记录、26,464个IMU样本。离线时pending、尝试0、无回执；恢复网络后自动上传完成、尝试1并取得回执。真实暂存和放弃分支仍待执行 |
 
 复现：在`android`目录执行`gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease lintVitalRelease --no-daemon --console=plain`。安装Debug及AndroidTest后，对API31执行`adb -s <serial> shell am instrument -w -r -e verifyCollectionFlow true -e captureFlowScreens true -e class com.nexthci.ringfitness.CollectionFlowInstrumentedTest,com.nexthci.ringfitness.RealCollectionBridgeInstrumentedTest,com.nexthci.ringfitness.RealUploadServiceManifestInstrumentedTest com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner`。本轮完整套件367.792秒，最终定向4项62.072秒。首次运行的旧无配置页面夹具已更新；并行安装曾中断旧运行，之后由单一设备操作者完整重跑，验收只采用重跑结果。
 
 专用发布脚本及材料备份方法见`android/README.md`。升级检查通过显式`-e verifyReleaseDelivery true`运行`ReleaseDeliveryInstrumentedTest#snapshotBeforeUpgrade`，安装后运行`#releaseRetainsFilesAndOmitsDevelopmentEntry`。真实数据导出辅助检查仅在采集停止、任务静止后运行；源码中的路径只写应用专属外部目录，导出物按本地敏感证据管理。Python沿用项目环境执行`python -m pytest backend/ringo_data/tests -q`；本轮520项、30.66秒。
 
 最终APK SHA-256为`da834d386fc5a0f9e16acf7b066ac5952cd5ca99bd36971b216921dd90166eb8`。三星在上述新段下载完成后再次原位更新最终APK，更新前后全部持久文件名和SHA一致；该次检查包含新增的参考、原始文件及上传任务。API31的大字号定向2项44.818秒，结束后恢复系统字号。
+
+网络恢复与云端读回：设备系统指定的域名解析服务不可达，导致云盘域名无法解析；经用户授权恢复系统自动解析后，云盘及另一公共站点连通。App当前用户的走路、跑步各1步记录均由正常JobScheduler任务自动上传，未强制运行Job、改参考值或重建session。两份冻结ZIP的云端读回SHA与手机逐字节对应，研究端均导入为`imported`，参考CSV各保留1步；IMU CSV分别有26,464行与224行。既有自动读取配置完成下载与Python处理，本次未手动下载网页ZIP。设备边界仍为`uncertain`，分析状态仍为`pending_review`；传输成功不提升研究时间质量。网络具体配置、原始回执和哈希明细仅保留本地。
 
 E35同步核对通知权限、电池限制、长上传前台保护和可升级签名包；10小时设备运行与完整正式发布仍按B16和E31逐级取证。0.8.7及更早的“保存稍后上传”证据只证明手机已有原始文件后的云盘暂缓，不能作为戒指暂存通过证据。
 
