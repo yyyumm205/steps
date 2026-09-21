@@ -255,7 +255,7 @@ def test_damaged_conflict_stays_retryable_while_other_good_archives_continue(tmp
     assert retried["index"]["sessions"] == 2
 
 
-def test_tampered_canonical_manifest_cannot_claim_new_raw_and_new_archive_retries(tmp_path, capsys):
+def test_tampered_canonical_manifest_cannot_claim_unrelated_new_raw(tmp_path, capsys):
     scanner, incoming, clock = scanner_at(tmp_path)
     first = archive_at(incoming / "a.zip")
     settled_scan(scanner, clock)
@@ -267,49 +267,45 @@ def test_tampered_canonical_manifest_cannot_claim_new_raw_and_new_archive_retrie
     tampered = json.loads(original)
     tampered["files"][0]["sha256"] = second["files"][0]["sha256"]
     canonical_manifest.write_text(json.dumps(tampered))
+    preserved = canonical_manifest.read_bytes()
 
     scanner.scan()
     clock.now += 11
-    failed = scanner.scan()
-    event = next(entry for entry in failed["files"] if entry["file"] == "b.zip")
-    assert event["status"] == "error"
-    assert "existing canonical session integrity error" in event["reason"]
-    assert failed["index"]["status"] == "index_error"
-    assert not (scanner.output / "sessions" / second["session_id"]).exists()
+    imported = scanner.scan()
+    event = next(entry for entry in imported["files"] if entry["file"] == "b.zip")
+    assert event["status"] == "imported"
+    assert imported["index"]["status"] == "index_error"
+    assert (scanner.output / "sessions" / second["session_id"] / "source.zip").is_file()
     assert not (scanner.output / "conflicts" / second["session_id"]).exists()
     assert not (scanner.output / "rejected").exists()
+    assert canonical_manifest.read_bytes() == preserved
 
-    assert main(["import", str(incoming / "b.zip"), "--output", str(scanner.output)]) == 2
-    cli_event = json.loads(capsys.readouterr().err)
-    assert cli_event["status"] == "research_store_error"
-    assert cli_event["retryable"] is True
-    assert not (scanner.output / "sessions" / second["session_id"]).exists()
+    assert main(["import", str(incoming / "b.zip"), "--output", str(scanner.output)]) == 0
+    cli_event = json.loads(capsys.readouterr().out)
+    assert cli_event["status"] == "already_imported"
+    assert (scanner.output / "sessions" / second["session_id"]).exists()
     assert not (scanner.output / "conflicts" / second["session_id"]).exists()
     assert not (scanner.output / "rejected").exists()
+    assert canonical_manifest.read_bytes() == preserved
 
     canonical_manifest.write_bytes(original)
-    retried = scanner.scan()
-    event = next(entry for entry in retried["files"] if entry["file"] == "b.zip")
-    assert event["status"] == "imported"
-    assert retried["index"]["status"] == "indexed"
-    assert retried["index"]["sessions"] == 2
+    recovered = scanner.scan()
+    assert recovered["index"]["status"] == "indexed"
+    assert recovered["index"]["sessions"] == 2
 
 
-@pytest.mark.parametrize("name,damage", [
-    ("import.json", {}), ("import.json", []),
-    ("import.json", {"session_id": "missing_hash", "artifacts": {}}),
-    ("quality.json", {}), ("quality.json", []),
-    ("quality.json", {"analysis_status": "pending_review"}),
-    ("quality.json", {"analysis_status": "pending_review", "analysis_reasons": None}),
-    ("quality.json", {"analysis_status": "pending_review", "analysis_reasons": [1]}),
+@pytest.mark.parametrize("damage", [
+    {}, [], {"analysis_status": "pending_review"},
+    {"analysis_status": "pending_review", "analysis_reasons": None},
+    {"analysis_status": "pending_review", "analysis_reasons": [1]},
 ])
-def test_structurally_damaged_metadata_keeps_sync_running_and_preserves_new_good_sessions(tmp_path, name, damage):
+def test_structurally_damaged_quality_keeps_sync_running_and_preserves_new_good_sessions(tmp_path, damage):
     scanner, incoming, clock = scanner_at(tmp_path)
     first = archive_at(incoming / "a.zip")
     settled_scan(scanner, clock)
     index = scanner.output / "session-index.csv"
     before = index.read_bytes()
-    damaged = scanner.output / "sessions" / first["session_id"] / name
+    damaged = scanner.output / "sessions" / first["session_id"] / "quality.json"
     damaged.write_text(json.dumps(damage))
     preserved = damaged.read_bytes()
     # A restarted watcher must handle reimport of the damaged record as a rejected/error result.
@@ -329,6 +325,38 @@ def test_structurally_damaged_metadata_keeps_sync_running_and_preserves_new_good
     assert next_round["index"]["status"] == "index_error"
     assert (scanner.output / "sessions" / third["session_id"] / "source.zip").is_file()
     assert index.read_bytes() == before and damaged.read_bytes() == preserved
+
+
+@pytest.mark.parametrize("damage", [{}, [], {"session_id": "missing_hash", "artifacts": {}}])
+def test_untrusted_import_receipt_blocks_new_canonical_until_repaired(tmp_path, damage):
+    scanner, incoming, clock = scanner_at(tmp_path)
+    first = archive_at(incoming / "a.zip")
+    settled_scan(scanner, clock)
+    receipt = scanner.output / "sessions" / first["session_id"] / "import.json"
+    original = receipt.read_bytes()
+    receipt.write_text(json.dumps(damage))
+    preserved = receipt.read_bytes()
+
+    scanner = DirectorySync(incoming, scanner.output, monotonic=clock)
+    scanner.scan()
+    second_raw = distinct_raw(2)
+    second = archive_at(incoming / "b.zip", raw=second_raw, manifest=manifest_for(second_raw, 2))
+    failed = settled_scan(scanner, clock)
+    event = next(entry for entry in failed["files"] if entry["file"] == "b.zip")
+    assert event["status"] == "error"
+    assert "existing canonical session integrity error" in event["reason"]
+    assert failed["index"]["status"] == "index_error"
+    assert not (scanner.output / "sessions" / second["session_id"]).exists()
+    assert not (scanner.output / "conflicts" / second["session_id"]).exists()
+    assert not (scanner.output / "rejected").exists()
+    assert receipt.read_bytes() == preserved
+
+    receipt.write_bytes(original)
+    recovered = scanner.scan()
+    event = next(entry for entry in recovered["files"] if entry["file"] == "b.zip")
+    assert event["status"] == "imported"
+    assert recovered["index"]["status"] == "indexed"
+    assert recovered["index"]["sessions"] == 2
 
 
 def test_once_cli_imports_one_settled_batch_and_can_be_repeated(tmp_path, capsys):

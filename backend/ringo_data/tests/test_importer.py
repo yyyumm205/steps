@@ -473,6 +473,128 @@ def test_same_raw_content_across_sessions_is_quarantined_with_canonical_owner(tm
     assert [row["session_id"] for row in rows] == [first_manifest["session_id"]]
 
 
+def test_damaged_materialized_manifest_cannot_hide_existing_raw_owner(tmp_path):
+    raw = raw_bytes()
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=raw, manifest=manifest_for(raw, session_number=1))
+    second_manifest = archive_at(second, raw=raw, manifest=manifest_for(raw, session_number=2))
+    root = tmp_path / "out"
+    canonical = Path(import_archive(first, root).directory)
+    stored_manifest = canonical / "manifest.json"
+    damaged = json.loads(stored_manifest.read_bytes())
+    damaged["files"][0]["sha256"] = "0" * 64
+    stored_manifest.write_text(json.dumps(damaged))
+    preserved = stored_manifest.read_bytes()
+
+    result = import_archive(second, root)
+
+    assert {path.name for path in (root / "sessions").iterdir()} == {first_manifest["session_id"]}
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert result.status == "conflict"
+    assert Path(result.directory).parts[-3:-1] == ("conflicts", second_manifest["session_id"])
+    assert not (root / "rejected").exists()
+    assert stored_manifest.read_bytes() == preserved
+
+
+def test_tampered_receipt_and_materialized_manifest_cannot_hide_frozen_raw_owner(tmp_path):
+    raw = raw_bytes()
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=raw, manifest=manifest_for(raw, session_number=1))
+    second_manifest = archive_at(second, raw=raw, manifest=manifest_for(raw, session_number=2))
+    root = tmp_path / "out"
+    canonical = Path(import_archive(first, root).directory)
+    stored_manifest, receipt_path = canonical / "manifest.json", canonical / "import.json"
+    damaged = json.loads(stored_manifest.read_bytes())
+    damaged["files"][0]["sha256"] = "0" * 64
+    stored_manifest.write_text(json.dumps(damaged))
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["artifacts"]["manifest.json"] = sha256(stored_manifest)
+    receipt_path.write_text(json.dumps(receipt))
+    preserved_manifest, preserved_receipt = stored_manifest.read_bytes(), receipt_path.read_bytes()
+
+    result = import_archive(second, root)
+
+    assert {path.name for path in (root / "sessions").iterdir()} == {first_manifest["session_id"]}
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert result.status == "conflict"
+    assert Path(result.directory).parts[-3:-1] == ("conflicts", second_manifest["session_id"])
+    assert not (root / "rejected").exists()
+    assert stored_manifest.read_bytes() == preserved_manifest
+    assert receipt_path.read_bytes() == preserved_receipt
+
+
+def test_damaged_derived_cache_does_not_hide_existing_raw_owner(tmp_path):
+    raw = raw_bytes()
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=raw, manifest=manifest_for(raw, session_number=1))
+    second_manifest = archive_at(second, raw=raw, manifest=manifest_for(raw, session_number=2))
+    root = tmp_path / "out"
+    canonical = Path(import_archive(first, root).directory)
+    quality = canonical / "quality.json"
+    quality.write_bytes(b"damaged derived cache")
+    preserved = quality.read_bytes()
+
+    result = import_archive(second, root)
+
+    assert {path.name for path in (root / "sessions").iterdir()} == {first_manifest["session_id"]}
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert result.status == "conflict"
+    assert Path(result.directory).parts[-3:-1] == ("conflicts", second_manifest["session_id"])
+    assert not (root / "rejected").exists()
+    assert quality.read_bytes() == preserved
+
+
+def test_canonical_owner_uses_one_verified_temporary_snapshot(tmp_path, monkeypatch):
+    import backend.ringo_data.importer as importer
+
+    raw = raw_bytes()
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=raw, manifest=manifest_for(raw, session_number=1))
+    second_manifest = archive_at(second, raw=raw, manifest=manifest_for(raw, session_number=2))
+    root = tmp_path / "out"
+    frozen = Path(import_archive(first, root).directory) / "source.zip"
+    original_check, checked = importer.check_zip_directory, []
+
+    def change_original_during_owner_check(path, maximum_entries):
+        checked.append(Path(path))
+        if len(checked) == 2:
+            assert Path(path) != frozen
+            frozen.write_bytes(b"changed after the verified snapshot")
+        return original_check(path, maximum_entries)
+
+    monkeypatch.setattr(importer, "check_zip_directory", change_original_during_owner_check)
+    result = import_archive(second, root)
+
+    assert result.status == "conflict"
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert {path.name for path in (root / "sessions").iterdir()} == {first_manifest["session_id"]}
+    assert len(checked) == 2 and not checked[1].exists()
+
+
+def test_damaged_manifest_and_unverified_frozen_source_block_new_owner_retryably(tmp_path):
+    first_raw, second_raw = raw_bytes(), raw_bytes([imu(10021), ppg(10041)])
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=first_raw, manifest=manifest_for(first_raw, session_number=1))
+    second_manifest = archive_at(second, raw=second_raw, manifest=manifest_for(second_raw, session_number=2))
+    root = tmp_path / "out"
+    canonical = Path(import_archive(first, root).directory)
+    stored_manifest = canonical / "manifest.json"
+    frozen = canonical / "source.zip"
+    stored_manifest.write_bytes(b"damaged manifest")
+    frozen.write_bytes(frozen.read_bytes() + b"damaged frozen source")
+    preserved_manifest, preserved_frozen = stored_manifest.read_bytes(), frozen.read_bytes()
+
+    with pytest.raises(ResearchStoreIntegrityError, match="frozen source archive checksum mismatch"):
+        import_archive(second, root)
+
+    assert {path.name for path in (root / "sessions").iterdir()} == {first_manifest["session_id"]}
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert not (root / "conflicts").exists()
+    assert not (root / "rejected").exists()
+    assert stored_manifest.read_bytes() == preserved_manifest
+    assert frozen.read_bytes() == preserved_frozen
+
+
 def test_device_unix_zero_stays_unknown_and_uptime_wrap_is_not_repaired(tmp_path):
     raw = raw_bytes([imu(0xFFFFFFF0), imu(20)], uptime=0xFFFFFFDC, anchor=0)
     source = tmp_path / "input.zip"

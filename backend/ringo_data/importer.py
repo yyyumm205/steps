@@ -68,6 +68,31 @@ def sha256(path: Path):
     return digest.hexdigest()
 
 
+def bounded_file_bytes(path, maximum, label):
+    require(path.is_file() and not path.is_symlink(), f"{label} is not a regular file")
+    with path.open("rb") as stream:
+        data = stream.read(maximum + 1)
+    require(0 < len(data) <= maximum, f"{label} size exceeds quota")
+    return data
+
+
+@contextmanager
+def verified_archive_snapshot(path, maximum, expected_digest, label):
+    require(path.is_file() and not path.is_symlink(), f"{label} is not a regular file")
+    with tempfile.TemporaryDirectory(prefix="ringfitness-owner-") as temporary:
+        snapshot = Path(temporary) / "source.zip"
+        digest, count = hashlib.sha256(), 0
+        with path.open("rb") as source, snapshot.open("xb") as target:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                count += len(chunk)
+                require(count <= maximum, f"{label} size exceeds quota")
+                digest.update(chunk)
+                target.write(chunk)
+        require(count > 0, f"{label} is empty")
+        require(digest.hexdigest() == expected_digest, f"{label} checksum mismatch")
+        yield snapshot
+
+
 def write_json(path: Path, value):
     with path.open("w", encoding="utf-8", newline="\n") as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
@@ -274,8 +299,12 @@ def decode_archive(stage, manifest, limits):
     return quality
 
 
-def read_import_receipt(destination):
-    receipt = object_value(strict_json((destination / "import.json").read_bytes()), "existing import receipt")
+def read_import_receipt(destination, maximum_bytes=None):
+    path = destination / "import.json"
+    data = path.read_bytes() if maximum_bytes is None else bounded_file_bytes(
+        path, maximum_bytes, "existing import receipt"
+    )
+    receipt = object_value(strict_json(data), "existing import receipt")
     require({"session_id", "zip_sha256", "artifacts"} <= set(receipt), "existing import receipt fields missing")
     require(type(receipt["session_id"]) is str and receipt["session_id"], "existing import identity is invalid")
     require(type(receipt["zip_sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", receipt["zip_sha256"]),
@@ -299,7 +328,28 @@ def existing_result(destination, session_id, digest):
     return receipt.get("zip_sha256") == digest
 
 
-def canonical_raw_duplicate(root, session_id, raw_entries):
+def canonical_ownership_manifest(directory, limits):
+    receipt = read_import_receipt(directory, limits.json_bytes)
+    require(receipt["session_id"] == directory.name, "existing import identity is inconsistent")
+    require(receipt.get("status") == "imported", "existing canonical import status is invalid")
+    artifacts = object_value(receipt["artifacts"], "existing artifact hashes")
+    source_digest = artifacts.get("source.zip")
+    require(type(source_digest) is str and re.fullmatch(r"[0-9a-f]{64}", source_digest) and
+            receipt["zip_sha256"] == source_digest, "existing ownership receipt is inconsistent")
+
+    with verified_archive_snapshot(
+        directory / "source.zip", limits.archive_bytes, source_digest, "frozen source archive"
+    ) as source:
+        check_zip_directory(source, limits.entries)
+        with zipfile.ZipFile(source) as archive:
+            entries = inspect_zip(archive, limits)
+            manifest_bytes = archive.read(entries["manifest.json"])
+    manifest = validate_manifest(strict_json(manifest_bytes))
+    require(manifest["session_id"] == directory.name, "session directory identity differs from frozen manifest")
+    return manifest
+
+
+def canonical_raw_duplicate(root, session_id, raw_entries, limits):
     incoming = {entry["sha256"] for entry in raw_entries}
     sessions = root / "sessions"
     try:
@@ -310,9 +360,8 @@ def canonical_raw_duplicate(root, session_id, raw_entries):
     for directory in sorted(sessions.glob("*")):
         try:
             require(directory.is_dir() and not directory.is_symlink(), "session entry is not a regular directory")
-            manifest = validate_manifest(strict_json((directory / "manifest.json").read_bytes()))
-            require(directory.name == manifest["session_id"], "session directory identity differs from manifest")
-        except (OSError, ValidationError) as error:
+            manifest = canonical_ownership_manifest(directory, limits)
+        except (OSError, ValidationError, zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, UnicodeError) as error:
             raise ResearchStoreIntegrityError(
                 f"existing canonical session integrity error ({directory.name}): {error}"
             ) from error
@@ -320,13 +369,6 @@ def canonical_raw_duplicate(root, session_id, raw_entries):
             continue
         shared = sorted(incoming & {entry["sha256"] for entry in manifest["files"] if entry["role"] == "raw"})
         if shared:
-            try:
-                receipt = read_import_receipt(directory)
-                existing_result(directory, manifest["session_id"], receipt["zip_sha256"])
-            except (OSError, ValidationError) as error:
-                raise ResearchStoreIntegrityError(
-                    f"existing canonical session integrity error ({directory.name}): {error}"
-                ) from error
             return {"session_id": manifest["session_id"], "raw_sha256": shared}
     return None
 
@@ -388,7 +430,7 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None, *, ex
                         f"existing canonical session integrity error ({session_id}): {error}"
                     ) from error
             raw_entries = [entry for entry in manifest["files"] if entry["role"] == "raw"]
-            duplicate = canonical_raw_duplicate(root, session_id, raw_entries)
+            duplicate = canonical_raw_duplicate(root, session_id, raw_entries, limits)
             quality = decode_archive(stage, manifest, limits)
             conflict = destination.exists() or duplicate is not None
             status = "conflict" if conflict else "imported"
