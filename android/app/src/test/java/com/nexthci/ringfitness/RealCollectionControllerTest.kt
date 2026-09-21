@@ -141,7 +141,7 @@ class RealCollectionControllerTest {
                 val last = first.copy(bytes = finalRecord.bytes, records = finalRecord.records)
                 f.owner.stop(); f.observe(stopped().copy(sessionId = 8), listOf(last))
                 assertEquals(CollectionPage.FINISH, f.owner.state.page)
-                f.owner.chooseFinish(false); f.owner.saveReference("0", "valid", "")
+                f.owner.chooseFinish(true); f.owner.saveReference("0", "valid", "")
                 val oldConnection = f.port.generation
                 f.observe(stopped().copy(sessionId = 8), listOf(last))
                 assertTrue(f.port.generation > oldConnection)
@@ -387,29 +387,77 @@ class RealCollectionControllerTest {
         } }
     }
 
-    @Test fun saveLaterCompletesLocallyAndReopeningKeepsUploadDeferredUntilExplicitRetry() {
+    @Test fun deferKeepsRawOnRingUntilExplicitResumeThenDownloadsAndUploadsTheSameSession() {
         val uploads = RecordingUploads()
         Fixture(uploads).use { f ->
             f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
             assertEquals(CollectionPage.FINISH, f.owner.state.page)
             assertTrue(f.port.reads.isEmpty())
-            f.owner.chooseFinish(false)
-            assertEquals(CompletionPolicy.SAVE_LATER, f.store.readPending()!!.completionPolicy)
-            f.owner.saveReference("0", "valid", "")
-            f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
-            val saved = f.store.read()!!
-            assertEquals(0L, saved.reference!!.steps)
-            assertEquals(SessionActivity.WALKING, saved.activity)
+            f.owner.finalizeSession(false, "0", "valid", "")
+            val deferred = requireNotNull(f.store.readPending())
+            assertEquals(CompletionPolicy.DEFER_ON_RING, deferred.completionPolicy)
+            assertEquals(0L, deferred.reference!!.steps)
+            assertEquals(SessionActivity.WALKING, deferred.activity)
+            assertNull(deferred.localData)
+            assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
             assertTrue(uploads.requests.isEmpty())
-            assertTrue(f.owner.state.records.single().uploadDeferred)
-            f.reopen(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord))
-            assertEquals(saved, f.store.read())
+            assertTrue(f.owner.state.records.single().ringDeferred)
+            assertFalse(f.owner.state.records.single().uploadDeferred)
+            assertTrue(f.owner.canReleaseIfIdle())
+
+            val startCount = f.port.count("start")
+            val stopCount = f.port.count("stop")
+            f.owner.retry(); f.owner.reconnect()
+            f.health(stopped()); f.health(finalRecord); f.health(HealthMessage.ListEnd(1))
+            f.owner.onTime(f.port.generation, SensorPacket.TimeStatus(true, f.clock.now, 1_000, ++f.clock.now))
+            assertEquals(CompletionPolicy.DEFER_ON_RING, f.store.readPending()!!.completionPolicy)
+            assertTrue(f.port.reads.isEmpty())
             assertTrue(uploads.requests.isEmpty())
-            f.owner.retryUpload(saved.sessionId)
-            assertEquals(listOf(saved.sessionId to true), uploads.requests)
-            assertEquals(CompletionPolicy.SAVE_UPLOAD, f.store.read()!!.completionPolicy)
-            assertEquals(saved.reference, f.store.read()!!.reference)
+            f.owner.onDisconnected(f.port.generation, "测试断连")
+            assertEquals(0, f.waitCount(3_000))
+
+            f.reopen()
+            assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
+            assertEquals(deferred, f.store.readPending())
+            assertTrue(f.port.reads.isEmpty())
+            assertTrue(f.owner.canReleaseIfIdle())
+            f.owner.retry(); f.owner.reconnect(); f.owner.onConnected(f.port.generation)
+            assertEquals(CompletionPolicy.DEFER_ON_RING, f.store.readPending()!!.completionPolicy)
+            assertTrue(f.port.reads.isEmpty())
+            assertTrue(uploads.requests.isEmpty())
+
+            f.owner.resumeRingTransfer()
+            assertEquals(CompletionPolicy.SAVE_UPLOAD, f.store.readPending()!!.completionPolicy)
+            f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertEquals(1, f.port.reads.size)
+            f.finishDownload()
+            val saved = requireNotNull(f.store.read(deferred.sessionId))
+            assertEquals(deferred.sessionId, saved.sessionId)
+            assertEquals(deferred.reference, saved.reference)
+            assertNotNull(saved.localData)
+            assertEquals(listOf(saved.sessionId to false), uploads.requests)
+            assertEquals(startCount, f.port.count("start"))
+            assertEquals(stopCount, f.port.count("stop"))
         }
+    }
+
+    @Test fun deferredSessionCanBeDiscardedWithoutChangingAnEarlierSavedRecord() = Fixture().use { f ->
+        val previous = f.seedLocal()
+        val previousRaw = File(f.directory, previous.localData!!.files.single().fileName)
+        val previousBytes = previousRaw.readBytes()
+        f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        f.owner.finalizeSession(false, "4", "valid", "")
+        val deferred = requireNotNull(f.store.readPending())
+        assertTrue(deferred.isRingDeferred)
+
+        f.owner.discardSession()
+
+        assertNull(f.store.readPending())
+        assertTrue(f.store.read(deferred.sessionId)!!.isDiscarded)
+        assertEquals(previous, f.store.read(previous.sessionId))
+        assertArrayEquals(previousBytes, previousRaw.readBytes())
+        assertTrue(f.port.reads.isEmpty())
     }
 
     @Test fun unavailableUploadConfigurationFallsBackToEditableLocalSaveWithoutQueuing() {
@@ -489,7 +537,7 @@ class RealCollectionControllerTest {
         f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
         assertEquals(CollectionPage.FINISH, f.owner.state.page)
         assertTrue(f.port.reads.isEmpty())
-        f.owner.chooseFinish(false)
+        f.owner.chooseFinish(true)
         f.owner.saveReference("73", "unreliable", "计步器读数可能偏低")
         val savedReference = f.store.readPending()!!.reference
         f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
@@ -747,12 +795,28 @@ class RealCollectionControllerTest {
         f.failCommit = false
         f.owner.finalizeSession(false, "0", "valid", "")
         val saved = requireNotNull(f.store.read())
-        assertEquals(CompletionPolicy.SAVE_LATER, saved.completionPolicy)
+        assertEquals(CompletionPolicy.DEFER_ON_RING, saved.completionPolicy)
         assertEquals(0L, saved.reference!!.steps)
         assertEquals(before.sessionId, saved.sessionId)
+        assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
         assertTrue(f.port.reads.isEmpty())
         f.observe(stopped(), listOf(finalRecord))
+        assertTrue(f.port.reads.isEmpty())
+        f.owner.resumeRingTransfer()
+        f.observe(stopped(), listOf(finalRecord))
         assertEquals(1, f.port.reads.size)
+    }
+
+    @Test fun legacySeparateDeferChoiceCannotCommitBeforeTheReference() = Fixture().use { f ->
+        f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+
+        f.owner.chooseFinish(false)
+
+        val pending = requireNotNull(f.store.readPending())
+        assertNull(pending.completionPolicy)
+        assertNull(pending.reference)
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertTrue(f.port.reads.isEmpty())
     }
 
     @Test fun rejectedStopReturnsToCollectingAndCanBeRetriedWithoutInventingAnEnd() = Fixture().use { f ->
@@ -1013,20 +1077,23 @@ class RealCollectionControllerTest {
         assertTrue(f.owner.state.connecting)
         assertEquals(CollectionPage.FINISH, f.owner.state.page)
         assertFalse(f.owner.state.busy)
-        f.owner.chooseFinish(false)
-        assertEquals(CollectionPage.REFERENCE, f.owner.state.page)
-        f.owner.saveReference("73", "valid", "")
+        f.owner.finalizeSession(false, "73", "valid", "")
         val saved = requireNotNull(f.store.readPending())
         assertEquals(stoppedSession.sessionId, saved.sessionId)
         assertEquals(stoppedSession.stopConfirmedAtMs, saved.stopConfirmedAtMs)
         assertEquals(73L, saved.reference!!.steps)
-        assertEquals(CompletionPolicy.SAVE_LATER, saved.completionPolicy)
+        assertEquals(CompletionPolicy.DEFER_ON_RING, saved.completionPolicy)
+        assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
         assertTrue(f.port.reads.isEmpty())
         f.reopen()
         assertEquals(saved.reference, f.store.readPending()!!.reference)
-        assertEquals(CompletionPolicy.SAVE_LATER, f.store.readPending()!!.completionPolicy)
+        assertEquals(CompletionPolicy.DEFER_ON_RING, f.store.readPending()!!.completionPolicy)
+        assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
+        f.owner.retry(); f.owner.reconnect()
         f.owner.onConnected(f.port.generation)
-        f.observe(stopped(), listOf(finalRecord))
+        assertTrue(f.port.reads.isEmpty())
+        f.owner.resumeRingTransfer()
+        f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord))
         f.finishDownload()
         assertEquals(saved.reference, f.store.read()!!.reference)
         assertEquals(0, f.store.read()!!.transfer.attempts)

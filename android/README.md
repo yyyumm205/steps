@@ -1,113 +1,77 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.8.4-recovery（versionCode 46）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
+当前版本：**步数采集 0.8.8-ring-defer（versionCode 50）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，实际通过范围见[验证记录E35](../specs/independent-step-collection/validation.md#e35原版戒指暂存收尾2026-09-21)。
 
-## 当前可运行范围
+## 当前流程
 
-正常入口已接通：首次登记用户名与佩戴位置、选择/连接戒指、等待真实开始确认、后台采集、停止确认、整段计步器读数保存、原始文件下载校验、冻结ZIP和清华云盘上传。准备档案与采集记录使用独立App私有目录；单一前台采集服务管理BLE，独立上传服务管理网络任务。页面依据真实保存、设备证据和回执呈现结果。
+正式入口为同一个原生Android App：
 
-0.8.4-recovery恢复在途任务持续重连：蓝牙暂不可用、连接立即失败或多次超时后，仍尝试同一戒指；重复和旧连接回调不另建任务，恢复时核对原记录而不重发START。Android恢复、后端隔离和正式交付缺口见[validation E31](../specs/independent-step-collection/validation.md#e31发布核对与在途恢复2026-09-21)。本版保持开发验收状态，真实跨设备、下载中断、上传读回和长时矩阵仍须完成。
+1. 首次填写研究者分配的用户名，选择佩戴位置和戒指；日常打开恢复已保存信息。
+2. 每段重新选择走路或跑步，佩戴设备、清零计步器，再开始采集。
+3. 戒指确认开始后显示“正在采集”；点击结束后等待STOP及Flash记录确认。
+4. 在同一收尾页填写非负整数总步数，`0`有效，然后选择：
+   - **保存并上传：** 先保存参考值，再下载并校验原始文件；手机保存完整后由后台上传。
+   - **暂存到戒指：** 先保存参考值，原始文件保留在戒指，不自动下载或上传；用户稍后从首页或记录中执行“下载并上传”。
+   - **放弃本段：** 二次确认后排除本段上传与统计。
 
-0.8.3将准备信息与活动选择集中到首页，开始／采集中／结束确认复用同一页，读数及三种收尾复用同一页，下载与后台上传原位更新。首次只填一个3–24位英文字母或数字用户名，去除首尾空格并转为小写，直接作为新数据的`participant_id`。登记、更换与退出重登均可离线完成；研究者须为不同被试分配不同用户名。复用现有准备档案，无需账号服务器或历史用户名映射；既有测试资料保留，不做编号迁移。软件与设备的实际验证范围见E30。
+戒指待下载期间保持原session、用户名、佩戴位置和戒指绑定，禁止开始下一段或切换这些设置。手机原始文件完整后，云盘上传与下一段采集相互独立。历史`SAVE_LATER`仍表示“文件已在手机、等待手动云盘上传”，不会转换为戒指暂存。
 
-0.8.0增加每段必选的走路/跑步，以及停止确认后的“保存并上传”“保存，稍后上传”“放弃本段”。保存先可靠记录参考步数，再下载并校验原始文件；稍后上传保持暂停，直到用户主动上传。放弃经二次确认后清理本段手机任务和文件，保留排除标记；戒指Flash的单段物理删除尚无已核实协议支持。已有充电错误恢复与未知日期旧记录保全继续按证据校验，时间异常的未确认开始提供单次保护停止及独立备份出口。
+本地journal v13用于恢复`DEFER_ON_RING`，研究manifest仍按v2–v7处理；内部暂存状态不进入研究包。旧journal、冻结ZIP和历史参考保持原文。
 
-0.8.2将新走路、跑步session分别冻结为`ringfitness-session-walking-<session_id>.zip`和`ringfitness-session-running-<session_id>.zip`，每包使用独立上传任务和严格匹配的云盘回执。旧冻结包保持原名和原字节，可继续重试。
+Debug版在模拟器中提供“更多 → 流程演示（模拟）”，演示数据与正式记录隔离。Release不显示演示入口，正式状态只依据真实设备、文件与上传回执。
 
-0.8.0的软件与模拟器基线见[验证记录E26](../specs/independent-step-collection/validation.md#e26连续使用兼容与分段收尾2026-09-20)，后续真机短采和0.8.1恢复修复见E27。停止确认后可离线填写读数，重连保留输入焦点；后台下载完成后释放准备页操作，网络上传独立执行。真实三种收尾、完整异常和长时仍按计划验收。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
+## 构建与检查
 
-### 历史独立版本证据（0.7.2–0.7.4）
+使用JDK 21、Android SDK 36和工程Gradle wrapper，最低Android版本为11。上传位置只配置在Git忽略的`local.properties`中；研究端读取位置须指向同一云盘目录。
 
-以下记录当时的实现和设备状态；当前版本的能力与验收范围以上文及最新验证记录为准。
-
-0.7.2在打开准备页时恢复待上传队列，无需先连接戒指。queued/sending及已手动重试的任务继续等待网络；明确失败在原记录中手动重试，保持同一session、目标和冻结包。真机短采、本地保全、云盘人工读回与Python处理分别见E18/E19，恢复及自动云端读取见[验证记录E20](../specs/independent-step-collection/validation.md#19-启动上传恢复与自动云端读取2026-09-19e20)。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
-
-0.7.3增加未确认开始请求的“结束本次尝试”入口：填写原因后重新连接，完整查询并复核原始文件，满足条件才保存归档审计并返回准备。该操作保留原记录，未确认的尝试不进入研究数据；本地账本升级v4，研究manifest快照及冻结包维持原契约。软件验证及真机归档、强停重开和原包保全已通过[验证记录E21](../specs/independent-step-collection/validation.md#20-未确认开始请求的受控归档2026-09-19e21)；固件仍返回-16，新采集保持禁用，根因继续调查。
-
-0.7.4补齐启动时序：可靠保存请求后等待500ms，再发送一次START，入队后1000ms开始完整状态检查；仍为空闲且基线不变时，间隔1500ms只读复查，含首轮最多3轮。空闲连接错误采用相同的有限完整复查，错误归零且完整空闲基线不变才恢复开始入口，发送START仍须通过原文件保全预检；“重新检查”始终针对当前设备。Debug日志增加单调时钟时序。349项JVM、44项模拟器及相关构建沿用`e497dee`的通过证据，本轮未重跑。版本38已原位安装，真机初查、重新检查及强停重开各完成3轮STATUS/LIST，页面保持未就绪，四次快照中的21个保护文件不变，独立复核通过，见[验证记录E22](../specs/independent-step-collection/validation.md#21-启动时序与有限错误复查2026-09-19e22)。设备持续返回-16，未发新START，500/1000ms实际设备时序待验证；错误清除条件、-16触发条件及保留数据的恢复步骤仍待固件依据。
-
-### 演示与验收范围
-
-Debug从“更多 → 流程演示（模拟）”进入完整交互演示，复用原生页面、协调器与持久化规则，设备、信号和传输使用替身；演示目录与正式记录隔离。Release不提供该入口。页面色彩、字号、容器和主要操作沿用功能规格的最小视觉规则。
-
-当前已验证的是限定设备上的短段技术链路。戒指时钟偏差、实际样本与参考时段对应、完整采集/下载故障矩阵及逐级长时继续验收，最长支持时长尚未确定。云端自动读取、可用版本交付与测试者独立操作以执行计划和最新证据为准。[被试操作说明](../docs/participant-guide.md)为待发放前核对的草稿。
-
-## 构建与本地配置
-
-使用JDK 21、Android SDK 36及工程Gradle wrapper，最低Android版本为11。手机真实上传位置仅配置在Git忽略的`local.properties`中，键为`ringfitness.activityUploadLink`；研究端读取须指向同一云盘目录。准备与采集入口采用本地编号，旧平台登录和睡眠授权退出独立流程。
-
-从`android`目录执行：
+在`android`目录执行开发检查：
 
 ```powershell
-.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease --console=plain
+.\gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease lintVitalRelease --no-daemon --console=plain
 ```
 
-Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`；Release构建当前生成未签名产物。中文Windows启动器存在编码兼容问题时，可追加`'-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=GBK'`，项目文件继续使用UTF-8，依据见[基线记录](../docs/android-baseline-20260918.md)。测试APK构建、设备测试运行与真实设备验收分别记录。
+Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`。`assembleRelease`只生成未签名中间产物，不能直接发放。
 
-## 页面与恢复验证
+模拟器页面与恢复检查使用项目的instrumentation测试；BLE、真实采集、Flash下载、后台上传和长时行为须在真机与戒指上另行取证。完整命令、用例数量、失败及跳过项统一写入validation，不在README复制历史日志。
 
-已有账本和原文件均保全的空闲戒指可运行`IdleRingDiagnosticInstrumentedTest`。该测试默认跳过，只有显式传入`-e verifyIdleRingDiagnostic true`才查询指定戒指；只发送STATUS/LIST，并逐轮核对本地文件。需先确认没有待处理采集并关闭生产App服务，仅选择该测试方法运行。卸载重装或换机后缺少原账本时会拒绝执行，具体前置条件与结果见E22。
+## 正式签名包
 
-模拟器用于页面、输入、导航、本地保存和受控异常。安装Debug及对应AndroidTest APK，在指定模拟器上运行：
+仓库脚本[scripts/Build-ReleaseApk.ps1](../scripts/Build-ReleaseApk.ps1)负责构建、对齐、签名、证书检查和SHA-256记录。首次建立项目专用发布身份，并为已安装的同证书Debug版本生成签名轮换链：
 
 ```powershell
-adb -s <emulator-serial> shell am instrument -w -e class com.nexthci.ringfitness.PreparationNavigationInstrumentedTest,com.nexthci.ringfitness.CollectionFlowInstrumentedTest,com.nexthci.ringfitness.RealCollectionBridgeInstrumentedTest -e verifyPreparationNavigation true -e verifyCollectionFlow true com.nexthci.ringfitness.steps.test/androidx.test.runner.AndroidJUnitRunner
+.\scripts\Build-ReleaseApk.ps1 -InitializeSigning -UpgradeFromDebug
 ```
 
-准备导航用例要求模拟器具备已授权的蓝牙条件；缺少前置会明确跳过。测试数据在隔离空间，执行期间保持App不受手动操作干扰。BLE协议、真实采集、下载与长时由手机和戒指另行取证。
-
-`recoveryQa`仅用于对已核对副本注入上传故障，独立应用ID为`com.nexthci.ringfitness.steps.recoveryqa`，显示“步数采集·恢复验证”。它与正常安装的数据隔离，使用同一上传实现：
+后续版本复用同一签名材料：
 
 ```powershell
-.\gradlew.bat -Pringfitness.recoveryQa=true assembleRecoveryQa assembleRecoveryQaAndroidTest --console=plain
+.\scripts\Build-ReleaseApk.ps1
 ```
 
-`UploadRecoveryInstrumentedTest`默认跳过，执行需显式`verifyUploadRecovery=true`、独立包名、已审阅的本地marker和原包SHA。调度检查要求离线且BLE权限拒绝，手动重试另指定session；具体准备、方法与已验证故障范围见E20。保持正式安装、凭据和实验记录完整，测试结束恢复设备原网络设置。每次交付按相关规格补运行结果，历史通过项保留原版本范围。
+产物位于`android/dist/<version>/RingFitness-Steps-<version>.apk`，同目录生成`SHA256SUMS.txt`。以下材料属于发布身份，必须加密备份并限制访问：
 
-## 原版历史说明
+- `.local/signing/release.jks`
+- `.local/signing/release-password.txt`
+- `.local/signing/release.lineage`
+- `.local/signing/previous-debug.keystore`（脚本保存的旧签名私钥副本）
 
-以下保留交接版本的能力和操作说明，适用范围为原版 0.5.3。新版本已退出这些旧导航入口，后续采集与上传按新规格逐步接入。
+这些文件和`android/dist/`已被Git忽略。遗失或更换任一私钥会影响后续升级；不得重新初始化发布身份代替复用。
 
-0.5.3（versionCode 25）将采集结束评分改为可选项：用户可关闭“填写评分”并直接保存评价。日常活动评价在“主观评价”之前新增最多 500 字的“活动细节”，可填写工作内容、饮食内容、步行/骑行/跑步路线等。未评分时上传清单省略 `score`，活动细节非空时写入 `activity_detail`；睡眠评价不显示或上传活动细节。
+签名轮换只能覆盖由同一旧证书签名的既有安装。每次交付保存旧证书、新证书及lineage核验结果，并完成：旧版原位升级、应用私有数据哈希保持、applicationId和versionCode核对、Release无演示入口、新装后再升级一版。完成模拟器和目标真机验证前，不将签名包标为可发放。
 
-0.5.2（versionCode 24）新增采集结束后的主观评价。睡眠采集仅在启用 Oura 时评价；日常活动中的走路、骑车、跑步、工作和吃饭需要评价，“其他活动”跳过。用户先选择“立即上传”或“暂存到戒指”，App 停止传感器后要求滑动选择 1–10 分，可选填写最多 500 字评价，再继续 Flash 查询、下载或暂存。评价会持久化并随上传包写入 `manifest.json`；同时修正 Flash 收尾期间过早显示下载进度的问题。
+## 后台任务
 
-0.5.1（versionCode 23）在日常活动采集开始前新增必选的戒指佩戴位置：左右手的食指、中指、无名指共六项。位置以 `ring_placement`、`ring_hand`、`ring_finger` 字段写入云盘上传包的 `manifest.json`；睡眠/心率采集不写入这些字段。
+`RealCollectionService`负责BLE采集与下载，`RealUploadService`负责持久网络任务。上传队列绑定session、冻结ZIP、长度和SHA；普通网络错误按既有上限重试，永久错误保留人工入口。戒指暂存任务在手机备份完成前不得进入上传队列。
 
-0.5.0（versionCode 22）新增“日常活动采集”模式。戒指连接后可选择进入原有睡眠/心率页面或日常活动页面；日常活动支持走路、骑车、跑步、工作、吃饭和其他活动六类标签，并可选同时采集 Polar H10 实时 HR/RR。两种模式共享戒指待传锁、固件/电量显示和四项结束操作，本地及已上传记录按模式分开显示。日常活动数据上传到独立的 `ringfitness.activityUploadLink`。
+原版上传任务在执行期间使用可观察的前台通知。当前独立服务已接入`dataSync`前台保护，系统停止、销毁和超时路径保留持久任务。API33+首次进入采集询问通知权限，拒绝后仍可继续；设置页根据实际状态提供通知和电池设置入口。自动检查与实际设备范围见E35，锁屏、网络切换、整机重启和长文件继续按设备矩阵取证。
 
-0.4.5（versionCode 21）将“从 0 重新下载”救援版的 Flash READ 窗口从 512 字节提升至 8 KiB，同时保留逐窗口等待 `READ_END`、防息屏、超时暂停、断点落盘和二次确认。
+## 数据与恢复边界
 
-0.4.4（versionCode 20）与 iOS Flash 救援流程对齐：“戒指待传”增加二次确认的“从 0 重新下载”。它只删除手机端部分临时文件并将断点归零，保留原用户、原戒指、session 元数据和戒指 Flash 记录。该救援构建使用与 iOS 相同的 512 字节安全窗口，并保留防息屏、串行 `READ_END` 和超时暂停保护。
+- 原始文件为无损`.rfbin` v2，上传包按走路／跑步和`session_id`独立冻结。
+- 参考步数、处理选择、设备记录锚和恢复状态先写入应用私有账本。
+- 下载采用同一戒指、同一记录证据和断点校验；重复片段须一致，缺口或替换保持隔离。
+- 放弃只处理本段手机任务并保存排除标记；已核对协议没有单段Flash物理删除命令。
+- 原位升级用于保留数据。卸载或清除应用数据会删除尚未外部保全的记录，不作为恢复步骤。
+- 上传链接、凭据、被试数据、APK、日志和截图不进入Git。
 
-0.4.3（versionCode 19）接入戒指私有 NUS INFO 协议（请求 `2A 01`，响应 `2A 02`）并在采集页显示固件版本。Flash 停止、收尾、查询、下载和本地处理期间自动防止息屏，并与 iOS 一致显示红色离页警告。
-
-0.4.0（versionCode 18）启用无损 HEALTH 原始包 v2：结束采集后直接保存戒指 Flash 原始字节并上传，按需异步导出/系统预览 CSV。
-
-0.3.2（versionCode 15）与 iOS 0.3.2 Build 16 对齐：在 0.3.1 的待传任务与逻辑放弃机制上，修复部分 Android 蓝牙栈未回调 `disconnect()` 时旧 GATT 永久占用的问题；1.5 秒内未正常断开会强制关闭旧 GATT 并重新建链。删除数据或任一 HEALTH 命令超时后都会恢复连接，重连稳定 800 ms 后才继续发送 STATUS/READ，避免界面解锁但电量、START 和 STATUS 均无响应。
-
-Android 数据采集端，应用 ID 为 `com.nexthci.ringfitness`。它同时支持：
-
-- Ringo 戒指 HEALTH 模式（IMU + PPG，结束后从 Flash 下载）
-- Oura 睡眠分期授权（无痕浏览器会话；按用户名 + App installation ID 绑定当前手机）
-- Polar H10 实时 HR + RR 采集
-- 戒指待传、云盘失败重试、当前用户上传记录；上传成功后保留本地 CSV
-
-## 本地配置
-
-在忽略提交的 `local.properties` 中配置：
-
-```properties
-ringfitness.uploadLink=https\://cloud.example.edu/shared/ringfitness/
-ringfitness.activityUploadLink=
-ringfitness.authorizationUrl=https\://<worker-host>
-ringfitness.enrollmentCode=<worker-enrollment-code>
-```
-
-Polar Android SDK 8.1.0 的 AAR 已从本机 `polar-ble-sdk` 复制到 `app/libs/polar-ble-sdk.aar`，构建不依赖 JitPack。
-
-当前工作副本的构建方法与 APK 位置见本文开头；原版运行路径仅作历史参考。
-
-从 0.1.6 起，Oura 登录会枚举 Custom Tabs 浏览器并优先选择明确支持账号隔离会话的 Chrome，不再误用 vivo 等不支持该能力的默认浏览器。后端同时执行 RingFitness 用户与 Oura 账号严格一对一校验。
-
-采集文件保存到 `Download/RingFitness/YYYY-MM-DD/`。用户名规则为 3–24 位字母或数字，不区分大小写。
+被试可见说明见[participant-guide.md](../docs/participant-guide.md)。原版0.5.3源码保存在`original/`，仅作为基线与历史证据；当前正式入口不得启动旧采集或旧上传服务。

@@ -498,7 +498,7 @@ class FreeLivingSessionStoreTest {
         assertEquals(requested, reopened)
         assertEquals(-16, reopened.startBaseline!!.status.errorCode)
         assertEquals(baseline.chargingRecoveryEvidence, reopened.startBaseline.chargingRecoveryEvidence)
-        assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
 
         assertThrows(IllegalArgumentException::class.java) {
             openStore(file).confirmStart(requested.sessionId, address, status(true).copy(errorCode = -16), t + 100)
@@ -571,7 +571,7 @@ class FreeLivingSessionStoreTest {
         assertEquals(requested, openStore(file).read())
         openStore(file).confirmStart(requested.sessionId, address, status(true), t + 100)
         val migrated = JsonParser.parseString(file.readText()).asJsonObject
-        assertEquals(12, migrated["journal_version"].asInt)
+        assertEquals(13, migrated["journal_version"].asInt)
         assertTrue(migrated.getAsJsonObject("session").getAsJsonObject("start_baseline")["charging_recovery_evidence"].isJsonNull)
         assertNull(openStore(file).read()!!.startBaseline!!.chargingRecoveryEvidence)
     }
@@ -619,7 +619,7 @@ class FreeLivingSessionStoreTest {
             assertEquals(SessionActivity.FREE_LIVING, openStore(file).read()!!.activity)
             assertArrayEquals(oldBytes, file.readBytes())
             store.confirmStart(requested.sessionId, address, status(true), t + 100)
-            assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+            assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
             val migrated = openStore(file).read()!!
             assertEquals(SessionActivity.FREE_LIVING, migrated.activity)
             val payload = JsonParser.parseString(file.readText()).asJsonObject.getAsJsonObject("session")

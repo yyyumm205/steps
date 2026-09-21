@@ -57,6 +57,116 @@ class SessionCompletionPolicyTest {
         assertEquals(0, f.requests)
     }
 
+    @Test fun ringDeferralSurvivesReopenAndCannotEnterAnyUploadPath() {
+        val f = Fixture()
+        val reference = SessionReference(ReferenceStatus.VALID, 0, f.time + 4)
+        f.store.finalizeStoppedSession(f.id, CompletionPolicy.DEFER_ON_RING, reference)
+
+        val restored = f.reopen().read()!!
+        assertEquals(CompletionPolicy.DEFER_ON_RING, restored.completionPolicy)
+        assertEquals(reference, restored.reference)
+        assertTrue(restored.isRingDeferred)
+        assertTrue(restored.isPending)
+        assertFalse(restored.uploadAllowed)
+        assertNull(restored.localData)
+        assertEquals(SessionTransfer(), restored.transfer)
+        assertFalse(f.queue().restore(link))
+        assertFalse(f.queue().enqueue(f.id, link, false))
+        assertFalse(f.queue().run(f.id))
+        assertEquals(0, f.requests)
+        assertThrows(IllegalArgumentException::class.java) { f.store.allowUpload(f.id) }
+        assertEquals(13, JsonParser.parseString(File(f.directory, "session.json").readText())
+            .asJsonObject["journal_version"].asInt)
+    }
+
+    @Test fun ringTransferResumeIsIdempotentAndPreservesAllSessionEvidence() {
+        val f = Fixture()
+        val reference = SessionReference(ReferenceStatus.VALID, 73, f.time + 4)
+        val deferred = f.store.finalizeStoppedSession(f.id, CompletionPolicy.DEFER_ON_RING, reference)
+
+        val resumed = f.reopen().resumeRingTransfer(f.id)
+        assertEquals(deferred.copy(completionPolicy = CompletionPolicy.SAVE_UPLOAD), resumed)
+        assertEquals(resumed, f.reopen().resumeRingTransfer(f.id))
+        assertFalse(resumed.isRingDeferred)
+        assertTrue(resumed.isPending)
+        assertTrue(resumed.uploadAllowed)
+
+        val entry = f.rawEntry()
+        val completed = f.reopen().completeLocalData(f.id, listOf(entry), f.time + 5)
+        assertEquals(reference, completed.reference)
+        assertEquals(deferred.deviceRecordEvidence, completed.deviceRecordEvidence)
+        assertNotNull(completed.localData)
+        val manifest = f.reopen().manifestSnapshot(f.id)
+        assertEquals(7, manifest["version"].asInt)
+        assertFalse(manifest.has("completion_policy"))
+    }
+
+    @Test fun deferredRawDataRequiresExplicitAtomicResume() {
+        val f = Fixture()
+        val deferred = f.store.finalizeStoppedSession(f.id, CompletionPolicy.DEFER_ON_RING,
+            SessionReference(ReferenceStatus.VALID, 12, f.time + 4))
+        val entry = f.rawEntry()
+        assertThrows(IllegalArgumentException::class.java) {
+            f.store.completeLocalData(f.id, listOf(entry), f.time + 5)
+        }
+        assertEquals(deferred, f.reopen().read())
+
+        f.failJournal = true
+        assertThrows(IOException::class.java) { f.store.resumeRingTransfer(f.id) }
+        f.failJournal = false
+        assertEquals(deferred, f.reopen().read())
+        f.store.resumeRingTransfer(f.id)
+        assertNotNull(f.store.completeLocalData(f.id, listOf(entry), f.time + 5).localData)
+    }
+
+    @Test fun ringTransferResumeRejectsWrongOrUnconfirmedSessionsAndAcceptsAnUncertainRetry() {
+        val wrong = Fixture()
+        wrong.store.finalizeStoppedSession(wrong.id, CompletionPolicy.DEFER_ON_RING,
+            SessionReference(ReferenceStatus.VALID, 1, wrong.time + 4))
+        assertThrows(IllegalArgumentException::class.java) {
+            wrong.store.resumeRingTransfer("22222222-2222-4222-8222-222222222222")
+        }
+        assertTrue(wrong.reopen().read()!!.isRingDeferred)
+
+        val unconfirmed = Fixture(stopped = false)
+        unconfirmed.store.saveReference(unconfirmed.id,
+            SessionReference(ReferenceStatus.UNRELIABLE, 2, unconfirmed.time + 4, "结束状态待确认"))
+        assertThrows(IllegalArgumentException::class.java) { unconfirmed.store.resumeRingTransfer(unconfirmed.id) }
+        assertNull(unconfirmed.reopen().read()!!.completionPolicy)
+
+        val uncertainCommit = Fixture()
+        val first = uncertainCommit.store.finalizeStoppedSession(uncertainCommit.id, CompletionPolicy.SAVE_UPLOAD,
+            SessionReference(ReferenceStatus.VALID, 3, uncertainCommit.time + 4))
+        assertEquals(first, uncertainCommit.reopen().resumeRingTransfer(uncertainCommit.id))
+    }
+
+    @Test fun versionTwelveSaveLaterKeepsItsOriginalPhoneSavedMeaning() {
+        val f = Fixture(); f.complete()
+        f.store.setCompletionPolicy(f.id, CompletionPolicy.SAVE_LATER)
+        f.rewriteJournalVersion(12)
+
+        val restored = f.reopen().read()!!
+        assertEquals(CompletionPolicy.SAVE_LATER, restored.completionPolicy)
+        assertNotNull(restored.localData)
+        assertFalse(restored.isRingDeferred)
+        assertFalse(restored.uploadAllowed)
+        f.reopen().allowUpload(f.id)
+        assertEquals(CompletionPolicy.SAVE_UPLOAD, f.reopen().read()!!.completionPolicy)
+        assertEquals(13, JsonParser.parseString(File(f.directory, "session.json").readText())
+            .asJsonObject["journal_version"].asInt)
+    }
+
+    @Test fun legacyCompleteRecordWithoutAPolicyRemainsExplicitlyUploadable() {
+        val f = Fixture(); f.complete()
+        assertNull(f.reopen().read()!!.completionPolicy)
+
+        val allowed = f.reopen().allowUpload(f.id)
+
+        assertEquals(CompletionPolicy.SAVE_UPLOAD, allowed.completionPolicy)
+        assertNotNull(allowed.localData)
+        assertTrue(allowed.uploadAllowed)
+    }
+
     @Test fun explicitUploadPersistsAcrossExitAndRetainsTheFrozenManifest() {
         val f = Fixture(); f.complete()
         val original = f.store.manifestSnapshot(f.id)
@@ -246,8 +356,11 @@ class SessionCompletionPolicyTest {
         }
         fun complete() {
             store.saveReference(id, SessionReference(ReferenceStatus.VALID, 0, time + 4))
+            store.completeLocalData(id, listOf(rawEntry()), time + 5)
+        }
+        fun rawEntry(): SessionRawFile {
             raw = File(directory, "$id-ring-7.rfbin").apply { writeText("Completion fixture") }
-            store.completeLocalData(id, listOf(SessionRawFile(raw.name, 7, raw.length(), hash(raw.readBytes()))), time + 5)
+            return SessionRawFile(raw.name, 7, raw.length(), hash(raw.readBytes()))
         }
         fun queue(onUpload: () -> Unit = {}) = RealUploadQueue(directory, reopen(), freeze = { session ->
             val archive = File(directory, "fixture-${session.sessionId}.zip").apply { writeText("fixture archive") }
@@ -268,6 +381,17 @@ class SessionCompletionPolicyTest {
             envelope.addProperty("journal_version", 6)
             val payload = JsonObject().apply {
                 add("session", session); add("archived_sessions", envelope.getAsJsonArray("archived_sessions"))
+            }
+            envelope.addProperty("sha256", hash(payload.toString().toByteArray()))
+            journal.writeText(envelope.toString())
+        }
+        fun rewriteJournalVersion(version: Int) {
+            val journal = File(directory, "session.json")
+            val envelope = JsonParser.parseString(journal.readText()).asJsonObject
+            envelope.addProperty("journal_version", version)
+            val payload = JsonObject().apply {
+                add("session", envelope.getAsJsonObject("session"))
+                add("archived_sessions", envelope.getAsJsonArray("archived_sessions"))
             }
             envelope.addProperty("sha256", hash(payload.toString().toByteArray()))
             journal.writeText(envelope.toString())

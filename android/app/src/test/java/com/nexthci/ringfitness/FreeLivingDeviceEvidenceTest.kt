@@ -43,7 +43,7 @@ class FreeLivingDeviceEvidenceTest {
         assertNull(open(file).read()!!.startAttemptArchive)
         assertArrayEquals(bytes, file.readBytes())
         open(file).requestStop(original.sessionId, t + 2)
-        assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
         assertNull(open(file).read()!!.deviceRecordEvidence)
         assertNull(open(file).read()!!.startAttemptArchive)
     }

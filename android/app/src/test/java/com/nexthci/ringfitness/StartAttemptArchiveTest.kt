@@ -169,7 +169,7 @@ class StartAttemptArchiveTest {
         f.journal.writeText(envelope.toString())
         assertEquals(f.pending, f.open().readPending())
         f.archive()
-        assertEquals(12, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(13, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
         val expected = manifest.deepCopy().apply {
             addProperty("stop_origin", StopOrigin.LEGACY_UNSPECIFIED.wireValue)
         }

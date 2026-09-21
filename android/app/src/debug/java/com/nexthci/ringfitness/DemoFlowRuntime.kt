@@ -65,6 +65,7 @@ object DemoFlowRuntime {
             override fun saveReference(stepsText: String, status: String, reason: String) { executor.execute { controller.saveReference(stepsText, status, reason) } }
             override fun retry() { executor.execute { controller.retry() } }
             override fun retryUpload(sessionId: String) { executor.execute { controller.retryUpload(sessionId) } }
+            override fun resumeRingTransfer() { executor.execute { controller.resumeRingTransfer() } }
             override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) {
                 executor.execute { controller.reviseReference(sessionId, stepsText, status, reason) }
             }

@@ -156,7 +156,8 @@ class RealCollectionController(
             CaptureControlPhase.AWAITING_REFERENCE -> {
                 if (control.observation != null) stopEvidenceGeneration = generation
                 val current = store.readPending()
-                if (current?.completionPolicy == null) publish(CollectionPage.FINISH)
+                if (current?.isRingDeferred == true) publish(CollectionPage.RING_PENDING)
+                else if (current?.completionPolicy == null) publish(CollectionPage.FINISH)
                 else if (current.reference == null) publish(CollectionPage.REFERENCE)
                 else publish(CollectionPage.RECOVERY, "步数已保存，正在核对戒指数据")
             }
@@ -200,7 +201,7 @@ class RealCollectionController(
         val current = store.read()
         browsingHome = current == null || !current.isPending
         enqueueSavedRecords()
-        connect()
+        if (current?.isRingDeferred == true) publish(CollectionPage.RING_PENDING) else connect()
     }
 
     override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
@@ -221,6 +222,7 @@ class RealCollectionController(
         }
         val pending = store.readPending()
         when {
+            pending?.isRingDeferred == true -> publish(CollectionPage.RING_PENDING)
             pending?.startAbort != null -> inspect()
             unknownArchiveReason != null -> inspect()
             pending == null -> inspect()
@@ -249,7 +251,8 @@ class RealCollectionController(
 
     /** One timer per retired connection; only unfinished local work keeps recovery alive. */
     private fun scheduleReconnect() {
-        if (store.readPending() == null || reconnectScheduledGeneration == generation) return
+        val pending = store.readPending()
+        if (pending == null || pending.isRingDeferred || reconnectScheduledGeneration == generation) return
         val failedGeneration = generation
         reconnectScheduledGeneration = failedGeneration
         scheduler.schedule(RECONNECT_DELAY_MS) {
@@ -262,6 +265,10 @@ class RealCollectionController(
 
     fun onHealth(connection: Long, packet: SensorPacket.Health) = safely {
         if (closed || connection != generation || !connected) return@safely
+        if (store.readPending()?.isRingDeferred == true) {
+            publish(CollectionPage.RING_PENDING)
+            return@safely
+        }
         if (query != null && (abortPrecheck != null || store.readPending()?.startAbort?.let { it.stoppedObservation == null } == true)) {
             val previous = abortHighWater ?: abortPrecheck ?: requireNotNull(store.readPending()?.startAbort).collectingObservation
             try {
@@ -412,7 +419,7 @@ class RealCollectionController(
             // A restored STOP may already have a preserved reference; inspect its final record.
             if (query == null && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.AWAITING_REFERENCE && store.readPending()?.let {
-                    it.reference != null && it.completionPolicy != null
+                    it.reference != null && it.completionPolicy != null && !it.isRingDeferred
                 } == true) inspect()
             return@safely
         }
@@ -469,7 +476,8 @@ class RealCollectionController(
                         round.batteryRequestedAtMs = clock.nowEpochMs()
                         check(port.queryBattery()) { "未能读取充电状态，请重新连接" }
                     } else finishReadinessInspection(round, observation)
-                } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null && current.completionPolicy != null) {
+                } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null &&
+                    current.completionPolicy != null && !current.isRingDeferred) {
                     finalizingDownload?.let { reconcileCompletedDownload(current, observation, it) }
                         ?: beginDownload(current, observation)
                 }
@@ -527,6 +535,10 @@ class RealCollectionController(
     }
 
     fun onTime(connection: Long, packet: SensorPacket.TimeStatus) = safely {
+        if (store.readPending()?.isRingDeferred == true) {
+            publish(CollectionPage.RING_PENDING)
+            return@safely
+        }
         recoveryTimeRound?.let { recovery ->
             if (!connected || generation != connection || recovery.before.connectionGeneration != connection) return@safely
             val current = requireNotNull(store.readPending())
@@ -622,9 +634,22 @@ class RealCollectionController(
     override fun chooseFinish(uploadNow: Boolean) = safely(CollectionPage.FINISH) {
         if (saving || downloader != null || query != null) return@safely
         val current = requireNotNull(store.readPending())
-        store.setCompletionPolicy(current.sessionId,
-            if (uploadNow && uploadAvailable) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
         browsingHome = false
+        if (current.completionPolicy != null) {
+            retry()
+            return@safely
+        }
+        if (!uploadNow) {
+            if (current.reference == null) {
+                publish(CollectionPage.FINISH)
+                return@safely
+            }
+            store.setCompletionPolicy(current.sessionId, CompletionPolicy.DEFER_ON_RING)
+            publish(CollectionPage.RING_PENDING)
+            return@safely
+        }
+        store.setCompletionPolicy(current.sessionId,
+            if (uploadAvailable) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
         if (current.reference == null) publish(CollectionPage.REFERENCE)
         else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
     }
@@ -634,9 +659,11 @@ class RealCollectionController(
             if (saving || downloader != null || query != null) return@safely
             browsingHome = false
             val current = requireNotNull(store.readPending())
-            val policy = current.completionPolicy ?: if (uploadNow && uploadAvailable) {
-                CompletionPolicy.SAVE_UPLOAD
-            } else CompletionPolicy.SAVE_LATER
+            val policy = current.completionPolicy ?: when {
+                !uploadNow -> CompletionPolicy.DEFER_ON_RING
+                uploadAvailable -> CompletionPolicy.SAVE_UPLOAD
+                else -> CompletionPolicy.SAVE_LATER
+            }
             val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
             saving = true
             val saved = try {
@@ -646,7 +673,8 @@ class RealCollectionController(
                     check(persisted.completionPolicy == it.completionPolicy && persisted.reference == it.reference)
                 }
             } finally { saving = false }
-            if (connected) inspect()
+            if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
+            else if (connected) inspect()
             else publish(CollectionPage.RECOVERY, "记录已保存，请重新连接以下载数据")
         }
 
@@ -688,7 +716,8 @@ class RealCollectionController(
                 check(store.read(current.sessionId)?.reference == it.reference)
             }
         } finally { saving = false }
-        if (saved.stopConfirmedAtMs == null) publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
+        if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
+        else if (saved.stopConfirmedAtMs == null) publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
         else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
     }
 
@@ -700,6 +729,7 @@ class RealCollectionController(
         }
         val pending = store.readPending()
         when {
+            pending?.isRingDeferred == true -> publish(CollectionPage.RING_PENDING)
             pending?.startAbort != null -> {
                 val abort = requireNotNull(pending.startAbort)
                 if (connected && abort.stoppedObservation == null && abort.ownerId == preservationOwnerId &&
@@ -717,6 +747,17 @@ class RealCollectionController(
             coordinator.state.phase == CaptureControlPhase.COLLECTING && connected -> publish(CollectionPage.COLLECTING)
             else -> connect() // A fresh GATT channel separates untagged late replies from retry queries.
         }
+    }
+
+    override fun resumeRingTransfer() = safely(CollectionPage.RING_PENDING) {
+        if (saving || downloader != null || backupObservation != null || query != null || readinessWait != null ||
+            abortWaitOperation != null || coordinator.state.timeoutOperationId != null || coordinator.state.settling) return@safely
+        val current = requireNotNull(store.readPending())
+        val resumed = store.resumeRingTransfer(current.sessionId)
+        profile = resumed.preparation
+        browsingHome = false
+        taskError = null
+        if (connected) inspect() else connect()
     }
 
     override fun endStartAttempt(reason: String) = safely {
@@ -803,7 +844,8 @@ class RealCollectionController(
                 it.completionPolicy in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.SAVE_UPLOAD) &&
                 it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
                 uploads?.isInFlight(it.sessionId) != true,
-            referenceReason = it.reference?.reason) }
+            referenceReason = it.reference?.reason,
+            ringDeferred = it.isRingDeferred) }
 
     override fun home() = safely {
         browsingHome = !devicePreparationRequired
@@ -811,9 +853,16 @@ class RealCollectionController(
     }
     override fun setFault(fault: FlowTestFault) = Unit
     override fun disconnect() = Unit // A page cannot tear down the collection connection.
-    override fun reconnect() = safely { browsingHome = false; connect() }
+    override fun reconnect() = safely {
+        browsingHome = false
+        if (store.readPending()?.isRingDeferred == true) publish(CollectionPage.RING_PENDING) else connect()
+    }
 
     private fun connect() {
+        if (store.readPending()?.isRingDeferred == true) {
+            publish(CollectionPage.RING_PENDING)
+            return
+        }
         unknownPreservation = null
         if (connecting) return
         reconnectScheduledGeneration = null
@@ -847,6 +896,10 @@ class RealCollectionController(
 
     private fun inspect(attempt: Int = 1, errorBaseline: HealthRecordObservation? = null) {
         if (query != null || readinessWait != null || downloader != null || !connected) return
+        if (store.readPending()?.isRingDeferred == true) {
+            publish(CollectionPage.RING_PENDING)
+            return
+        }
         val id = ++operation
         query = Inspection(id, attempt, errorBaseline, startedAtElapsedMs = clock.nowElapsedMs())
         if (abortPrecheck != null || store.readPending()?.startAbort != null) publish(CollectionPage.STOPPING)
@@ -1301,12 +1354,18 @@ class RealCollectionController(
 
     /** Called on the serial owner executor before committing a UI-requested release. */
     fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && timeRound == null && downloader == null && finalizingDownload == null && backupObservation == null &&
-        coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
+        coordinator.state.timeoutOperationId == null && !coordinator.state.settling &&
+        store.readPending().let { it == null || it.isRingDeferred }
 
     /** Confirmed-stop choices and reference entry are local work, including during BLE recovery. */
-    private fun pendingReferencePage(): CollectionPage? = store.readPending()?.takeIf {
-        it.stopConfirmedAtMs != null && it.reference == null && it.startAbort == null
-    }?.let { if (it.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE }
+    private fun pendingReferencePage(): CollectionPage? = store.readPending()?.let { pending ->
+        when {
+            pending.isRingDeferred -> CollectionPage.RING_PENDING
+            pending.stopConfirmedAtMs != null && pending.reference == null && pending.startAbort == null ->
+                if (pending.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE
+            else -> null
+        }
+    }
 
     private fun publish(page: CollectionPage, error: String? = null) {
         val current = visibleCurrentSession()
@@ -1333,7 +1392,9 @@ class RealCollectionController(
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
-            canRetry = !connecting && query == null && readinessWait == null && timeRound == null && recoveryTimeRound == null && abortWaitOperation == null && downloader == null && backupObservation == null && !coordinator.state.settling,
+            canRetry = pending?.isRingDeferred != true && !connecting && query == null && readinessWait == null &&
+                timeRound == null && recoveryTimeRound == null && abortWaitOperation == null && downloader == null &&
+                backupObservation == null && !coordinator.state.settling,
             canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
                 pending.startAbort == null && coordinator.state.unconfirmedStartStopCandidate == null &&
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&

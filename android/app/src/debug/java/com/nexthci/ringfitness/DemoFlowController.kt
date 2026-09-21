@@ -130,9 +130,15 @@ class DemoFlowController(
 
     override fun chooseFinish(uploadNow: Boolean) = safely(CollectionPage.FINISH) {
         val current = requireNotNull(store.readPending())
-        store.setCompletionPolicy(current.sessionId, if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
+        if (!uploadNow && current.reference == null && current.completionPolicy == null) {
+            publish(CollectionPage.FINISH)
+            return@safely
+        }
+        val saved = store.setCompletionPolicy(current.sessionId, current.completionPolicy ?:
+            if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.DEFER_ON_RING)
         browsingHome = false
-        if (current.reference != null) download(current.sessionId) else publish(CollectionPage.REFERENCE)
+        if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
+        else if (saved.reference != null) download(saved.sessionId) else publish(CollectionPage.REFERENCE)
     }
 
     override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) =
@@ -140,7 +146,8 @@ class DemoFlowController(
             browsingHome = false
             if (savingReference) { publish(CollectionPage.SAVING); return@safely }
             val current = requireNotNull(store.readPending())
-            val policy = if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER
+            val policy = current.completionPolicy ?:
+                if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.DEFER_ON_RING
             val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
             savingReference = true
             try {
@@ -151,7 +158,7 @@ class DemoFlowController(
                         val saved = store.finalizeStoppedSession(current.sessionId, policy, reference)
                         val persisted = requireNotNull(store.read(current.sessionId))
                         check(persisted.completionPolicy == saved.completionPolicy && persisted.reference == saved.reference)
-                        download(saved.sessionId)
+                        if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING) else download(saved.sessionId)
                     } finally { savingReference = false; failNextReferenceCommit = false }
                 }
             } catch (error: Exception) {
@@ -222,7 +229,8 @@ class DemoFlowController(
                     failNextReferenceCommit = consume(FlowTestFault.SAVE_FAILURE)
                     val saved = store.saveReference(current.sessionId, reference)
                     check(store.read(current.sessionId)?.reference == saved.reference)
-                    if (saved.stopConfirmedAtMs != null) download(saved.sessionId)
+                    if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
+                    else if (saved.stopConfirmedAtMs != null) download(saved.sessionId)
                     else publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
                 } finally { savingReference = false; failNextReferenceCommit = false }
             }
@@ -244,6 +252,7 @@ class DemoFlowController(
             current?.let { store.cleanupDiscardedSession(it.sessionId) }
             taskPage = null; taskError = null; publish(CollectionPage.HOME); return@safely
         }
+        if (current.isRingDeferred) { publish(CollectionPage.RING_PENDING); return@safely }
         if (current.localData != null) {
             if (current.transfer.status == SessionTransferStatus.COMPLETE) publish(CollectionPage.COMPLETE)
             else if (current.uploadAllowed) upload(current.sessionId) else publish(CollectionPage.COMPLETE)
@@ -252,6 +261,14 @@ class DemoFlowController(
     }
 
     override fun retryUpload(sessionId: String) = safely { store.allowUpload(sessionId); upload(sessionId) }
+
+    override fun resumeRingTransfer() = safely {
+        val current = store.readPending() ?: return@safely
+        if (!current.isRingDeferred) return@safely
+        store.resumeRingTransfer(current.sessionId)
+        browsingHome = false
+        if (!connected) reconnect() else recoverStored(false)
+    }
 
     override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) = safely {
         val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
@@ -270,7 +287,8 @@ class DemoFlowController(
         connected = false
         operationEpoch++
         coordinator?.onDisconnected(generation)
-        publish(CollectionPage.RECOVERY, "连接已断开，本次记录已保留")
+        if (store.read()?.isRingDeferred == true) publish(CollectionPage.RING_PENDING)
+        else publish(CollectionPage.RECOVERY, "连接已断开，本次记录已保留")
     }
 
     override fun reconnect() = safely {
@@ -352,6 +370,7 @@ class DemoFlowController(
         recoveryOwner = false
         val current = store.read()
         if (current == null || current.isDiscarded) { taskPage = null; taskError = null; publish(CollectionPage.HOME); return }
+        if (current.isRingDeferred) { publish(CollectionPage.RING_PENDING); return }
         if (current.localData != null) {
             verifyLocalFiles(current)
             if (resumeTransfer && current.transfer.status == SessionTransferStatus.COMPLETE) {
@@ -399,6 +418,7 @@ class DemoFlowController(
 
     private fun showStored(current: FreeLivingSession) {
         when {
+            current.isRingDeferred -> publish(CollectionPage.RING_PENDING)
             current.stopConfirmedAtMs != null && current.completionPolicy == null -> publish(CollectionPage.FINISH)
             current.localData != null && current.transfer.status == SessionTransferStatus.COMPLETE -> publish(CollectionPage.COMPLETE)
             current.localData != null -> publish(CollectionPage.COMPLETE)
@@ -413,6 +433,7 @@ class DemoFlowController(
     private fun download(sessionId: String) {
         val session = requireNotNull(store.read(sessionId))
         if (session.isDiscarded) return
+        if (session.isRingDeferred) { publish(CollectionPage.RING_PENDING); return }
         if (session.localData != null) { upload(sessionId); return }
         require(session.stopConfirmedAtMs != null && session.reference != null)
         if (!connected) { publish(CollectionPage.RECOVERY, "读数已保存，请重新连接下载数据"); return }
@@ -427,6 +448,7 @@ class DemoFlowController(
                     if (consume(FlowTestFault.DOWNLOAD_FAILURE)) throw IOException("读数已保存，数据下载请重试")
                     val current = requireNotNull(store.read(sessionId))
                     if (current.isDiscarded) return@safely
+                    if (current.isRingDeferred) { publish(CollectionPage.RING_PENDING); return@safely }
                     val record = requireOwnedDevice(current)
                     require(!record.collecting)
                     val raw = File(directory, "$sessionId-simulated-signal.txt")
@@ -567,7 +589,7 @@ class DemoFlowController(
                     it.completionPolicy == CompletionPolicy.SAVE_LATER &&
                     it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
                     it.sessionId !in transferring,
-                referenceReason = it.reference?.reason) }, fault = fault)
+                referenceReason = it.reference?.reason, ringDeferred = it.isRingDeferred) }, fault = fault)
         broadcast()
     }
 

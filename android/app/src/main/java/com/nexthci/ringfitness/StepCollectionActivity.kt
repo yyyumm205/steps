@@ -261,7 +261,7 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun usesHomeSurface(state: CollectionFlowState): Boolean =
         state.page == CollectionPage.HOME ||
-            state.page in setOf(CollectionPage.DOWNLOADING, CollectionPage.UPLOADING, CollectionPage.COMPLETE) ||
+            state.page in setOf(CollectionPage.RING_PENDING, CollectionPage.DOWNLOADING, CollectionPage.UPLOADING, CollectionPage.COMPLETE) ||
             (state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
                 state.session?.reference != null && state.session.stopConfirmedAtMs != null)
 
@@ -320,7 +320,7 @@ abstract class StepCollectionActivity : Activity() {
         when {
             state.connecting || state.checkingDevice -> deviceRow.addView(ui.progress(),
                 LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)))
-            !state.connected && state.canRetry -> ui.button(deviceRow, "重新连接", tag = "home_reconnect") {
+            !state.connected && state.canRetry && state.session?.isRingDeferred != true -> ui.button(deviceRow, "重新连接", tag = "home_reconnect") {
                 flow.reconnect()
             }.apply {
                 layoutParams = LinearLayout.LayoutParams(-2, -2)
@@ -339,7 +339,7 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(taskCard, task.status, 24f, bold = true).tag = "home_task_status"
             task.hint?.takeIf { it.isNotBlank() }?.let { ui.gap(taskCard, 10); ui.text(taskCard, it) }
             val actionLabel = task.action.takeUnless { it.endsWith("…") }
-            val localFinishAction = state.canRecordReferenceLocally ||
+            val localFinishAction = state.session?.isRingDeferred == true || state.canRecordReferenceLocally ||
                 (state.session?.stopConfirmedAtMs != null && state.session.reference == null &&
                     state.taskPage in setOf(CollectionPage.FINISH, CollectionPage.REFERENCE, CollectionPage.RECOVERY))
             if (actionLabel != null && (state.connected || localFinishAction) && (!state.busy || localFinishAction) &&
@@ -348,6 +348,7 @@ abstract class StepCollectionActivity : Activity() {
                 ui.gap(taskCard, 12)
                 ui.button(taskCard, actionLabel, primary = true, tag = "home_task_action") {
                     when {
+                        state.session?.isRingDeferred == true -> flow.resumeRingTransfer()
                         state.canRecordReferenceLocally -> flow.enterFinish()
                         !state.connected -> flow.reconnect()
                         state.canStopUnconfirmedStart -> flow.stop()
@@ -362,7 +363,7 @@ abstract class StepCollectionActivity : Activity() {
                 stopped.localData == null && !stopped.isDiscarded &&
                 stopped.transfer.status == SessionTransferStatus.PENDING && stopped.transfer.attempts == 0 &&
                 stopped.transfer.receipt == null &&
-                (state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) ||
+                (stopped.isRingDeferred || state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) ||
                     state.taskPage in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR))) {
                 ui.button(taskCard, "放弃本段", tag = "recovery_discard") { showDiscardConfirmation() }.apply {
                     background = ui.linkBackground()
@@ -383,7 +384,7 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(startCard, "佩戴好设备，站定后将计步器清零。", 15f, muted = true)
         }
 
-        val localRecords = state.records.filter { it.localComplete }
+        val localRecords = state.records.filter { it.localComplete || it.ringDeferred }
         if (localRecords.isNotEmpty()) {
             val recordsCard = ui.card(body)
             ui.text(recordsCard, "采集记录", 16f, bold = true)
@@ -403,7 +404,7 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun records(body: LinearLayout, state: CollectionFlowState) {
         title(body, "采集记录")
-        val records = state.records.filter { it.localComplete }.reversed()
+        val records = state.records.filter { it.localComplete || it.ringDeferred }.reversed()
         if (records.isEmpty()) {
             val empty = ui.card(body)
             ui.text(empty, "暂无记录", 16f, muted = true)
@@ -432,12 +433,18 @@ abstract class StepCollectionActivity : Activity() {
             recordAction(record, state)?.let { (label, action) ->
                 ui.button(card, label, tag = "retry_upload_${record.sessionId}") { action() }
             }
+            if (record.ringDeferred && record.sessionId == state.session?.sessionId && !state.busy) {
+                ui.button(card, "放弃本段", tag = "discard_record_${record.sessionId}") { showDiscardConfirmation() }.apply {
+                    background = ui.linkBackground()
+                }
+            }
         }
     }
 
     private fun recordsSummary(records: List<FlowRecordSummary>): String {
         val pending = records.count { it.transferStatus != "complete" }
         return when {
+            records.any { it.ringDeferred } -> "${records.size} 条记录 · 有数据暂存到戒指"
             records.any { it.localReviewRequired } -> "${records.size} 条记录 · 有数据需要检查"
             records.any { it.transferStatus == "failed" } -> "${records.size} 条记录 · 有上传需要重试"
             pending > 0 -> "${records.size} 条记录 · $pending 条等待上传"
@@ -446,16 +453,21 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun recordStatus(record: FlowRecordSummary, state: CollectionFlowState): String = when {
+        record.ringDeferred -> "已暂存到戒指"
         record.localReviewRequired -> if (record.transferInFlight) "正在校验上传文件" else "上传校验未通过"
         record.transferStatus == "complete" -> if (state.isSimulation) "模拟上传完成" else "已上传"
         record.transferInFlight -> "正在上传"
         record.uploadDeferred -> "已保存，稍后上传"
         !state.uploadAvailable -> "已保存在手机"
         record.transferStatus == "failed" -> "上传失败，数据已保存在手机"
-        else -> "等待网络，将自动上传"
+        else -> "已保存，等待上传"
     }
 
     private fun recordAction(record: FlowRecordSummary, state: CollectionFlowState): Pair<String, () -> Unit>? {
+        if (record.ringDeferred) return "下载并上传" to {
+            showingRecords = false
+            flow.resumeRingTransfer()
+        }
         if (!state.uploadAvailable || record.transferInFlight || record.transferStatus == "complete" ||
             record.localReviewRequired) return null
         val label = when {
@@ -472,6 +484,8 @@ abstract class StepCollectionActivity : Activity() {
     private data class HomeTask(val title: String, val status: String, val action: String, val hint: String? = null)
 
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
+        state.session?.isRingDeferred == true -> HomeTask("本段步数已保存", "已暂存到戒指", "下载并上传",
+            "下载到手机后，即可开始下一段。")
         state.canRecordReferenceLocally -> if (state.session?.completionPolicy == null)
             HomeTask("采集已结束", "待保存本段", "继续收尾")
         else HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
@@ -559,7 +573,7 @@ abstract class StepCollectionActivity : Activity() {
                 16f, bold = true).gravity = Gravity.CENTER
         }
         ui.gap(card, 18)
-        detail(card, "活动", session?.activity?.label ?: "—")
+        detail(card, "活动", session?.takeIf { it.isPending }?.activity?.label ?: "正在准备")
         ui.gap(card, 14)
         detail(card, "戒指", connectionLabel(state))
         if (phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference != null) {
@@ -586,7 +600,7 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun saving(body: LinearLayout, state: CollectionFlowState) {
-        title(body, "正在保存", "完成后会自动下载戒指数据。")
+        title(body, "正在保存")
         val card = ui.card(body)
         card.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply { gravity = Gravity.CENTER })
         ui.gap(card, 18)
@@ -624,15 +638,17 @@ abstract class StepCollectionActivity : Activity() {
         val fixedPolicy = state.session?.completionPolicy
         when {
             !state.uploadAvailable -> action(actions, "保存到手机", !state.busy) {
-                submitFinish(fixedPolicy == CompletionPolicy.SAVE_UPLOAD)
+                submitFinish(true)
             }
             fixedPolicy == CompletionPolicy.SAVE_UPLOAD ->
                 action(actions, "保存并上传", !state.busy) { submitFinish(true) }
             fixedPolicy == CompletionPolicy.SAVE_LATER ->
                 action(actions, "保存，稍后上传", !state.busy) { submitFinish(false) }
+            fixedPolicy == CompletionPolicy.DEFER_ON_RING ->
+                action(actions, "下载并上传", !state.busy) { flow.resumeRingTransfer() }
             else -> {
                 action(actions, "保存并上传", !state.busy) { submitFinish(true) }
-                ui.button(actions, "保存，稍后上传", tag = "finish_defer") { submitFinish(false) }.apply {
+                ui.button(actions, "暂存到戒指", tag = "finish_defer") { submitFinish(false) }.apply {
                     isEnabled = !state.busy
                 }
             }
@@ -709,6 +725,7 @@ abstract class StepCollectionActivity : Activity() {
             confirmation.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 if (!confirmation.isShowing) return@setOnClickListener
                 confirmation.dismiss()
+                showingRecords = false
                 flow.discardSession()
             }
         }

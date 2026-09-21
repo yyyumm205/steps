@@ -69,7 +69,7 @@ enum class SessionTransferStatus(val wireValue: String) {
 }
 
 enum class CompletionPolicy(val wireValue: String) {
-    SAVE_UPLOAD("save_upload"), SAVE_LATER("save_later"),
+    SAVE_UPLOAD("save_upload"), SAVE_LATER("save_later"), DEFER_ON_RING("defer_on_ring"),
 }
 
 enum class StopOrigin(val wireValue: String) {
@@ -182,7 +182,10 @@ data class FreeLivingSession(
 ) {
     val isDiscarded: Boolean get() = discarded != null
     val isPending: Boolean get() = localData == null && startAttemptArchive == null && !isDiscarded && startAbort?.completedAtMs == null
-    val uploadAllowed: Boolean get() = !isDiscarded && startAbort == null && completionPolicy != CompletionPolicy.SAVE_LATER
+    val isRingDeferred: Boolean get() = !isDiscarded && startAbort == null &&
+        completionPolicy == CompletionPolicy.DEFER_ON_RING && localData == null
+    val uploadAllowed: Boolean get() = !isDiscarded && startAbort == null &&
+        completionPolicy !in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.DEFER_ON_RING)
     val deviceSessionId: Int? get() = startStatusEvidence?.sessionId
     val startedAtMs: Long? get() = startBoundaryEvidence?.epochMs
     // Preserve contradictory raw evidence, while keeping the effective end explicitly unknown.
@@ -251,6 +254,13 @@ class FreeLivingSessionStore internal constructor(
             require(current.transfer.attempts == 0 && current.transfer.status == SessionTransferStatus.PENDING) {
                 "本段已开始上传，保留当前上传任务"
             }
+            if (current.completionPolicy == CompletionPolicy.DEFER_ON_RING) {
+                require(policy == CompletionPolicy.DEFER_ON_RING) { "请从戒指继续保存本段数据" }
+            }
+            if (policy == CompletionPolicy.DEFER_ON_RING) {
+                require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null &&
+                    current.localData == null) { "请先确认结束并保存本次读数" }
+            }
             current.copy(completionPolicy = policy)
         }
 
@@ -285,7 +295,26 @@ class FreeLivingSessionStore internal constructor(
     /** Explicit user action releases a durable save-for-later choice. */
     fun allowUpload(sessionId: String): FreeLivingSession = update(sessionId, allowArchived = true) { current ->
         require(current.stopConfirmedAtMs != null) { "请等待戒指确认结束" }
+        // Journals written before completion policies existed may have complete local data and a
+        // null policy. They remain uploadable; ring-deferred sessions never have local data here.
+        require(current.localData != null && current.completionPolicy != CompletionPolicy.DEFER_ON_RING) {
+            "请先完成戒指数据保存"
+        }
         current.copy(completionPolicy = CompletionPolicy.SAVE_UPLOAD)
+    }
+
+    /** Explicitly resumes downloading a stopped session whose raw data intentionally stayed on the ring. */
+    fun resumeRingTransfer(sessionId: String): FreeLivingSession = update(sessionId) { current ->
+        require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.stopConfirmedAtMs != null) {
+            "请等待戒指确认结束"
+        }
+        require(current.reference != null && current.localData == null) { "本段无需从戒指继续保存" }
+        require(current.transfer.status == SessionTransferStatus.PENDING && current.transfer.attempts == 0 &&
+            current.transfer.receipt == null) { "本段已开始上传，保留当前上传任务" }
+        require(current.completionPolicy in
+            setOf(CompletionPolicy.DEFER_ON_RING, CompletionPolicy.SAVE_UPLOAD)) { "本段没有待恢复的戒指数据" }
+        if (current.completionPolicy == CompletionPolicy.SAVE_UPLOAD) current
+        else current.copy(completionPolicy = CompletionPolicy.SAVE_UPLOAD)
     }
 
     /** Commit cancellation before deleting any bytes; late callbacks cannot revive this session. */
@@ -726,6 +755,7 @@ class FreeLivingSessionStore internal constructor(
             require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null) {
                 "请先确认结束并保存本次读数"
             }
+            require(current.completionPolicy != CompletionPolicy.DEFER_ON_RING) { "请先确认继续保存戒指数据" }
             require(completedAtMs > 0)
             verifyLocalFiles(current, files)
             current.localData?.let {
@@ -809,7 +839,7 @@ class FreeLivingSessionStore internal constructor(
                 value.asJsonObject
             }
             val version = envelope.strictLong("journal_version")
-            require(version in 1L..12L) { "版本不受支持" }
+            require(version in 1L..13L) { "版本不受支持" }
             val payload = envelope.getAsJsonObject("session") ?: error("缺少采集段")
             val archives = if (version >= 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
             val hashed = if (version == 1L) payload else journalPayload(payload, archives)
@@ -835,7 +865,7 @@ class FreeLivingSessionStore internal constructor(
         val payload = encode(journal.current)
         val archives = JsonArray().apply { journal.archived.forEach { add(encode(it)) } }
         val envelope = JsonObject().apply {
-            addProperty("journal_version", 12)
+            addProperty("journal_version", 13)
             add("session", payload)
             add("archived_sessions", archives)
             addProperty("sha256", digest(journalPayload(payload, archives).toString()))
@@ -1096,6 +1126,10 @@ class FreeLivingSessionStore internal constructor(
             session.startAbort?.validate(session)
             if (session.completionPolicy != null) require(hasStop)
             if (session.completionPolicy == CompletionPolicy.SAVE_LATER) require(transfer.attempts == 0)
+            if (session.completionPolicy == CompletionPolicy.DEFER_ON_RING) {
+                require(hasStop && session.reference != null && session.localData == null &&
+                    transfer.status == SessionTransferStatus.PENDING && transfer.attempts == 0 && transfer.receipt == null)
+            }
             session.discarded?.let { discarded ->
                 require(hasStop && session.startAttemptArchive == null && discarded.discardedAtMs > 0)
                 require(transfer.status == SessionTransferStatus.PENDING && transfer.attempts == 0 && transfer.receipt == null)
@@ -1105,7 +1139,8 @@ class FreeLivingSessionStore internal constructor(
             }
         }
 
-        private fun encode(s: FreeLivingSession, version: Long = 12L) = JsonObject().apply {
+        private fun encode(s: FreeLivingSession, version: Long = 13L) = JsonObject().apply {
+            require(version >= 13L || s.completionPolicy != CompletionPolicy.DEFER_ON_RING)
             addProperty("session_id", s.sessionId)
             addProperty("participant_id", s.preparation.participantId)
             addProperty("participant_name", s.preparation.participantId)
@@ -1284,7 +1319,9 @@ class FreeLivingSessionStore internal constructor(
                     if (extended && p.nullableLong("reference_saved_at_ms") != null &&
                         p.nullableLong("stop_confirmed_at_ms") != null) CompletionPolicy.SAVE_UPLOAD else null
                 } else if (p.required("completion_policy").isJsonNull) null else
-                    CompletionPolicy.entries.single { it.wireValue == p.strictString("completion_policy") },
+                    CompletionPolicy.entries.single { it.wireValue == p.strictString("completion_policy") }.also {
+                        require(version >= 13L || it != CompletionPolicy.DEFER_ON_RING) { "完成方式版本不受支持" }
+                    },
                 discarded = if (version < 8L || p.required("discarded").isJsonNull) null else
                     p.getAsJsonObject("discarded").let { SessionDiscard(it.strictLong("discarded_at_ms"),
                         if (it.required("connection_owner_id").isJsonNull) null else it.strictString("connection_owner_id"),

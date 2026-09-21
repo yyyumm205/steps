@@ -1,11 +1,17 @@
 package com.nexthci.ringfitness
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.job.JobInfo
 import android.app.job.JobParameters
 import android.app.job.JobScheduler
 import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -108,15 +114,24 @@ object RealUploadScheduler {
 class RealUploadService : JobService() {
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
-    private data class Run(val owner: Any = Any(), val cancelled: AtomicBoolean = AtomicBoolean(false))
+    private data class Run(val params: JobParameters, val owner: Any = Any(),
+        val cancelled: AtomicBoolean = AtomicBoolean(false))
     // Android may parcel a new JobParameters object for stop; callbacks are ordered per job ID.
     private val runs = mutableMapOf<Int, Run>() // Accessed only on main.
 
     override fun onStartJob(params: JobParameters): Boolean {
-        val run = Run()
+        val run = Run(params)
         val stop = run.cancelled
         runs[params.jobId] = run
         RealUploadScheduler.started(run.owner)
+        try {
+            startForeground(NOTIFICATION_ID, uploadNotification("正在准备上传"),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } catch (error: RuntimeException) {
+            Log.e(TAG, "Upload foreground protection could not start", error)
+            main.post { finish(params, run, retry = true) }
+            return true
+        }
         executor.execute {
             var retry = false
             try {
@@ -125,6 +140,7 @@ class RealUploadService : JobService() {
                 while (!stop.get()) {
                     val id = queue.queuedIds().firstOrNull { it !in attempted } ?: break
                     attempted += id
+                    main.post { if (runs[params.jobId] === run) updateNotification("正在上传采集数据") }
                     RealUploadScheduler.uploading(id, run.owner, true)
                     try { retry = queue.run(id, stop::get) || retry }
                     finally { RealUploadScheduler.uploading(id, run.owner, false) }
@@ -135,12 +151,7 @@ class RealUploadService : JobService() {
                 Log.e("RingFitnessUpload", "Local upload task could not be processed", error)
                 retry = true
             } finally {
-                main.post {
-                    if (runs[params.jobId] === run) runs.remove(params.jobId)
-                    if (!stop.get()) RealUploadScheduler.finished(run.owner, retry)?.let { needsRetry ->
-                        jobFinished(params, needsRetry)
-                    }
-                }
+                main.post { finish(params, run, retry) }
             }
         }
         return true
@@ -151,15 +162,68 @@ class RealUploadService : JobService() {
             run.cancelled.set(true)
             RealUploadScheduler.stopped(run.owner)
         }
+        if (runs.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
         return true
     }
+
+    /** Android 15+ limits data-sync foreground time; durable tasks resume through JobScheduler. */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        val timedOut = runs.values.toList()
+        runs.clear()
+        timedOut.forEach { run ->
+            run.cancelled.set(true)
+            val retry = RealUploadScheduler.finished(run.owner, retry = true) ?: true
+            jobFinished(run.params, retry)
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     override fun onDestroy() {
         runs.values.forEach { run ->
             run.cancelled.set(true)
             RealUploadScheduler.stopped(run.owner)
         }
         runs.clear()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         executor.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun finish(params: JobParameters, run: Run, retry: Boolean) {
+        if (runs[params.jobId] !== run) return
+        runs.remove(params.jobId)
+        if (runs.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
+        if (!run.cancelled.get()) RealUploadScheduler.finished(run.owner, retry)?.let { needsRetry ->
+            jobFinished(params, needsRetry)
+        }
+    }
+
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, uploadNotification(text))
+    }
+
+    private fun uploadNotification(text: String): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "采集数据上传", NotificationManager.IMPORTANCE_LOW))
+        val content = PendingIntent.getActivity(this, NOTIFICATION_ID,
+            Intent(this, RealCollectionActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("步数采集")
+            .setContentText(text)
+            .setContentIntent(content)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setProgress(0, 0, true)
+            .build()
+    }
+
+    companion object {
+        private const val TAG = "RingFitnessUpload"
+        internal const val CHANNEL_ID = "real-upload"
+        internal const val NOTIFICATION_ID = 4202
     }
 }

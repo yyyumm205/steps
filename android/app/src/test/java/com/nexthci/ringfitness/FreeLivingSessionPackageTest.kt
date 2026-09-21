@@ -207,7 +207,7 @@ class FreeLivingSessionPackageTest {
         assertFalse(m.getAsJsonObject("start_baseline").has("charging_recovery_evidence"))
         assertFalse(m.has("start_attempt_archive"))
         f.store.markTransferStarted(f.session.sessionId)
-        assertEquals(12, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(13, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
         assertArrayEquals(before, packager(f.directory, openStore(f.directory)).freeze(f.session).file.readBytes())
         assertEquals(m, manifest(f.packager.freeze(f.session)))
     }

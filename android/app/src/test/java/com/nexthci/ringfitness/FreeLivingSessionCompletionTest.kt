@@ -274,7 +274,7 @@ class FreeLivingSessionCompletionTest {
         assertNull(restored.startAttemptArchive)
         assertArrayEquals(originalBytes, file.readBytes())
         open(file).saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
-        assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(0L, open(file).read()!!.reference!!.steps)
         assertNull(open(file).read()!!.startAttemptArchive)
     }

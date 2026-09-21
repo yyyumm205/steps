@@ -2,7 +2,7 @@ package com.nexthci.ringfitness
 
 /** UI contract shared by the native collection pages and their environment-specific owner. */
 enum class CollectionPage {
-    HOME, STARTING, COLLECTING, STOPPING, FINISH, REFERENCE, SAVING, DOWNLOADING, UPLOADING, COMPLETE, RECOVERY, ERROR,
+    HOME, STARTING, COLLECTING, STOPPING, FINISH, REFERENCE, SAVING, RING_PENDING, DOWNLOADING, UPLOADING, COMPLETE, RECOVERY, ERROR,
 }
 
 enum class FlowTestFault { NONE, START_TIMEOUT, STOP_TIMEOUT, SAVE_FAILURE, DOWNLOAD_FAILURE, UPLOAD_FAILURE }
@@ -21,6 +21,7 @@ data class FlowRecordSummary(
     val timeZoneId: String? = null,
     val referenceEditable: Boolean = false,
     val referenceReason: String? = null,
+    val ringDeferred: Boolean = false,
 )
 
 data class CollectionFlowState(
@@ -74,6 +75,8 @@ interface CollectionFlow {
     fun retry()
     fun endStartAttempt(reason: String) = Unit
     fun retryUpload(sessionId: String)
+    /** Explicit consent to download a session parked on its original ring and then upload it. */
+    fun resumeRingTransfer() = Unit
     /** Replaces a locally saved reference before the participant confirms its first upload. */
     fun reviseReference(sessionId: String, stepsText: String, status: String = "valid", reason: String = "") = Unit
     fun home()

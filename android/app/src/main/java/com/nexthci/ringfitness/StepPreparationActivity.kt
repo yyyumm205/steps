@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
 import android.view.inputmethod.InputMethodManager
@@ -69,6 +70,7 @@ class StepPreparationActivity : Activity() {
     private var identityDialog: AlertDialog? = null
     private var clearDialog: AlertDialog? = null
     private var moreMenu: PopupMenu? = null
+    private var continueToCollectionAfterNotification = false
 
     private lateinit var back: Button
     private lateinit var heading: TextView
@@ -89,6 +91,9 @@ class StepPreparationActivity : Activity() {
     private lateinit var editPlacement: Button
     private lateinit var changeRing: Button
     private lateinit var clearProfile: Button
+    private lateinit var backgroundAccess: LinearLayout
+    private lateinit var notificationSettings: Button
+    private lateinit var batterySettings: Button
     private lateinit var message: TextView
     private lateinit var progressRow: LinearLayout
     private lateinit var progressStatus: TextView
@@ -286,6 +291,15 @@ class StepPreparationActivity : Activity() {
         changeRing = link(profileCard, "更换戒指") { openDeviceSelection(fromSettings = true) }.apply { tag = "change_ring" }
         clearProfile = link(profileCard, "退出当前用户") { confirmClearProfile() }.apply {
             tag = "clear_profile"
+        }
+
+        backgroundAccess = ui.card(body).apply { tag = "background_access" }
+        label(backgroundAccess, "后台运行", 16f).setTypeface(null, Typeface.BOLD)
+        notificationSettings = link(backgroundAccess, "开启通知") { openNotificationSettings() }.apply {
+            tag = "notification_settings"
+        }
+        batterySettings = link(backgroundAccess, "允许后台运行") { openBatterySettings() }.apply {
+            tag = "battery_settings"
         }
 
         val footer = section(frame, 20)
@@ -501,6 +515,11 @@ class StepPreparationActivity : Activity() {
         registration.visibility = if (!loading && !hasStorageProblem && page == Page.REGISTER) View.VISIBLE else View.GONE
         devices.visibility = if (!loading && !hasStorageProblem && page == Page.DEVICES) View.VISIBLE else View.GONE
         settings.visibility = if (!loading && !hasStorageProblem && page == Page.SETTINGS) View.VISIBLE else View.GONE
+        val longRunningAccess = longRunningAccess()
+        backgroundAccess.visibility = if (!loading && !hasStorageProblem && page == Page.SETTINGS &&
+            longRunningAccess.showSettings) View.VISIBLE else View.GONE
+        notificationSettings.visibility = if (longRunningAccess.showNotificationSettings) View.VISIBLE else View.GONE
+        batterySettings.visibility = if (longRunningAccess.showBatterySettings) View.VISIBLE else View.GONE
         back.visibility = if (loading || page == Page.SETTINGS) View.GONE else View.VISIBLE
         back.text = if (page == Page.DEVICES) "返回" else "关闭"
         back.isEnabled = true
@@ -769,6 +788,13 @@ class StepPreparationActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_NOTIFICATIONS) {
+            val shouldContinue = continueToCollectionAfterNotification
+            continueToCollectionAfterNotification = false
+            updateViews()
+            if (shouldContinue) openCollectionAndFinish()
+            return
+        }
         if (requestCode != REQUEST_BLUETOOTH) return
         val action = pendingBluetoothAction
         pendingBluetoothAction = null
@@ -849,6 +875,14 @@ class StepPreparationActivity : Activity() {
 
     private fun openCollectionAndFinish() {
         if (routeStarted) return
+        val access = longRunningAccess()
+        if (access.requestNotificationPermission) {
+            accessPreferences().edit().putBoolean(KEY_NOTIFICATION_REQUESTED, true).commit()
+            continueToCollectionAfterNotification = true
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
+            updateViews()
+            return
+        }
         routeStarted = true
         stopScan()
         startActivity(
@@ -857,6 +891,35 @@ class StepPreparationActivity : Activity() {
         )
         finish()
     }
+
+    private fun longRunningAccess(): LongRunningAccessState {
+        val notificationGranted = Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val batteryOptimizationExempt = Build.VERSION.SDK_INT < 23 ||
+            getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        return LongRunningAccessPolicy.evaluate(
+            sdkInt = Build.VERSION.SDK_INT,
+            notificationGranted = notificationGranted,
+            notificationPermissionRequested = accessPreferences().getBoolean(KEY_NOTIFICATION_REQUESTED, false),
+            batteryOptimizationExempt = batteryOptimizationExempt,
+        )
+    }
+
+    private fun openNotificationSettings() {
+        startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        })
+    }
+
+    private fun openBatterySettings() {
+        val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.parse("package:$packageName"))
+        runCatching { startActivity(direct) }.onFailure {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+
+    private fun accessPreferences() = getSharedPreferences(ACCESS_PREFERENCES, Context.MODE_PRIVATE)
 
     /** Recheck durable work and the live owner immediately before changing profile routing. */
     private fun <T> withIdleCollectionOwner(write: () -> T): T {
@@ -917,6 +980,9 @@ class StepPreparationActivity : Activity() {
         private const val STATE_PERMISSION_DENIED = "permission_denied"
         private const val STATE_RETURN_TO_SETTINGS = "return_to_settings"
         private const val REQUEST_BLUETOOTH = 10
+        private const val REQUEST_NOTIFICATIONS = 11
+        private const val ACCESS_PREFERENCES = "long_running_access"
+        private const val KEY_NOTIFICATION_REQUESTED = "notification_requested"
         private val disk = Executors.newSingleThreadExecutor()
     }
 }

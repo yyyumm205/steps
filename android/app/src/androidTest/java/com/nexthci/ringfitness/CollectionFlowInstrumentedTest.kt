@@ -330,7 +330,7 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
-    @Test fun deferredSaveReopensWithTheSameZeroAndOnlyUploadsFromTheRecordAction() = withFlow { handle ->
+    @Test fun ringDeferredSaveReopensWithTheSameZeroAndOnlyDownloadsFromTheRecordAction() = withFlow { handle ->
         lateinit var saved: FreeLivingSession
         launch().use { scenario ->
             register(scenario)
@@ -338,19 +338,20 @@ class CollectionFlowInstrumentedTest {
             captureReviewScreen(scenario, "finish")
             type(scenario, "flow_steps", "0")
             click(scenario, "finish_defer")
-            awaitHeading(scenario, "这一段已保存")
-            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
+            awaitFlow(handle, "ring defer persists") { it.session?.isRingDeferred == true }
+            awaitHeading(scenario, "步数采集")
+            assertEquals(CompletionPolicy.DEFER_ON_RING, session(handle).completionPolicy)
             saved = session(handle)
             assertEquals(SessionActivity.RUNNING, saved.activity)
             assertEquals(0L, saved.reference!!.steps)
-            assertNotNull(saved.localData)
+            assertNull(saved.localData)
             assertEquals(0, saved.transfer.attempts)
             assertNull(saved.transfer.receipt)
             captureReviewScreen(scenario, "deferred_saved")
             awaitHeading(scenario, "步数采集")
             openRecords(scenario)
             scenario.onActivity {
-                assertEquals("已保存，稍后上传", tagged<TextView>(it, "record_status_${saved.sessionId}").text.toString())
+                assertEquals("已暂存到戒指", tagged<TextView>(it, "record_status_${saved.sessionId}").text.toString())
                 assertNull(taggedOrNull<Button>(it, "flow_primary"))
             }
             captureReviewScreen(scenario, "deferred_history")
@@ -359,10 +360,13 @@ class CollectionFlowInstrumentedTest {
             awaitHeading(reopened, "步数采集")
             assertEquals(saved, session(handle))
             openRecords(reopened)
+            click(reopened, "discard_record_${saved.sessionId}")
+            reopened.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+            assertEquals(saved, session(handle))
             click(reopened, "retry_upload_${saved.sessionId}")
             awaitFlow(handle, "manual upload receipt") { it.records.single().transferStatus == "complete" }
             assertEquals(saved.reference, session(handle).reference)
-            assertEquals(saved.localData, session(handle).localData)
+            assertNotNull(session(handle).localData)
             assertEquals(1, session(handle).transfer.attempts)
             assertEquals(CompletionPolicy.SAVE_UPLOAD, session(handle).completionPolicy)
             assertNotNull(session(handle).transfer.receipt)
@@ -430,6 +434,62 @@ class CollectionFlowInstrumentedTest {
             assertNull(handle.flow.state.selectedActivity)
             scenario.onActivity { assertNull(taggedOrNull<Button>(it, "flow_primary")) }
             captureReviewScreen(scenario, "discarded_home")
+        }
+    }
+
+    @Test fun parkedRecordHasOneResumeActionAndDiscardCancellationKeepsItsSavedZero() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            reachFinish(scenario, handle, SessionActivity.WALKING)
+            type(scenario, "flow_steps", "0")
+            click(scenario, "finish_defer")
+            awaitFlow(handle, "deferred reference durable") { it.session?.isRingDeferred == true }
+            awaitHeading(scenario, "步数采集")
+            val saved = session(handle)
+            scenario.onActivity { activity ->
+                assertEquals("已暂存到戒指", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertEquals("下载并上传", tagged<Button>(activity, "home_task_action").text.toString())
+                assertNull(taggedOrNull<Button>(activity, "flow_primary"))
+                assertNull(taggedOrNull<Button>(activity, "activity_walking"))
+            }
+            click(scenario, "recovery_discard")
+            scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+            assertEquals(saved, session(handle))
+            scenario.recreate()
+            awaitHeading(scenario, "步数采集")
+            handle.flow.disconnect()
+            awaitFlow(handle, "ring temporarily disconnected") { !it.connected }
+            scenario.onActivity {
+                assertTrue(tagged<Button>(it, "home_task_action").isEnabled)
+                assertNull(taggedOrNull<Button>(it, "home_reconnect"))
+            }
+            click(scenario, "recovery_discard")
+            scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_POSITIVE).performClick() }
+            awaitFlow(handle, "discarded record removed from page") { it.records.isEmpty() }
+            val discarded = FreeLivingSessionStore(File(handle.directory, "session.json")).read(saved.sessionId)!!
+            assertTrue(discarded.isDiscarded)
+            assertNull(discarded.localData)
+            assertNull(discarded.transfer.receipt)
+            handle.flow.reconnect()
+            awaitFlow(handle, "next session available after discard") { it.canStart }
+        }
+    }
+
+    @Test fun startingANewSegmentDoesNotPresentThePreviousCompletedActivity() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val previous = renderingSession(preparation).copy(activity = SessionActivity.RUNNING,
+                localData = SessionLocalData(emptyList(), 5_000))
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.STARTING,
+                taskPage = CollectionPage.STARTING, isSimulation = false, hasProfile = true,
+                session = previous, connected = true, busy = true))
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                val texts = visibleTexts(activity.findViewById(android.R.id.content))
+                assertTrue(texts.contains("正在准备"))
+                assertFalse(texts.contains("跑步"))
+            }
         }
     }
 
@@ -972,7 +1032,7 @@ class CollectionFlowInstrumentedTest {
             }
             type(scenario, "flow_steps", "0")
             click(scenario, "flow_primary")
-            assertEquals(false to Triple("0", "valid", ""), fixture.finalizedReference)
+            assertEquals(true to Triple("0", "valid", ""), fixture.finalizedReference)
 
             fixture.finalizedReference = null
             fixture.state = fixture.state.copy(session = stopped.copy(completionPolicy = CompletionPolicy.SAVE_UPLOAD))
@@ -1001,7 +1061,7 @@ class CollectionFlowInstrumentedTest {
             }
             type(scenario, "flow_steps", "0")
             click(scenario, "flow_primary")
-            assertEquals(false to Triple("0", "valid", ""), fixture.finalizedReference)
+            assertEquals(true to Triple("0", "valid", ""), fixture.finalizedReference)
         }
     }
 
@@ -1122,6 +1182,7 @@ class CollectionFlowInstrumentedTest {
                 Triple(ReferenceStatus.UNRELIABLE, 562L, "忘记清零"),
             ).map { (status, steps, reason) ->
                 val id = reachFinish(scenario, handle, SessionActivity.WALKING)
+                store.setCompletionPolicy(id, CompletionPolicy.SAVE_LATER)
                 handle.flow.finalizeSession(false, steps?.toString().orEmpty(), status.wireValue, reason)
                 awaitFlow(handle, "historical ${status.wireValue} reference is locally complete") { state ->
                     state.records.singleOrNull { it.sessionId == id }?.localComplete == true
@@ -1204,10 +1265,14 @@ class CollectionFlowInstrumentedTest {
                 }
                 captureReviewScreen(scenario, "finish_aligned_actions")
                 click(scenario, saveTag)
-                awaitHeading(scenario, "这一段已保存")
+                if (saveTag == "finish_defer") {
+                    awaitFlow(handle, "ring defer saves zero") { it.session?.isRingDeferred == true }
+                    awaitHeading(scenario, "步数采集")
+                    assertNull(session(handle).localData)
+                } else awaitHeading(scenario, "这一段已保存")
                 assertEquals(id, session(handle).sessionId)
                 assertEquals(0L, session(handle).reference!!.steps)
-                assertEquals(if (saveTag == "finish_defer") CompletionPolicy.SAVE_LATER else CompletionPolicy.SAVE_UPLOAD,
+                assertEquals(if (saveTag == "finish_defer") CompletionPolicy.DEFER_ON_RING else CompletionPolicy.SAVE_UPLOAD,
                     session(handle).completionPolicy)
             }
         }
@@ -1610,10 +1675,11 @@ class CollectionFlowInstrumentedTest {
             assertEquals(0, session(handle).transfer.attempts)
             captureReviewScreen(scenario, "finish_after_recovery")
             click(scenario, "finish_defer")
-            awaitHeading(scenario, "这一段已保存")
+            awaitFlow(handle, "recovered reference deferred on ring") { it.session?.isRingDeferred == true }
+            awaitHeading(scenario, "步数采集")
             assertEquals(saved.reference, session(handle).reference)
-            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
-            assertNotNull(session(handle).localData)
+            assertEquals(CompletionPolicy.DEFER_ON_RING, session(handle).completionPolicy)
+            assertNull(session(handle).localData)
             assertNull(session(handle).transfer.receipt)
         }
     }
