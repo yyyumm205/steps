@@ -15,6 +15,7 @@ internal object DiscardedSessionFiles {
             session.localData?.files?.forEach { add(it.fileName) }
             if (prefix != null) listOf(".part", ".download.json", ".rfbin", ".raw-evidence.json").forEach { add(prefix + it) }
             add("$id.clock-sync.json")
+            add("$id.clock-recovery.json")
             add("$id-simulated-signal.txt")
             add("$id-simulated-receipt.txt")
         }

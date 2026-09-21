@@ -34,6 +34,16 @@ class PhoneClockDeviceInstrumentedTest {
     @Test fun oneClockSetPreservesIdleRecordsAndMatchesASubsequentPhoneWindow() {
         assumeTrue("Requires explicit opt-in and verified local originals",
             InstrumentationRegistry.getArguments().getString("verifyPhoneClock") == "true")
+        checkClock(allowSet = true)
+    }
+
+    @Test fun readOnlyClockAcrossReconnectPreservesIdleRecordsAndSavedFiles() {
+        assumeTrue("Requires explicit read-only device opt-in",
+            InstrumentationRegistry.getArguments().getString("verifyReadOnlyClock") == "true")
+        checkClock(allowSet = false)
+    }
+
+    private fun checkClock(allowSet: Boolean) {
         check(BuildConfig.DEBUG) { "Clock diagnostics require a development build" }
         val context = instrumentation.targetContext
         val root = context.filesDir
@@ -49,6 +59,7 @@ class PhoneClockDeviceInstrumentedTest {
         val closing = AtomicBoolean(false)
         var run: File? = null
         var setCount = 0
+        var connection = 0L
 
         fun idleOwner() {
             check(!RealCollectionBridge.isRunning()) { "Close the real collection owner before clock diagnostics" }
@@ -116,7 +127,7 @@ class PhoneClockDeviceInstrumentedTest {
                             else records.any { it.sessionId == status.sessionId && it.bytes == status.bytes && it.records == status.records }) {
                             "HEALTH STATUS and LIST disagree; cancel clock diagnostics"
                         }
-                        return HealthRecordObservation(ring.address, 1, status, received.packet.receivedEpochMs, records)
+                        return HealthRecordObservation(ring.address, connection, status, received.packet.receivedEpochMs, records)
                     }
                     else -> error("Unexpected HEALTH LIST response; cancel clock diagnostics")
                 }
@@ -131,13 +142,14 @@ class PhoneClockDeviceInstrumentedTest {
             return request to received
         }
 
-        try {
-            verifySavedFiles()
+        fun connect() {
+            val selectedConnection = ++connection
+            ready.set(false)
             events.clear()
             instrumentation.runOnMainSync {
                 client = RingBleClient(context, object : RingBleClient.Listener {
                     override fun onBleState(message: String, connected: Boolean) {
-                        if (closing.get()) return
+                        if (closing.get() || connection != selectedConnection) return
                         if (connected) {
                             if (ready.compareAndSet(false, true)) events.offer(Ready(SystemClock.elapsedRealtime()))
                         } else if (ready.getAndSet(false)) {
@@ -145,10 +157,11 @@ class PhoneClockDeviceInstrumentedTest {
                         }
                     }
                     override fun onBleError(message: String) {
-                        if (!closing.get()) events.offer(IllegalStateException(message))
+                        if (!closing.get() && connection == selectedConnection) events.offer(IllegalStateException(message))
                     }
                     override fun onSensorPacket(packet: SensorPacket) {
-                        if (!closing.get() && (packet is SensorPacket.Health || packet is SensorPacket.TimeStatus)) {
+                        if (!closing.get() && connection == selectedConnection &&
+                            (packet is SensorPacket.Health || packet is SensorPacket.TimeStatus)) {
                             events.offer(Received(packet, SystemClock.elapsedRealtime()))
                         }
                     }
@@ -158,11 +171,16 @@ class PhoneClockDeviceInstrumentedTest {
                 check(requireNotNull(client).connectKnownAddress(ring.address, ring.name))
             }
             check(next(SystemClock.elapsedRealtime() + 20_000) is Ready) { "Expected connection readiness" }
+        }
+
+        try {
+            verifySavedFiles()
+            connect()
             val baseline = observation()
-            check(baseline.records.isEmpty() || store.hasPreservedDeviceRecords(ring.address, baseline.records)) {
+            check(!allowSet || baseline.records.isEmpty() || store.hasPreservedDeviceRecords(ring.address, baseline.records)) {
                 "Every nonempty ring record must have a verified local copy before TIME SET"
             }
-            val (_, beforeTime) = readTime()
+            val (beforeRequest, beforeTime) = readTime()
             val beforePacket = beforeTime.packet as SensorPacket.TimeStatus
             check(beforePacket.unixMs >= 0 && beforePacket.uptimeMs >= 0) { "Invalid pre-SET device time" }
             verifySavedFiles()
@@ -173,6 +191,40 @@ class PhoneClockDeviceInstrumentedTest {
             run = File(qa, UUID.randomUUID().toString()).also { check(it.mkdir()); syncDirectory(qa) }
             writeEvidence(requireNotNull(run), "before-device-observation.json", baseline)
             writeEvidence(requireNotNull(run), "before-time-status.json", beforePacket)
+            writeEvidence(requireNotNull(run), "before-time-request.json", beforeRequest)
+            if (!allowSet) {
+                val originalSession = requireNotNull(store.listSessions().filter {
+                    it.preparation.ring?.address == ring.address &&
+                        File(journal.parentFile, "${it.sessionId}.clock-sync.json").isFile
+                }.maxByOrNull { it.startRequestedAtMs }) { "A saved pre-START clock anchor is required" }
+                val original = PhoneClockSync.load(requireNotNull(journal.parentFile), originalSession.sessionId)
+                StoppedRecordClockRecovery.validateReply(original, beforeRequest.epochMs,
+                    beforeRequest.elapsedMs, beforeTime.elapsedMs, beforePacket)
+                closing.set(true)
+                instrumentation.runOnMainSync { client?.stop() }
+                connection++ // Exclude callbacks already queued by the closed GATT instance.
+                closing.set(false)
+                connect()
+                val after = observation()
+                val (request, received) = readTime()
+                val reply = received.packet as SensorPacket.TimeStatus
+                writeEvidence(requireNotNull(run), "after-device-observation.json", after)
+                writeEvidence(requireNotNull(run), "after-time-status.json", reply)
+                writeEvidence(requireNotNull(run), "after-time-request.json", request)
+                StoppedRecordClockRecovery.validateReply(original, request.epochMs,
+                    request.elapsedMs, received.elapsedMs, reply)
+                assertEquals(baseline.status, after.status)
+                assertEquals(baseline.records.toSet(), after.records.toSet())
+                verifySavedFiles()
+                assertEquals(0, setCount)
+                emit("read_only_complete", mapOf("retained_record_count" to baseline.records.size,
+                    "protected_file_count" to beforeHashes.size, "time_set_count" to setCount,
+                    "device_uptime_delta_ms" to (reply.uptimeMs - beforePacket.uptimeMs),
+                    "device_unix_delta_ms" to (reply.unixMs - beforePacket.unixMs),
+                    "device_minus_phone_reply_ms" to (reply.unixMs - reply.receivedEpochMs),
+                    "get_round_trip_ms" to (received.elapsedMs - request.elapsedMs)))
+                return
+            }
             // Capture the phone time in the main-thread enqueue action, after all protection checks.
             var setRequest: Request? = null
             command("TIME_SET") {

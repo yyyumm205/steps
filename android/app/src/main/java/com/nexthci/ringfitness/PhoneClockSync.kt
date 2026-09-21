@@ -2,6 +2,7 @@ package com.nexthci.ringfitness
 
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -103,6 +104,30 @@ object PhoneClockSync {
             evidence.deviceUnixMs - evidence.receivedAtMs <= MAX_WALL_CLOCK_SKEW_MS) {
             "戒指时间与手机校时窗口不符"
         }
+    }
+
+    /** Read the immutable pre-START reply already bound to this local session. */
+    fun load(directory: File, sessionId: String): PhoneClockSyncEvidence = synchronized(lock) {
+        validateUuid(sessionId)
+        val file = File(directory.canonicalFile, "$sessionId.clock-sync.json")
+        require(!Files.isSymbolicLink(file.toPath()) && file.isFile && file.length() in 1..8192) {
+            "缺少本次校时记录，已保留步数与数据"
+        }
+        val json = JsonParser.parseString(file.readText(Charsets.UTF_8)).asJsonObject
+        fun number(name: String): Long = requireNotNull(json[name]).let {
+            require(it.isJsonPrimitive && it.asJsonPrimitive.isNumber && Regex("[0-9]+").matches(it.asString))
+            it.asString.toLong()
+        }
+        fun text(name: String): String = requireNotNull(json[name]).let {
+            require(it.isJsonPrimitive && it.asJsonPrimitive.isString)
+            it.asString
+        }
+        val evidence = PhoneClockSyncEvidence(text("attempt_id"), text("ring_address"), number("connection_generation"),
+            number("requested_at_ms"), number("received_at_ms"), number("requested_elapsed_ms"),
+            number("received_elapsed_ms"), number("device_unix_ms"), number("device_uptime_ms"))
+        validate(evidence)
+        require(encode(evidence, sessionId) == json) { "校时记录不一致，已保留原始数据" }
+        evidence
     }
 
     private fun validateUuid(value: String) {

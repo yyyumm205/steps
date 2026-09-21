@@ -361,6 +361,17 @@ abstract class StepCollectionActivity : Activity() {
                     }
                 }
             }
+            val stopped = state.session
+            if (!state.busy && stopped?.stopConfirmedAtMs != null && stopped.reference != null &&
+                stopped.localData == null && !stopped.isDiscarded &&
+                stopped.transfer.status == SessionTransferStatus.PENDING && stopped.transfer.attempts == 0 &&
+                stopped.transfer.receipt == null &&
+                (state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) ||
+                    state.taskPage in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR))) {
+                ui.button(taskCard, "放弃本段", tag = "recovery_discard") { showDiscardConfirmation() }.apply {
+                    background = ui.linkBackground()
+                }
+            }
         } else if (state.canStart) {
             val startCard = ui.card(body, ui.statusSurface)
             ui.text(startCard, "本次活动", 14f, muted = true)

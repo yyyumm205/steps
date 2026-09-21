@@ -97,6 +97,7 @@ class RealCollectionService : Service() {
                     override fun queryStatus() = command("STATUS") { it.requestHealthStatus() }
                     override fun queryBattery() = command("BATTERY") { it.requestBattery() }
                     override fun syncTime(unixMs: Long) = command("TIME_SET") { it.syncTime(unixMs) }
+                    override fun queryTime() = command("TIME_GET") { it.requestTime() }
                     override fun queryRecords() = command("LIST") { it.requestHealthSessions() }
                     override fun start() = command("START") { it.startHealth() }
                     override fun stop() = command("STOP") { it.stopHealth() }

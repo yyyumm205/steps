@@ -113,6 +113,36 @@ class PhoneClockSyncTest {
         assertEquals(3, syncs)
         assertArrayEquals(original, binding.readBytes())
         assertEquals(2, directory.listFiles()!!.size)
+        assertEquals(evidence, PhoneClockSync.load(directory, sessionId))
+    }
+
+    @Test fun loadingRecoveryEvidenceRejectsForeignSessionAndMalformedFieldsWithoutChangingTheFile() {
+        val directory = temporary.newFolder()
+        PhoneClockSync.save(directory, accept(), sessionId, {})
+        val target = File(directory, "$sessionId.clock-sync.json")
+        val original = target.readText()
+        val mutations: List<(com.google.gson.JsonObject) -> Unit> = listOf(
+            { it.addProperty("session_id", UUID.randomUUID().toString()) },
+            { it.addProperty("version", 2) },
+            { it.addProperty("device_uptime_ms", "1000") },
+            { it.addProperty("device_uptime_ms", 1.5) },
+            { it.addProperty("device_uptime_ms", -1) },
+            { it.addProperty("device_uptime_ms", java.math.BigInteger("9223372036854775808")) },
+            { it.remove("attempt_id") },
+            { it.addProperty("extra", "unexpected") },
+        )
+        for (mutate in mutations) {
+            val json = JsonParser.parseString(original).asJsonObject
+            mutate(json)
+            target.writeText(json.toString())
+            val before = target.readBytes()
+            assertThrows(Exception::class.java) { PhoneClockSync.load(directory, sessionId) }
+            assertArrayEquals(before, target.readBytes())
+        }
+        target.writeText("x".repeat(8193))
+        assertThrows(IllegalArgumentException::class.java) { PhoneClockSync.load(directory, sessionId) }
+        assertThrows(IllegalArgumentException::class.java) { PhoneClockSync.load(directory, "../escape") }
+        assertThrows(IllegalArgumentException::class.java) { PhoneClockSync.load(directory, UUID.randomUUID().toString()) }
     }
 
     @Test fun differentEvidenceCannotReplaceAnAttemptOrSessionBinding() {

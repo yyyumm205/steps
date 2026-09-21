@@ -7,6 +7,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 /** The service supplies a fresh connection generation and serializes every callback. */
 interface RealCollectionPort : HealthControlPort {
     fun syncTime(unixMs: Long): Boolean = false
+    fun queryTime(): Boolean = false
     fun connect(ring: PreparedRing, generation: Long): Boolean
     fun disconnect()
     fun read(sessionId: Int, offset: Long, length: Int): Boolean
@@ -45,6 +46,10 @@ class RealCollectionController(
     private val syncClockBeforeStart: Boolean = false,
     private val saveClockEvidence: (PhoneClockSyncEvidence, String?) -> Unit = { evidence, sessionId ->
         PhoneClockSync.save(directory, evidence, sessionId)
+    },
+    private val saveRecoveryEvidence: (FreeLivingSession, PhoneClockSyncEvidence, HealthRecordObservation,
+        Long, Long, Long, SensorPacket.TimeStatus) -> Unit = { session, start, observed, requested, sent, received, reply ->
+        StoppedRecordClockRecovery.save(directory, session, start, observed, requested, sent, received, reply)
     },
 ) : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
@@ -100,6 +105,11 @@ class RealCollectionController(
     private var timeRound: TimeRound? = null
     private var startingClockEvidence: PhoneClockSyncEvidence? = null
     private var boundClockEvidence: PhoneClockSyncEvidence? = null
+    private data class RecoveryTimeRound(val id: Long, val sessionId: String, val before: HealthRecordObservation,
+        val start: PhoneClockSyncEvidence, val requestedAtMs: Long, val requestedElapsedMs: Long)
+    private var recoveryTimeRound: RecoveryTimeRound? = null
+    private var recoveredStopClock: Pair<RecoveryTimeRound, Long>? = null
+    private var replayDownloadOffset: Long? = null
     private data class Inspection(val id: Long, val attempt: Int = 1,
         val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
@@ -230,6 +240,7 @@ class RealCollectionController(
         timeRound = null; startingClockEvidence = null; boundClockEvidence = null
         endStartAttemptReason = null
         stopEvidenceGeneration = null
+        recoveryTimeRound = null; recoveredStopClock = null
         closeDownload()
         coordinator.onDisconnected(connection)
         scheduleReconnect()
@@ -320,8 +331,31 @@ class RealCollectionController(
         val download = downloader
         if (download != null) {
             when (val message = packet.message) {
-                is HealthMessage.DataChunk -> { download.append(message); scheduleDownloadTimeout() }
+                is HealthMessage.DataChunk -> {
+                    replayDownloadOffset?.let { offset ->
+                        require(message.offset in 0..offset && message.payload.size.toLong() <= download.nextOffset - message.offset) {
+                            "重连后的片段不一致，已保留原始数据"
+                        }
+                        download.append(message) // Compare the entire durable prefix before appending a new tail.
+                        replayDownloadOffset = maxOf(offset, message.offset + message.payload.size)
+                    } ?: download.append(message)
+                    scheduleDownloadTimeout()
+                }
                 is HealthMessage.ReadEnd -> {
+                    replayDownloadOffset?.let { offset ->
+                        require(message.nextOffset == offset && (!message.done || offset == download.nextOffset)) {
+                            "重连后的下载位置不一致，已保留原始数据"
+                        }
+                        if (offset < download.nextOffset) {
+                            requestWindow(download)
+                            return@safely
+                        }
+                        replayDownloadOffset = null
+                        if (!message.done) {
+                            requestWindow(download)
+                            return@safely
+                        }
+                    }
                     if (download.isDelayedCompletedPrefix(message)) {
                         scheduleDownloadTimeout()
                         return@safely
@@ -493,6 +527,21 @@ class RealCollectionController(
     }
 
     fun onTime(connection: Long, packet: SensorPacket.TimeStatus) = safely {
+        recoveryTimeRound?.let { recovery ->
+            if (!connected || generation != connection || recovery.before.connectionGeneration != connection) return@safely
+            val current = requireNotNull(store.readPending())
+            require(current.sessionId == recovery.sessionId)
+            val received = clock.nowElapsedMs()
+            StoppedRecordClockRecovery.validateStart(current, recovery.start)
+            StoppedRecordClockRecovery.validateReply(recovery.start, recovery.requestedAtMs,
+                recovery.requestedElapsedMs, received, packet)
+            saveRecoveryEvidence(current, recovery.start, recovery.before, recovery.requestedAtMs,
+                recovery.requestedElapsedMs, received, packet)
+            recoveryTimeRound = null
+            recoveredStopClock = recovery to received
+            inspect() // The record must still match after the read-only time query.
+            return@safely
+        }
         val round = timeRound ?: return@safely
         if (!connected || generation != connection || round.before.connectionGeneration != connection ||
             !round.awaitingReply || round.evidence != null) return@safely
@@ -773,6 +822,7 @@ class RealCollectionController(
         timeRound = null; startingClockEvidence = null; boundClockEvidence = null
         closeDownload(); query = null; readinessWait = null; lastIdle = null
         stopEvidenceGeneration = null
+        recoveryTimeRound = null; recoveredStopClock = null
         if (connected) coordinator.onDisconnected(generation)
         connected = false; connecting = true
         val id = ++generation
@@ -1083,9 +1133,6 @@ class RealCollectionController(
     private fun beginDownload(current: FreeLivingSession, observed: HealthRecordObservation) {
         val expected = requireNotNull(current.deviceRecordEvidence) { "本次戒指记录需要核对" }.record
         require(!current.deviceAssociationInvalidated && observed.address == current.preparation.ring?.address)
-        require(expected.unixMs > 0L || stopEvidenceGeneration == generation) {
-            "戒指时间信息不足，请重新连接后继续保存"
-        }
         require(!observed.status.collecting && observed.status.errorCode == 0 && observed.status.sessionId == expected.sessionId)
         val actual = observed.records.singleOrNull { it.sessionId == expected.sessionId }
         require(actual != null && FreeLivingSessionStore.sameDeviceRecord(expected, actual) &&
@@ -1096,8 +1143,33 @@ class RealCollectionController(
         require(otherRecordsAreStable(current, observed, actual)) {
             "戒指记录发生变化，请重新连接后继续保存"
         }
+        if (expected.unixMs == 0L && stopEvidenceGeneration != generation) {
+            val proof = recoveredStopClock
+            if (proof == null || proof.first.sessionId != current.sessionId ||
+                proof.first.before.connectionGeneration != generation ||
+                clock.nowElapsedMs() - proof.second !in 0..PhoneClockSync.MAX_START_AGE_MS) {
+                val start = PhoneClockSync.load(directory, current.sessionId)
+                StoppedRecordClockRecovery.validateStart(current, start)
+                val round = RecoveryTimeRound(++operation, current.sessionId, observed, start,
+                    clock.nowEpochMs(), clock.nowElapsedMs())
+                recoveryTimeRound = round
+                recoveredStopClock = null
+                publish(CollectionPage.RECOVERY, "正在核对戒指数据")
+                check(port.queryTime()) { "未能核对戒指时间，请重新连接后继续保存" }
+                scheduler.schedule(PhoneClockSync.TIMEOUT_MS) {
+                    if (!closed && recoveryTimeRound?.id == round.id && generation == observed.connectionGeneration) safely {
+                        recoveryTimeRound = null
+                        publish(CollectionPage.RECOVERY, "时间核对超时，请重新连接后继续保存")
+                    }
+                }
+                return
+            }
+            require(observed.status == proof.first.before.status &&
+                observed.records.toSet() == proof.first.before.records.toSet()) {
+                "戒指记录有变化，请重新检查后继续保存"
+            }
+        }
         if (unknownReadGeneration == generation) {
-            require(expected.unixMs > 0) { "本次时间尚未确认，请保留戒指数据并重新检查" }
             connect() // Separate untagged DATA from the previously preserved old original.
             return
         }
@@ -1105,13 +1177,15 @@ class RealCollectionController(
             DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
         val next = downloadFactory(directory, current, actual)
         lastIdle = observed
-        if (next.nextOffset == actual.bytes) {
+        val replay = expected.unixMs == 0L && stopEvidenceGeneration != generation && next.nextOffset > 0
+        if (next.nextOffset == actual.bytes && !replay) {
             val completed = next.finish(HealthMessage.ReadEnd(actual.bytes, true))
             finalizingDownload = FinalizingDownload(next, completed, actual)
             reconcileCompletedDownload(current, observed, requireNotNull(finalizingDownload))
             return
         }
         downloader = next
+        replayDownloadOffset = if (replay) 0L else null
         publish(CollectionPage.DOWNLOADING)
         requestWindow(next)
     }
@@ -1174,7 +1248,10 @@ class RealCollectionController(
 
     private fun requestWindow(download: RealSessionDownload) {
         val id = requireNotNull(store.readPending()?.deviceSessionId)
-        check(port.read(id, download.nextOffset, 16_384)) { "下载连接中断，请重试" }
+        val replay = replayDownloadOffset
+        val offset = replay ?: download.nextOffset
+        val length = if (replay != null) minOf(8192L, download.nextOffset - replay).toInt() else 16_384
+        check(port.read(id, offset, length)) { "下载连接中断，请重试" }
         scheduleDownloadTimeout()
     }
 
@@ -1191,6 +1268,7 @@ class RealCollectionController(
 
     private fun closeDownload() {
         downloadTimeout++
+        replayDownloadOffset = null
         val previous = downloader
         downloader = null
         val pendingFinalization = finalizingDownload
@@ -1207,6 +1285,7 @@ class RealCollectionController(
         abortWaitOperation = null; abortHighWater = null; abortPrecheck = null
         unknownPreservation = null
         closed = true; generation++; reconnectScheduledGeneration = null
+        recoveryTimeRound = null; recoveredStopClock = null
         query = null; readinessWait = null; timeRound = null; startingClockEvidence = null
         coordinator.close()
         runCatching { closeDownload() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
@@ -1249,12 +1328,12 @@ class RealCollectionController(
             placement = visibleProfile?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
             preservingExisting = backupObservation != null,
-            busy = saving || (!localReference && (connecting || query != null || readinessWait != null || timeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null)) ||
+            busy = saving || (!localReference && (connecting || query != null || readinessWait != null || timeRound != null || recoveryTimeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null)) ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
             savedSteps = current?.reference?.steps, referenceStatus = current?.reference?.status?.wireValue,
             canStart = canStart, canStop = connected && coordinator.state.phase == CaptureControlPhase.COLLECTING,
-            canRetry = !connecting && query == null && readinessWait == null && timeRound == null && abortWaitOperation == null && downloader == null && backupObservation == null && !coordinator.state.settling,
+            canRetry = !connecting && query == null && readinessWait == null && timeRound == null && recoveryTimeRound == null && abortWaitOperation == null && downloader == null && backupObservation == null && !coordinator.state.settling,
             canEndStartAttempt = pending?.phase == FreeLivingSessionPhase.START_REQUESTED && connected && !connecting &&
                 pending.startAbort == null && coordinator.state.unconfirmedStartStopCandidate == null &&
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
@@ -1273,6 +1352,7 @@ class RealCollectionController(
             abortPrecheck = null
             val clockStartFailed = startingClockEvidence != null
             timeRound = null; startingClockEvidence = null
+            recoveryTimeRound = null; recoveredStopClock = null
             if (clockStartFailed) {
                 // Binding failed inside the coordinator's pre-START callback. Cancel its
                 // unscheduled wait and require fresh recovery queries on a new connection.

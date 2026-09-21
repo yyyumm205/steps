@@ -1207,6 +1207,221 @@ class RealCollectionControllerTest {
         assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
     }
 
+    @Test fun unknownClockSavedReferenceReopensWithReadOnlyClockEvidenceAndSameSession() = Fixture().use { f ->
+        f.reachReference(unixMs = 0)
+        f.saveReference("0", "valid", "")
+        val before = f.store.readPending()!!
+        val startClock = f.seedRecoveryClock()
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        assertEquals(1, f.port.count("time_get"))
+        assertTrue(f.port.reads.isEmpty())
+        assertTrue(f.owner.state.busy)
+        f.recoveryTimeReply(startClock)
+        assertTrue(f.port.reads.isEmpty())
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.finishDownload()
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(before.sessionId, f.store.read()!!.sessionId)
+        assertEquals(before.reference, f.store.read()!!.reference)
+        assertEquals(0L, f.store.read()!!.deviceRecordEvidence!!.record.unixMs)
+        assertNull(f.store.read()!!.startedAtMs)
+        assertEquals(0, f.port.count("time"))
+        assertEquals(1, f.port.count("start")); assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun unknownClockReconnectedDownloadComparesSavedPrefixBeforeContinuing() = Fixture().use { f ->
+        f.reachReference(unixMs = 0); f.saveReference("73", "valid", "")
+        val startClock = f.seedRecoveryClock()
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.recoveryTimeReply(startClock)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        assertEquals(Read(7, 0, 13), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        f.health(HealthMessage.ReadEnd(13, false))
+        assertEquals(Read(7, 13, 16_384), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(73L, f.store.read()!!.reference!!.steps)
+    }
+
+    @Test fun unknownClockChangedPrefixCannotBeMergedOrOverwriteSavedBytes() = Fixture().use { f ->
+        f.reachReference(unixMs = 0); f.saveReference("2", "valid", "")
+        val startClock = f.seedRecoveryClock()
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.recoveryTimeReply(startClock)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13).apply { this[0] = 0 }))
+        assertEquals(CollectionPage.ERROR, f.owner.state.page)
+        assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        assertNull(f.store.read()!!.localData)
+        assertEquals(2L, f.store.read()!!.reference!!.steps)
+    }
+
+    @Test fun recoveredPrefixSpansMultipleWindowsAndAcceptsIdenticalDuplicateChunks() = Fixture().use { f ->
+        val longPayload = ByteArrayOutputStream().apply {
+            repeat(500) { write(imu(3, 1_000L + it * 60)) }
+        }.toByteArray()
+        val record = finalRecord.copy(unixMs = 0, bytes = longPayload.size.toLong(), records = 500)
+        val status = stopped().copy(bytes = record.bytes, records = record.records)
+        f.reachReference(unixMs = 0); f.saveReference("0", "valid", "")
+        val start = f.seedRecoveryClock()
+        f.observe(status, listOf(record))
+        f.health(HealthMessage.DataChunk(0, longPayload.copyOf(10_000)))
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(status, listOf(record)); f.recoveryTimeReply(start); f.observe(status, listOf(record))
+        assertEquals(Read(7, 0, 8192), f.port.reads.last())
+        val first = HealthMessage.DataChunk(0, longPayload.copyOf(8192))
+        f.health(first); f.health(first)
+        f.health(HealthMessage.ReadEnd(8192, false))
+        assertEquals(Read(7, 8192, 1808), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(8192, longPayload.copyOfRange(8192, 10_000)))
+        f.health(HealthMessage.ReadEnd(10_000, false))
+        assertEquals(Read(7, 10_000, 16_384), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(10_000, longPayload.copyOfRange(10_000, longPayload.size)))
+        f.health(HealthMessage.ReadEnd(record.bytes, true)); f.observe(status, listOf(record))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(0L, f.store.read()!!.reference!!.steps)
+        assertEquals(500L, f.store.read()!!.deviceRecordEvidence!!.record.records)
+    }
+
+    @Test fun unknownClockRecoveryRejectsResetClockTimeoutAndForeignRecords() {
+        for (fault in listOf("reset", "unsynced", "timeout", "foreign", "save")) Fixture().use { f ->
+            f.reachReference(unixMs = 0); f.saveReference("31", "valid", "")
+            val startClock = f.seedRecoveryClock()
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            val before = f.store.readPending()!!
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            when (fault) {
+                "timeout" -> f.runDelay(PhoneClockSync.TIMEOUT_MS)
+                "reset" -> f.recoveryTimeReply(startClock, uptime = 1)
+                "unsynced" -> f.recoveryTimeReply(startClock, synced = false)
+                "save" -> { f.failRecoveryEvidence = true; f.recoveryTimeReply(startClock) }
+                else -> {
+                    f.recoveryTimeReply(startClock)
+                    f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0), finalRecord.copy(sessionId = 8)))
+                }
+            }
+            assertTrue("fault=$fault", f.port.reads.isEmpty())
+            assertEquals(before, f.store.readPending())
+            assertTrue(f.owner.state.canRetry)
+            assertEquals(1, f.port.count("start")); assertEquals(1, f.port.count("stop"))
+            assertEquals(0, f.port.count("time"))
+        }
+    }
+
+    @Test fun unknownClockRecoveryAllowsTenHoursAndPhoneElapsedResetButRejectsPhoneClockJump() {
+        for (jump in listOf(false, true)) Fixture().use { f ->
+            f.reachReference(unixMs = 0); f.saveReference("31", "valid", "")
+            val startClock = f.seedRecoveryClock()
+            f.clock.now += 10 * 60 * 60 * 1000L
+            f.clock.elapsed = 50 // Another Android boot; only this GET uses the new monotonic clock.
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            f.recoveryTimeReply(startClock, clockJump = if (jump) 10_000 else 0)
+            if (!jump) {
+                f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+                f.finishDownload()
+                assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            } else {
+                assertTrue(f.port.reads.isEmpty())
+                assertNull(f.store.read()!!.localData)
+            }
+        }
+    }
+
+    @Test fun recoveryUptimeAnchorUsesHealthUint32WrappingWithoutChangingResearchTime() = Fixture().use { f ->
+        f.reachReference(unixMs = 0); f.saveReference("0", "valid", "")
+        val session = f.store.readPending()!!
+        val start = f.seedRecoveryClock()
+        StoppedRecordClockRecovery.validateStart(session, start.copy(deviceUptimeMs = (1L shl 32) + start.deviceUptimeMs))
+        // The HEALTH record is 100 ms after this TIME anchor across the uint32 boundary.
+        val record = session.deviceRecordEvidence!!.record.copy(uptimeMs = 50)
+        StoppedRecordClockRecovery.validateStart(session.copy(deviceRecordEvidence =
+            session.deviceRecordEvidence!!.copy(record = record)), start.copy(deviceUptimeMs = (1L shl 32) - 50))
+        assertThrows(IllegalArgumentException::class.java) {
+            StoppedRecordClockRecovery.validateStart(session, start.copy(deviceUptimeMs = initialRecord.uptimeMs + 1))
+        }
+        assertEquals(0L, f.store.readPending()!!.deviceRecordEvidence!!.record.unixMs)
+    }
+
+    @Test fun recoveryUsesElapsedContinuityForAccumulatedClockDriftAndRejectsLargerChanges() {
+        for (lag in listOf(364L, 6_000L, 7_000L)) Fixture().use { f ->
+            f.reachReference(unixMs = 0); f.saveReference("0", "valid", "")
+            val start = f.seedRecoveryClock()
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            f.recoveryTimeReply(start, deviceLag = lag)
+            if (lag < 6_500) {
+                f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+                f.finishDownload()
+                assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            } else {
+                assertEquals(CollectionPage.ERROR, f.owner.state.page)
+                assertTrue(f.port.reads.isEmpty())
+            }
+        }
+    }
+
+    @Test fun timedOutRecoveryReplyAndOldConnectionCannotAuthorizeTheNextDownload() = Fixture().use { f ->
+        f.reachReference(unixMs = 0); f.saveReference("73", "valid", "")
+        val start = f.seedRecoveryClock()
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        val oldGeneration = f.port.generation
+        f.runDelay(PhoneClockSync.TIMEOUT_MS)
+        f.recoveryTimeReply(start)
+        assertTrue(f.port.reads.isEmpty())
+        assertFalse(File(f.directory, "${f.store.readPending()!!.sessionId}.clock-recovery.json").exists())
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.owner.onTime(oldGeneration, SensorPacket.TimeStatus(true, f.clock.now,
+            start.deviceUptimeMs + f.clock.now - start.deviceUnixMs, f.clock.now))
+        assertTrue(f.port.reads.isEmpty())
+        assertTrue(f.owner.state.busy)
+        f.recoveryTimeReply(start)
+        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+        f.finishDownload()
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(1, f.port.count("start")); assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun missingOrDamagedClockEvidenceKeepsDataUntilExplicitDiscardThenReopensReady() {
+        for (damaged in listOf(false, true)) Fixture().use { f ->
+            f.reachReference(unixMs = 0); f.saveReference("73", "valid", "")
+            val id = f.store.readPending()!!.sessionId
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            if (damaged) File(f.directory, "$id.clock-sync.json").writeText("damaged")
+            val other = File(f.directory, "another-session.rfbin").apply { writeText("retained") }
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            assertEquals(CollectionPage.ERROR, f.owner.state.page)
+            assertEquals(73L, f.store.readPending()!!.reference!!.steps)
+            assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+            val readCount = f.port.reads.size
+            f.owner.discardSession()
+            f.reopen(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
+            assertNull(f.store.readPending())
+            assertTrue(f.store.read(id)!!.isDiscarded)
+            assertEquals(73L, f.store.read(id)!!.reference!!.steps) // Tombstone retains the audit, excluded from research.
+            assertEquals("retained", other.readText())
+            assertFalse(f.directory.listFiles()!!.any { it.name.startsWith(id) })
+            assertEquals(readCount, f.port.reads.size)
+            assertEquals(1, f.port.count("start")); assertEquals(1, f.port.count("stop"))
+            assertTrue(f.owner.state.canStart)
+        }
+    }
+
     @Test fun cleanupSyncFailureAfterLocalCommitKeepsCompleteStateAndSavedFiles() = Fixture().use { f ->
         f.reachReference()
         f.saveReference("47", "valid", "")
@@ -1897,6 +2112,7 @@ class RealCollectionControllerTest {
         var failObservation = false
         var failDownloadSyncAfterLocalCommit = false
         var failClockEvidence = false
+        var failRecoveryEvidence = false
         val clockEvidence = mutableListOf<Pair<PhoneClockSyncEvidence, String?>>()
         val preparation = PreparationStore(File(directory, "profile")) { source, target -> replace(source, target) }.apply {
             register(profileLabel, RingPlacement.LEFT_INDEX, identityType)
@@ -1931,7 +2147,29 @@ class RealCollectionControllerTest {
             saveClockEvidence = { evidence, sessionId ->
                 if (failClockEvidence) throw IOException("校时证据保存失败")
                 clockEvidence += evidence to sessionId
+            }, saveRecoveryEvidence = { session, start, observed, requested, sent, received, reply ->
+                if (failRecoveryEvidence) throw IOException("恢复依据保存失败")
+                StoppedRecordClockRecovery.save(directory, session, start, observed, requested, sent, received, reply, {})
             })
+
+        fun seedRecoveryClock(): PhoneClockSyncEvidence {
+            val session = store.readPending()!!
+            val received = session.startRequestedAtMs - 1
+            val evidence = PhoneClockSyncEvidence(java.util.UUID.randomUUID().toString(), ring.address,
+                session.startCommandDispatch!!.connectionGeneration!!, received - 10, received,
+                1_000, 1_010, received - 5, initialRecord.uptimeMs - 100)
+            PhoneClockSync.save(directory, evidence, session.sessionId, {})
+            return evidence
+        }
+
+        fun recoveryTimeReply(start: PhoneClockSyncEvidence, synced: Boolean = true, uptime: Long? = null,
+            clockJump: Long = 0, deviceLag: Long = 0) {
+            clock.now += 10; clock.elapsed += 10
+            val unix = clock.now - 5 - deviceLag
+            clock.now += clockJump
+            owner.onTime(port.generation, SensorPacket.TimeStatus(synced, unix,
+                uptime ?: (start.deviceUptimeMs + unix - start.deviceUnixMs), clock.now))
+        }
 
         fun timeReply(synced: Boolean = true) {
             clock.now += 10; clock.elapsed += 10
@@ -2091,6 +2329,7 @@ class RealCollectionControllerTest {
         override fun queryStatus() = send("status")
         override fun queryBattery() = send("battery")
         override fun syncTime(unixMs: Long) = send("time")
+        override fun queryTime() = send("time_get")
         override fun queryRecords() = send("list")
         override fun start() = send("start")
         override fun stop() = send("stop")

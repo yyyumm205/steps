@@ -1348,6 +1348,37 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun failedDownloadCanCancelDiscardOrConfirmItThenReopenHome() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val id = reachReference(scenario, handle)
+            handle.flow.setFault(FlowTestFault.DOWNLOAD_FAILURE)
+            awaitFlow(handle, "download failure armed") { it.fault == FlowTestFault.DOWNLOAD_FAILURE }
+            type(scenario, "flow_steps", "0")
+            click(scenario, "flow_primary")
+            awaitFlow(handle, "failed download is recoverable at home") { it.taskPage == CollectionPage.ERROR && !it.busy }
+            await(scenario, "discard available after confirmed stop") { taggedOrNull<Button>(it, "recovery_discard") != null }
+            val saved = session(handle)
+            click(scenario, "recovery_discard")
+            scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+            assertEquals(saved, session(handle))
+            scenario.recreate()
+            await(scenario, "recovery action survives recreation") { taggedOrNull<Button>(it, "recovery_discard") != null }
+            click(scenario, "recovery_discard")
+            captureReviewScreen(scenario, "download_discard_confirmation")
+            scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_POSITIVE).performClick() }
+            awaitFlow(handle, "discard releases original task") { it.canStart && !it.busy }
+            val store = FreeLivingSessionStore(File(handle.directory, "session.json"))
+            assertTrue(store.read(id)!!.isDiscarded)
+            assertEquals(0L, store.read(id)!!.reference!!.steps)
+            assertNull(store.readPending())
+            assertTrue(handle.flow.state.records.none { it.sessionId == id })
+            scenario.recreate()
+            awaitHeading(scenario, "步数采集")
+            scenario.onActivity { assertNull(taggedOrNull<Button>(it, "recovery_discard")) }
+        }
+    }
+
     @Test fun startDateKeepsTheSessionTimezoneAcrossMidnightAndDefaultTimezoneChanges() = withFlow { handle ->
         val originalDefault = TimeZone.getDefault()
         try {
