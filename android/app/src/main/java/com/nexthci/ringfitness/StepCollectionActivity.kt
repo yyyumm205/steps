@@ -34,19 +34,15 @@ abstract class StepCollectionActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var current: CollectionFlowState? = null
     private var stepsInput: EditText? = null
-    private var reasonInput: EditText? = null
     private var participantInput: EditText? = null
     private var placementPicker: Spinner? = null
     private var elapsedLabel: TextView? = null
     private var pageScroll: ScrollView? = null
     private var finishInputError: TextView? = null
-    private var finishErrorField: EditText? = null
     private var imeWasVisible = false
     private var stepsDraft = ""
-    private var reasonDraft = ""
     private var participantDraft = ""
     private var placementDraft = 0
-    private var referenceKind = "valid"
     private var draftSessionId: String? = null
     private var dialog: AlertDialog? = null
     private var showingRecords = false
@@ -54,8 +50,7 @@ abstract class StepCollectionActivity : Activity() {
         val sessionId: String,
         val target: SessionReference,
         val editor: AlertDialog,
-        val steps: EditText?,
-        val reason: EditText?,
+        val steps: EditText,
     )
     private var pendingReferenceRevision: PendingReferenceRevision? = null
     private val ticker = object : Runnable {
@@ -68,10 +63,8 @@ abstract class StepCollectionActivity : Activity() {
         ui = QuietUi(this)
         flow = provideFlow()
         stepsDraft = savedInstanceState?.getString("steps").orEmpty()
-        reasonDraft = savedInstanceState?.getString("reason").orEmpty()
         participantDraft = savedInstanceState?.getString("participant").orEmpty()
         placementDraft = savedInstanceState?.getInt("placement") ?: 0
-        referenceKind = savedInstanceState?.getString("reference_kind") ?: "valid"
         draftSessionId = savedInstanceState?.getString("draft_session")
         if (Build.VERSION.SDK_INT >= 33) onBackInvokedDispatcher.registerOnBackInvokedCallback(
             android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { back() }
@@ -95,10 +88,8 @@ abstract class StepCollectionActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         rememberDrafts()
         outState.putString("steps", stepsDraft)
-        outState.putString("reason", reasonDraft)
         outState.putString("participant", participantDraft)
         outState.putInt("placement", placementDraft)
-        outState.putString("reference_kind", referenceKind)
         outState.putString("draft_session", draftSessionId)
         super.onSaveInstanceState(outState)
     }
@@ -126,7 +117,6 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun rememberDrafts() {
         stepsInput?.let { stepsDraft = it.text.toString() }
-        reasonInput?.let { reasonDraft = it.text.toString() }
         participantInput?.let { participantDraft = it.text.toString() }
         placementPicker?.let { placementDraft = it.selectedItemPosition }
     }
@@ -140,13 +130,9 @@ abstract class StepCollectionActivity : Activity() {
         if (state.session?.sessionId != null && draftSessionId != state.session.sessionId) {
             draftSessionId = state.session.sessionId
             stepsDraft = ""
-            reasonDraft = ""
-            referenceKind = "valid"
         }
         state.session?.reference?.let { saved ->
             stepsDraft = saved.steps?.toString().orEmpty()
-            reasonDraft = saved.reason.orEmpty()
-            referenceKind = saved.status.wireValue
         }
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
@@ -159,9 +145,8 @@ abstract class StepCollectionActivity : Activity() {
             }
             return
         }
-        stepsInput = null; reasonInput = null; participantInput = null; placementPicker = null; elapsedLabel = null
+        stepsInput = null; participantInput = null; placementPicker = null; elapsedLabel = null
         finishInputError = null
-        finishErrorField = null
         val root = ui.column().apply {
             setBackgroundColor(ui.background)
             isFocusableInTouchMode = true
@@ -254,8 +239,8 @@ abstract class StepCollectionActivity : Activity() {
             state.page in setOf(CollectionPage.STARTING, CollectionPage.COLLECTING, CollectionPage.STOPPING) ->
                 captureSession(body, footer, state)
             state.page == CollectionPage.SAVING -> saving(body, state)
-            state.page == CollectionPage.FINISH -> finishSession(body, footer, state)
-            state.page == CollectionPage.REFERENCE && session?.stopConfirmedAtMs != null -> finishSession(body, footer, state)
+            state.page == CollectionPage.FINISH -> finishSession(body, state)
+            state.page == CollectionPage.REFERENCE && session?.stopConfirmedAtMs != null -> finishSession(body, state)
             state.page == CollectionPage.REFERENCE -> reference(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) && session == null -> recovery(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
@@ -267,7 +252,7 @@ abstract class StepCollectionActivity : Activity() {
                 session?.phase in setOf(FreeLivingSessionPhase.START_REQUESTED, FreeLivingSessionPhase.COLLECTING,
                     FreeLivingSessionPhase.STOP_REQUESTED) -> captureSession(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
-                session?.stopConfirmedAtMs != null && session.reference == null -> finishSession(body, footer, state)
+                session?.stopConfirmedAtMs != null && session.reference == null -> finishSession(body, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) && session?.reference != null ->
                 recovery(body, footer, state)
             else -> recovery(body, footer, state)
@@ -441,7 +426,7 @@ abstract class StepCollectionActivity : Activity() {
             }
             if (record.referenceEditable) {
                 ui.button(card, "修改步数", tag = "edit_reference_${record.sessionId}") {
-                    showReferenceCorrectionStatus(record)
+                    showReferenceCorrection(record)
                 }
             }
             recordAction(record, state)?.let { (label, action) ->
@@ -611,7 +596,7 @@ abstract class StepCollectionActivity : Activity() {
         }
     }
 
-    private fun finishSession(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
+    private fun finishSession(body: LinearLayout, state: CollectionFlowState) {
         // Keep the complete form scrollable when the keyboard or larger system text reduces space.
         title(body, "结束本段", "填写计步器显示的本次总数。")
         val summary = ui.card(body, ui.statusSurface)
@@ -630,41 +615,9 @@ abstract class StepCollectionActivity : Activity() {
                 ui.text(input, reason, 14f, muted = true)
             }
         } else {
-            if (referenceKind != "missing") {
-                ui.text(input, "计步器总步数", 14f, muted = true)
-                ui.gap(input, 10)
-                stepsInput = ui.input(input, "填写步数", "flow_steps", numeric = true).apply { setText(stepsDraft) }
-            } else ui.text(input, "本次无法提供读数", 20f, bold = true)
-            if (referenceKind != "valid") {
-                ui.gap(input, 18)
-                ui.text(input, "原因", 14f, muted = true)
-                ui.gap(input, 8)
-                reasonInput = ui.input(input, "简单说明情况", "flow_reason").apply {
-                    setSingleLine(false); maxLines = 3; setText(reasonDraft)
-                }
-            }
-            finishInputError = ui.text(input, "", 14f).apply {
-                tag = "finish_input_error"
-                setTextColor(ui.error)
-                visibility = View.GONE
-                accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-            }
-            listOfNotNull(stepsInput, reasonInput).forEach { field ->
-                field.doAfterTextChanged {
-                    if (field === finishErrorField && !it.isNullOrBlank()) {
-                        finishInputError?.visibility = View.GONE
-                        finishErrorField = null
-                    }
-                }
-            }
-            ui.button(input, when (referenceKind) {
-                "missing" -> "改为填写步数"
-                "unreliable" -> "读数有异常 · 修改"
-                else -> "读数有问题"
-            }, tag = "reference_options") { showReferenceOptions(false) }.apply {
-                background = ui.linkBackground()
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            }
+            referenceInput(input)
+            ui.gap(input, 12)
+            ui.text(input, "无法提供本次步数时，可放弃本段。", 14f, muted = true).tag = "no_reference_hint"
         }
 
         val actions = ui.column(body)
@@ -699,21 +652,32 @@ abstract class StepCollectionActivity : Activity() {
             else flow.chooseFinish(uploadNow)
             return
         }
-        if (referenceKind != "missing" && stepsDraft.isBlank()) {
+        if (stepsDraft.isBlank()) {
             showRequiredFinishInput(stepsInput, "请先填写计步器总步数")
             return
         }
-        if (referenceKind != "valid" && reasonDraft.isBlank()) {
-            showRequiredFinishInput(reasonInput, "请填写读数异常的原因")
-            return
-        }
         hideKeyboard()
-        flow.finalizeSession(uploadNow, stepsDraft, referenceKind,
-            if (referenceKind == "valid") "" else reasonDraft)
+        flow.finalizeSession(uploadNow, stepsDraft, "valid", "")
+    }
+
+    private fun referenceInput(parent: LinearLayout) {
+        ui.text(parent, "计步器总步数", 14f, muted = true)
+        ui.gap(parent, 10)
+        stepsInput = ui.input(parent, "填写步数", "flow_steps", numeric = true).apply { setText(stepsDraft) }
+        finishInputError = ui.text(parent, "", 14f).apply {
+            tag = "finish_input_error"
+            setTextColor(ui.error)
+            visibility = View.GONE
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        stepsInput?.doAfterTextChanged {
+            if (!it.isNullOrBlank()) {
+                finishInputError?.visibility = View.GONE
+            }
+        }
     }
 
     private fun showRequiredFinishInput(field: EditText?, message: String) {
-        finishErrorField = field
         finishInputError?.apply {
             val input = field?.parent as? LinearLayout
             if (input != null) {
@@ -738,8 +702,8 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun showDiscardConfirmation() {
         val confirmation = AlertDialog.Builder(this).setTitle("放弃本段？")
-            .setMessage("删除手机中的本段记录并停止上传。戒指原始记录会保留。")
-            .setNegativeButton("继续保存", null).setPositiveButton("放弃本段", null).create()
+            .setMessage("删除本段记录，不会上传。此操作无法撤销。")
+            .setNegativeButton("返回", null).setPositiveButton("确认放弃", null).create()
         dialog = confirmation
         confirmation.setOnShowListener {
             confirmation.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
@@ -755,71 +719,46 @@ abstract class StepCollectionActivity : Activity() {
         title(body, "记录计步器读数", "结束确认恢复后，App会继续保存本段。")
         val card = ui.card(body)
         val uncertain = state.session?.stopConfirmedAtMs == null
-        if (uncertain && referenceKind == "valid") referenceKind = "unreliable"
-        if (referenceKind != "missing") {
-            ui.text(card, "计步器总步数", 14f, muted = true)
-            ui.gap(card, 12)
-            stepsInput = ui.input(card, "填写步数", "flow_steps", numeric = true).apply { setText(stepsDraft) }
-        } else ui.text(card, "本次无法提供读数", 20f, bold = true)
-        if (referenceKind != "valid") {
-            ui.gap(card, 20)
-            ui.text(card, "简单说明原因", 14f, muted = true)
-            ui.gap(card, 10)
-            reasonInput = ui.input(card, "例如：计步器意外清零", "flow_reason").apply {
-                setSingleLine(false); maxLines = 3; setText(reasonDraft)
-            }
-        }
-        ui.button(body, when (referenceKind) {
-            "missing" -> "改为填写步数"
-            "unreliable" -> "读数有异常 · 修改"
-            else -> "读数有问题？"
-        }, tag = "reference_options") { showReferenceOptions(uncertain) }
+        referenceInput(card)
         if (uncertain) { ui.gap(body, 14); ui.text(body, "戒指仍在确认结束，读数会先保存在手机。", 14f, muted = true) }
         action(footer, "保存读数", !state.busy) {
-            rememberDrafts(); hideKeyboard()
-            flow.saveReference(stepsDraft, referenceKind, if (referenceKind == "valid") "" else reasonDraft)
+            rememberDrafts()
+            if (stepsDraft.isBlank()) showRequiredFinishInput(stepsInput, "请先填写计步器总步数")
+            else {
+                hideKeyboard()
+                flow.saveReference(stepsDraft, if (uncertain) "unreliable" else "valid",
+                    if (uncertain) "戒指停止尚未确认时记录的计步器读数" else "")
+            }
         }
+        if (uncertain) ui.button(body, "返回结束确认", tag = "reference_resume_stop") {
+            rememberDrafts(); hideKeyboard(); flow.retry()
+        }.background = ui.linkBackground()
     }
 
-    private fun showReferenceCorrectionStatus(record: FlowRecordSummary) {
-        val labels = arrayOf("读数正常", "数字可能不准确", "无法提供读数")
-        val values = listOf("valid", "unreliable", "missing")
-        val selected = values.indexOf(record.referenceStatus).coerceAtLeast(0)
-        dialog = AlertDialog.Builder(this).setTitle("修改计步器读数")
-            .setSingleChoiceItems(labels, selected) { picker, index ->
-                picker.dismiss()
-                showReferenceCorrectionForm(record, values[index])
-            }.setNegativeButton("取消", null).show()
-    }
-
-    private fun showReferenceCorrectionForm(record: FlowRecordSummary, status: String) {
+    private fun showReferenceCorrection(record: FlowRecordSummary) {
+        val status = if (record.referenceStatus == "unreliable") "unreliable" else "valid"
+        val reasonText = if (status == "unreliable") record.referenceReason.orEmpty() else ""
         val content = ui.column(padding = 20)
-        val steps = if (status == "missing") null else ui.input(content, "填写步数", "edit_reference_steps", numeric = true).apply {
+        val steps = ui.input(content, "填写步数", "edit_reference_steps", numeric = true).apply {
             setText(record.steps?.toString().orEmpty())
-        }
-        val reason = if (status == "valid") null else ui.input(content, "简单说明情况", "edit_reference_reason").apply {
-            setSingleLine(false)
-            maxLines = 3
-            setText(record.referenceReason.orEmpty())
         }
         val editor = AlertDialog.Builder(this).setTitle("本次计步器读数")
             .setView(content).setNegativeButton("取消", null).setPositiveButton("保存修改", null).create()
         dialog = editor
         editor.setOnShowListener {
             editor.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val stepsText = steps?.text?.toString().orEmpty()
-                val reasonText = reason?.text?.toString().orEmpty()
+                val stepsText = steps.text.toString()
                 val target = runCatching {
                     sessionReferenceFromInput(stepsText, status, reasonText, System.currentTimeMillis())
                 }.onFailure { error ->
-                    (steps ?: reason)?.error = error.message ?: "请核对读数"
+                    steps.error = error.message ?: "请核对读数"
                 }.getOrNull() ?: return@setOnClickListener
                 if (record.referenceStatus == target.status.wireValue && record.steps == target.steps &&
                     record.referenceReason == target.reason) {
                     editor.dismiss()
                     return@setOnClickListener
                 }
-                val pending = PendingReferenceRevision(record.sessionId, target, editor, steps, reason)
+                val pending = PendingReferenceRevision(record.sessionId, target, editor, steps)
                 pendingReferenceRevision = pending
                 editor.setCancelable(false)
                 editor.getButton(AlertDialog.BUTTON_NEGATIVE).isEnabled = false
@@ -836,7 +775,7 @@ abstract class StepCollectionActivity : Activity() {
                             isEnabled = true
                             text = "保存修改"
                         }
-                        (steps ?: reason)?.error = "保存时间较长，请重试"
+                        steps.error = "保存时间较长，请重试"
                     }
                 }, 10_000)
             }
@@ -864,7 +803,7 @@ abstract class StepCollectionActivity : Activity() {
             isEnabled = true
             text = "保存修改"
         }
-        (pending.steps ?: pending.reason)?.error = displayError(error) ?: "保存未完成，请重试"
+        pending.steps.error = displayError(error) ?: "保存未完成，请重试"
     }
 
     private fun recovery(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
@@ -1007,17 +946,6 @@ abstract class StepCollectionActivity : Activity() {
         SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ROOT).apply {
             timeZone = runCatching { timeZoneId?.let(TimeZone::getTimeZone) }.getOrNull() ?: TimeZone.getDefault()
         }.format(Date(it))
-    }
-
-    private fun showReferenceOptions(uncertain: Boolean) {
-        rememberDrafts()
-        val labels = if (uncertain) arrayOf("数字可能不准确", "无法提供读数") else arrayOf("读数正常", "数字可能不准确", "无法提供读数")
-        val values = if (uncertain) listOf("unreliable", "missing") else listOf("valid", "unreliable", "missing")
-        dialog = AlertDialog.Builder(this).setTitle("计步器读数")
-            .setSingleChoiceItems(labels, values.indexOf(referenceKind)) { d, index ->
-                referenceKind = values[index]; d.dismiss()
-                val state = requireNotNull(current); current = null; render(state)
-            }.setNegativeButton("返回", null).show()
     }
 
     private fun showOptions() {

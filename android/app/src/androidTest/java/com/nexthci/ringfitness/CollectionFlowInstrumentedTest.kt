@@ -15,7 +15,6 @@ import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import com.google.gson.JsonParser
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -93,14 +92,6 @@ class CollectionFlowInstrumentedTest {
                     captureReviewScreen(scenario, name)
                 }
                 fun screen(name: String, state: CollectionFlowState) { show(state); capture(name) }
-                fun selectReferenceKind(label: String) {
-                    click(scenario, "reference_options")
-                    scenario.onActivity { activity ->
-                        val list = startAttemptDialog(activity).listView
-                        val index = (0 until list.adapter.count).single { list.adapter.getItem(it).toString() == label }
-                        assertTrue(list.performItemClick(list.adapter.getView(index, null, list), index, list.adapter.getItemId(index)))
-                    }
-                }
                 fun savedState(session: FreeLivingSession = local, inFlight: Boolean = false,
                     needsReview: Boolean = false) = base.copy(page = CollectionPage.COMPLETE,
                     taskPage = CollectionPage.COMPLETE, session = session, canStart = true,
@@ -120,25 +111,25 @@ class CollectionFlowInstrumentedTest {
                     taskPage = CollectionPage.STOPPING, session = stopping, busy = true))
                 screen("catalog_finish", base.copy(page = CollectionPage.FINISH,
                     taskPage = CollectionPage.FINISH, session = stopped))
+                scenario.onActivity { activity ->
+                    assertNotNull(taggedOrNull<TextView>(activity, "no_reference_hint"))
+                    assertNull(taggedOrNull<View>(activity, "reference_options"))
+                    assertNull(taggedOrNull<View>(activity, "flow_reason"))
+                }
                 click(scenario, "finish_discard")
                 capture("catalog_discard_confirmation")
                 scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
 
                 val referenceState = base.copy(page = CollectionPage.REFERENCE,
-                    taskPage = CollectionPage.REFERENCE, session = reference)
+                    taskPage = CollectionPage.REFERENCE, session = stopping)
                 screen("catalog_reference_empty", referenceState)
                 type(scenario, "flow_steps", "562")
-                capture("catalog_reference_valid")
-                click(scenario, "reference_options")
-                capture("catalog_reference_options")
-                scenario.onActivity { startAttemptDialog(it).getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
-                selectReferenceKind("无法提供读数")
-                type(scenario, "flow_reason", "计步器意外清零")
-                capture("catalog_reference_missing")
-                selectReferenceKind("数字可能不准确")
-                type(scenario, "flow_reason", "结束后仍走动了几步")
-                capture("catalog_reference_unreliable")
-                selectReferenceKind("读数正常")
+                capture("catalog_reference_number")
+                scenario.onActivity { activity ->
+                    assertEquals("返回结束确认", tagged<Button>(activity, "reference_resume_stop").text.toString())
+                    assertNull(taggedOrNull<View>(activity, "reference_options"))
+                    assertNull(taggedOrNull<View>(activity, "flow_reason"))
+                }
                 scenario.onActivity { activity ->
                     val input = tagged<EditText>(activity, "flow_steps")
                     input.requestFocus()
@@ -394,17 +385,28 @@ class CollectionFlowInstrumentedTest {
             awaitHeading(scenario, "步数采集")
             val discardedId = reachFinish(scenario, handle, SessionActivity.RUNNING)
             val stopped = session(handle)
+            type(scenario, "flow_steps", "29")
+            scenario.onActivity { activity ->
+                assertEquals("无法提供本次步数时，可放弃本段。",
+                    tagged<TextView>(activity, "no_reference_hint").text.toString())
+                assertNull(taggedOrNull<View>(activity, "reference_options"))
+                assertNull(taggedOrNull<View>(activity, "flow_reason"))
+            }
             click(scenario, "finish_discard")
             captureReviewScreen(scenario, "discard_confirmation")
             scenario.onActivity {
                 val confirmation = startAttemptDialog(it)
-                assertEquals("继续保存", confirmation.getButton(AlertDialog.BUTTON_NEGATIVE).text.toString())
-                assertEquals("放弃本段", confirmation.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
+                assertEquals("删除本段记录，不会上传。此操作无法撤销。",
+                    confirmation.findViewById<TextView>(android.R.id.message).text.toString())
+                assertEquals("返回", confirmation.getButton(AlertDialog.BUTTON_NEGATIVE).text.toString())
+                assertEquals("确认放弃", confirmation.getButton(AlertDialog.BUTTON_POSITIVE).text.toString())
                 confirmation.getButton(AlertDialog.BUTTON_NEGATIVE).performClick()
             }
             awaitHeading(scenario, "结束本段")
             assertEquals(stopped, session(handle))
             assertNull(session(handle).reference)
+            scenario.onActivity { assertEquals("29", tagged<EditText>(it, "flow_steps").text.toString()) }
+            type(scenario, "flow_steps", "")
             click(scenario, "finish_discard")
             scenario.onActivity {
                 val confirm = startAttemptDialog(it).getButton(AlertDialog.BUTTON_POSITIVE)
@@ -424,6 +426,7 @@ class CollectionFlowInstrumentedTest {
             assertEquals(listOf(previous.sessionId), handle.flow.state.records.map { it.sessionId })
             scenario.recreate()
             awaitHeading(scenario, "步数采集")
+            assertTrue(handle.flow.state.records.none { it.sessionId == discardedId })
             assertNull(handle.flow.state.selectedActivity)
             scenario.onActivity { assertNull(taggedOrNull<Button>(it, "flow_primary")) }
             captureReviewScreen(scenario, "discarded_home")
@@ -1110,35 +1113,40 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
-    @Test fun missingAndUnreliableSelectionsPersistTheirDistinctMeaningAndReasons() {
-        listOf("missing", "unreliable").forEach { kind -> withFlow { handle ->
-            launch().use { scenario ->
-                register(scenario)
-                reachReference(scenario, handle)
-                chooseReferenceKind(scenario, kind)
-                if (kind == "unreliable") type(scenario, "flow_steps", "562")
-                type(scenario, "flow_reason", if (kind == "missing") "计步器意外清零" else "忘记清零")
-                captureReviewScreen(scenario, "reference_$kind")
-                click(scenario, "flow_primary")
-                awaitHeading(scenario, "这一段已保存")
-                val saved = session(handle)
-                val reference = requireNotNull(saved.reference)
-                val payload = JsonParser.parseString(File(handle.directory, "session.json").readText())
-                    .asJsonObject.getAsJsonObject("session")
-                assertNotNull(reference.reason)
-                assertTrue(payload.get("reference_saved_at_ms").asLong > 0)
-                if (kind == "missing") {
-                    assertEquals(ReferenceStatus.MISSING, reference.status)
-                    assertNull(reference.steps)
-                    assertNull(reference.groundTruthRecordedAtMs)
-                    assertTrue(payload.get("ground_truth_recorded_at_ms").isJsonNull)
-                } else {
-                    assertEquals(ReferenceStatus.UNRELIABLE, reference.status)
-                    assertEquals(562L, reference.steps)
-                    assertNotNull(reference.groundTruthRecordedAtMs)
+    @Test fun historicalMissingAndUnreliableReferencesRenderAndRetryWithoutBeingRewritten() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val store = FreeLivingSessionStore(File(handle.directory, "session.json"))
+            val seeded = listOf(
+                Triple(ReferenceStatus.MISSING, null, "计步器意外清零"),
+                Triple(ReferenceStatus.UNRELIABLE, 562L, "忘记清零"),
+            ).map { (status, steps, reason) ->
+                val id = reachFinish(scenario, handle, SessionActivity.WALKING)
+                handle.flow.finalizeSession(false, steps?.toString().orEmpty(), status.wireValue, reason)
+                awaitFlow(handle, "historical ${status.wireValue} reference is locally complete") { state ->
+                    state.records.singleOrNull { it.sessionId == id }?.localComplete == true
                 }
+                awaitHeading(scenario, "这一段已保存")
+                val saved = requireNotNull(store.read(id))
+                assertEquals(status, saved.reference?.status)
+                assertEquals(steps, saved.reference?.steps)
+                assertEquals(reason, saved.reference?.reason)
+                id to requireNotNull(saved.reference)
             }
-        } }
+
+            openRecords(scenario)
+            scenario.onActivity { activity ->
+                assertEquals("未提供读数", tagged<TextView>(activity, "record_steps_${seeded[0].first}").text.toString())
+                assertEquals("562 步", tagged<TextView>(activity, "record_steps_${seeded[1].first}").text.toString())
+            }
+            for ((id, reference) in seeded) {
+                click(scenario, "retry_upload_$id")
+                awaitFlow(handle, "historical reference upload retry completes") { state ->
+                    state.records.singleOrNull { it.sessionId == id }?.transferStatus == "complete"
+                }
+                assertEquals(reference, store.read(id)?.reference)
+            }
+        }
     }
 
     @Test fun bothEmptySaveActionsExplainTheMissingInputAndZeroStillSaves() {
@@ -1205,63 +1213,47 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
-    @Test fun missingReferencePromptsForItsReasonAndCanSaveWithoutSteps() = withFlow { handle ->
+    @Test fun referenceCorrectionIsNumericAndPreservesOnlyHistoricalUnreliableMeaning() = withFlow { handle ->
         launch().use { scenario ->
-            register(scenario); reachReference(scenario, handle)
-            chooseReferenceKind(scenario, "missing")
-            val before = session(handle)
-            click(scenario, "finish_defer")
-            await(scenario, "missing reference focuses required reason") {
-                tagged<TextView>(it, "finish_input_error").text.toString() == "请填写读数异常的原因" &&
-                    tagged<EditText>(it, "flow_reason").hasFocus()
-            }
-            assertEquals(before, session(handle))
-            type(scenario, "flow_reason", "计步器意外归零")
-            click(scenario, "finish_defer")
-            awaitHeading(scenario, "这一段已保存")
-            assertEquals(ReferenceStatus.MISSING, session(handle).reference!!.status)
-            assertNull(session(handle).reference!!.steps)
-            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
-        }
-    }
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val cases = listOf(
+                FlowRecordSummary("edit-valid", 12, "valid", "pending", true,
+                    referenceEditable = true),
+                FlowRecordSummary("edit-missing", null, "missing", "pending", true,
+                    referenceEditable = true, referenceReason = "计步器意外清零"),
+                FlowRecordSummary("edit-unreliable", 18, "unreliable", "pending", true,
+                    referenceEditable = true, referenceReason = "忘记清零"),
+            )
+            val fixture = RenderingFlow(CollectionFlowState(isSimulation = false, hasProfile = true,
+                participantId = preparation.participantId, placement = preparation.placement,
+                connected = true, canStart = true, records = cases))
+            renderFixture(scenario, fixture)
+            openRecords(scenario)
 
-    @Test fun unreliableReferenceExplainsEachRequiredFieldNextToItsInput() = withFlow { handle ->
-        launch().use { scenario ->
-            register(scenario); reachReference(scenario, handle)
-            chooseReferenceKind(scenario, "unreliable")
-            val before = session(handle)
-            for ((fieldTag, message) in listOf(
-                "flow_steps" to "请先填写计步器总步数",
-                "flow_reason" to "请填写读数异常的原因",
-            )) {
-                click(scenario, "finish_defer")
-                await(scenario, "the required input and its own explanation are visible") { activity ->
-                    val field = tagged<EditText>(activity, fieldTag)
-                    val error = tagged<TextView>(activity, "finish_input_error")
-                    val visible = android.graphics.Rect()
-                    error.text.toString() == message && field.hasFocus() &&
-                        error.parent === field.parent && error.top == field.bottom &&
-                        field.getGlobalVisibleRect(visible) && visible.height() == field.height &&
-                        error.getGlobalVisibleRect(visible) && visible.height() == error.height &&
-                        activity.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+            for ((index, record) in cases.withIndex()) {
+                click(scenario, "edit_reference_${record.sessionId}")
+                scenario.onActivity { activity ->
+                    val editor = startAttemptDialog(activity)
+                    assertTrue(editor.isShowing)
+                    assertNull(editor.listView)
+                    val input = editor.window!!.decorView.findViewWithTag<EditText>("edit_reference_steps")
+                    assertNotNull(input)
+                    input!!.setText((40 + index).toString())
+                    editor.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
                 }
-                assertEquals(before, session(handle))
-                if (fieldTag == "flow_steps") {
-                    type(scenario, "flow_reason", "先写原因")
-                    scenario.onActivity { activity ->
-                        assertEquals(View.VISIBLE, tagged<TextView>(activity, "finish_input_error").visibility)
-                        assertEquals(message, tagged<TextView>(activity, "finish_input_error").text.toString())
-                    }
-                    type(scenario, "flow_reason", "")
+                val revision = fixture.referenceRevisions.last()
+                assertEquals(record.sessionId, revision.first)
+                assertEquals((40 + index).toString(), revision.second)
+                if (record.referenceStatus == "unreliable") {
+                    assertEquals("unreliable", revision.third.first)
+                    assertEquals("忘记清零", revision.third.second)
+                } else {
+                    assertEquals("valid", revision.third.first)
+                    assertEquals("", revision.third.second)
                 }
-                type(scenario, fieldTag, if (fieldTag == "flow_steps") "0" else "计步器中途松动")
+                renderFixture(scenario, fixture)
             }
-            click(scenario, "finish_defer")
-            awaitHeading(scenario, "这一段已保存")
-            assertEquals(ReferenceStatus.UNRELIABLE, session(handle).reference!!.status)
-            assertEquals(0L, session(handle).reference!!.steps)
-            assertEquals("计步器中途松动", session(handle).reference!!.reason)
-            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
         }
     }
 
@@ -1305,20 +1297,19 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "步数采集")
             val id = reachReference(scenario, handle)
-            chooseReferenceKind(scenario, "unreliable")
             type(scenario, "flow_steps", "83")
-            type(scenario, "flow_reason", "途中摘下计步器")
             scenario.recreate()
             awaitHeading(scenario, "结束本段")
             scenario.onActivity {
                 assertEquals("83", tagged<EditText>(it, "flow_steps").text.toString())
-                assertEquals("途中摘下计步器", tagged<EditText>(it, "flow_reason").text.toString())
+                assertNull(taggedOrNull<View>(it, "flow_reason"))
+                assertNull(taggedOrNull<View>(it, "reference_options"))
             }
             assertEquals(id, session(handle).sessionId)
             assertNull(session(handle).reference)
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
-            assertEquals(ReferenceStatus.UNRELIABLE, session(handle).reference!!.status)
+            assertEquals(ReferenceStatus.VALID, session(handle).reference!!.status)
             assertEquals(83L, session(handle).reference!!.steps)
         }
     }
@@ -1591,8 +1582,13 @@ class CollectionFlowInstrumentedTest {
             awaitHeading(scenario, "记录计步器读数")
             assertEquals("Returning to the form must not query and silently confirm a previously unknown stop",
                 beforeReturn, session(handle))
-            chooseReferenceKind(scenario, "missing")
-            type(scenario, "flow_reason", "计步器意外清零")
+            scenario.onActivity { activity ->
+                assertNotNull(taggedOrNull<EditText>(activity, "flow_steps"))
+                assertEquals("返回结束确认", tagged<Button>(activity, "reference_resume_stop").text.toString())
+                assertNull(taggedOrNull<View>(activity, "reference_options"))
+                assertNull(taggedOrNull<View>(activity, "flow_reason"))
+            }
+            type(scenario, "flow_steps", "0")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "正在结束")
             val saved = session(handle)
@@ -1601,9 +1597,9 @@ class CollectionFlowInstrumentedTest {
             assertNull(saved.stopConfirmedAtMs)
             assertNull(saved.endedAtMs)
             assertNull(saved.localData)
-            assertEquals(ReferenceStatus.MISSING, saved.reference!!.status)
-            assertNull(saved.reference!!.steps)
-            assertEquals("计步器意外清零", saved.reference!!.reason)
+            assertEquals(ReferenceStatus.UNRELIABLE, saved.reference!!.status)
+            assertEquals(0L, saved.reference!!.steps)
+            assertEquals("戒指停止尚未确认时记录的计步器读数", saved.reference!!.reason)
             assertFalse(handle.flow.state.canStart)
             click(scenario, "flow_primary")
             awaitHeading(scenario, "结束本段")
@@ -1619,6 +1615,31 @@ class CollectionFlowInstrumentedTest {
             assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
             assertNotNull(session(handle).localData)
             assertNull(session(handle).transfer.receipt)
+        }
+    }
+
+    @Test fun unconfirmedStopCanReturnWithoutSavingAnEmptyReference() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            startWalking(scenario)
+            awaitHeading(scenario, "正在采集")
+            handle.flow.setFault(FlowTestFault.STOP_TIMEOUT)
+            awaitFlow(handle, "stop timeout armed") { it.fault == FlowTestFault.STOP_TIMEOUT }
+            click(scenario, "flow_primary")
+            awaitFlow(handle, "stop remains unconfirmed") { it.page == CollectionPage.RECOVERY }
+            click(scenario, "preserve_reference")
+            awaitHeading(scenario, "记录计步器读数")
+            scenario.onActivity { activity ->
+                assertEquals("", tagged<EditText>(activity, "flow_steps").text.toString())
+                assertEquals("返回结束确认", tagged<Button>(activity, "reference_resume_stop").text.toString())
+            }
+            click(scenario, "reference_resume_stop")
+            awaitHeading(scenario, "结束本段")
+            assertNull(session(handle).reference)
+            assertNotNull(session(handle).stopConfirmedAtMs)
+            assertEquals(FreeLivingSessionPhase.AWAITING_REFERENCE, session(handle).phase)
+            assertNull(session(handle).completionPolicy)
+            assertNull(session(handle).localData)
         }
     }
 
@@ -1661,6 +1682,7 @@ class CollectionFlowInstrumentedTest {
         var protectiveStops = 0
         val uploadRetries = mutableListOf<String>()
         val endedStartAttempts = mutableListOf<String>()
+        val referenceRevisions = mutableListOf<Triple<String, String, Pair<String, String>>>()
         var savedReference: Triple<String, String, String>? = null
         var finalizedReference: Pair<Boolean, Triple<String, String, String>>? = null
         var finishEntries = 0
@@ -1686,6 +1708,16 @@ class CollectionFlowInstrumentedTest {
         override fun retry() { retries++ }
         override fun endStartAttempt(reason: String) { endedStartAttempts += reason }
         override fun retryUpload(sessionId: String) { uploadRetries += sessionId }
+        override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) {
+            referenceRevisions += Triple(sessionId, stepsText, status to reason)
+            state = state.copy(records = state.records.map { record ->
+                if (record.sessionId != sessionId) record else record.copy(
+                    steps = stepsText.toLong(),
+                    referenceStatus = status,
+                    referenceReason = reason.ifBlank { null },
+                )
+            })
+        }
         override fun home() = error("Unexpected navigation")
         override fun setFault(fault: FlowTestFault) = error("Unexpected development option")
         override fun disconnect() = error("Unexpected disconnect")
@@ -1803,21 +1835,6 @@ class CollectionFlowInstrumentedTest {
                 it.fd.sync()
             }
         } finally { screenshot.recycle() }
-    }
-
-    private fun chooseReferenceKind(scenario: ActivityScenario<DemoCollectionActivity>, kind: String) {
-        click(scenario, "reference_options")
-        captureReviewScreen(scenario, "reference_options")
-        scenario.onActivity { activity ->
-            val dialog = StepCollectionActivity::class.java.getDeclaredField("dialog").apply { isAccessible = true }
-                .get(activity) as AlertDialog
-            assertTrue(dialog.isShowing)
-            val expected = when (kind) { "missing" -> "无法提供读数"; "unreliable" -> "数字可能不准确"; else -> "读数正常" }
-            val list = dialog.listView
-            val index = (0 until list.adapter.count).single { list.adapter.getItem(it).toString() == expected }
-            assertTrue(list.performItemClick(list.adapter.getView(index, null, list), index, list.adapter.getItemId(index)))
-        }
-        await(scenario, "reference type selected") { taggedOrNull<EditText>(it, "flow_reason") != null }
     }
 
     private fun session(handle: DemoFlowRuntime.TestHandle): FreeLivingSession =
