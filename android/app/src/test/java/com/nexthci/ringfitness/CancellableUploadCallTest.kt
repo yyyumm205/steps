@@ -26,9 +26,11 @@ import java.util.concurrent.atomic.AtomicLong
 class CancellableUploadCallTest {
     @Test fun cancelledBeforeRequestDoesNotConnect() {
         Peer { _, stop -> stop.await() }.use { peer ->
+            val dispatched = AtomicBoolean(false)
             assertThrows(InterruptedException::class.java) {
-                CancellableUploadCall().execute(peer.request(), 5_000, { true }) { it.code() }
+                CancellableUploadCall().execute(peer.request(), 5_000, { true }, { dispatched.set(true) }) { it.code() }
             }
+            assertFalse(dispatched.get())
             assertEquals(0, peer.connections.get())
         }
     }

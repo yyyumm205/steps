@@ -16,6 +16,8 @@ fun interface CollectionScheduler { fun schedule(delayMs: Long, action: () -> Un
 
 /** Upload execution has an independent owner and never controls the collection connection. */
 interface RealUploadPort {
+    /** True only when this build has a syntactically valid destination ready for new tasks. */
+    val available: Boolean get() = true
     fun enqueue(sessionId: String, retry: Boolean = false)
     fun isInFlight(sessionId: String): Boolean
     fun needsLocalReview(sessionId: String): Boolean = false
@@ -46,6 +48,9 @@ class RealCollectionController(
     },
 ) : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
+    private val uploadAvailable: Boolean get() = uploads?.available == true
+    /** Current local profile. Session journals intentionally omit its display label. */
+    private var localProfile: PreparationSnapshot? = null
     private var profile: PreparationSnapshot? = null
     private var connected = false
     private var connecting = false
@@ -58,6 +63,12 @@ class RealCollectionController(
     private var operation = 0L
     private var lastIdle: HealthRecordObservation? = null
     private var downloader: RealSessionDownload? = null
+    private data class FinalizingDownload(
+        val download: RealSessionDownload,
+        val completed: RealSessionDownload.Completed,
+        val record: HealthMessage.ListItem,
+    )
+    private var finalizingDownload: FinalizingDownload? = null
     private var backupDownloader: RealSessionDownload? = null
     private var backupObservation: HealthRecordObservation? = null
     private var backupRecord: HealthMessage.ListItem? = null
@@ -95,7 +106,7 @@ class RealCollectionController(
         var batteryRequestedAtMs: Long? = null, var observation: HealthRecordObservation? = null,
         val startedAtElapsedMs: Long)
 
-    @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploads != null,
+    @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploadAvailable,
         connected = false, connecting = true, busy = true, hasProfile = true)
         private set
 
@@ -140,11 +151,11 @@ class RealCollectionController(
                 else publish(CollectionPage.RECOVERY, "步数已保存，正在核对戒指数据")
             }
             CaptureControlPhase.NEEDS_REVIEW -> publish(CollectionPage.RECOVERY, when (control.issue) {
-                CaptureControlIssue.EXISTING_RECORDS -> "戒指中有待处理记录，请联系研究者"
+                CaptureControlIssue.EXISTING_RECORDS -> "戒指记录已变化，请重新检查"
                 CaptureControlIssue.RECORD_CHANGED, CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN,
                 CaptureControlIssue.RECOVERY_REQUIRES_REVIEW -> "本次记录需要核对，请保留戒指数据"
                 CaptureControlIssue.CONNECTION_LOST, CaptureControlIssue.NOT_CONNECTED -> "连接中断，请将戒指放在手机附近"
-                CaptureControlIssue.START_ARCHIVE_BLOCKED -> "本次记录仍需核对，请联系研究者"
+                CaptureControlIssue.START_ARCHIVE_BLOCKED -> "请先完成本次记录的数据保全"
                 CaptureControlIssue.DEVICE_ERROR -> "戒指返回异常，请重新连接后再试"
                 else -> "暂未收到确认，请重新检查戒指"
             })
@@ -168,7 +179,12 @@ class RealCollectionController(
         store.listSessions().filter { it.isDiscarded }.forEach {
             runCatching { store.cleanupDiscardedSession(it.sessionId) }.onFailure { error -> reportError(error as? Exception ?: Exception(error)) }
         }
-        profile = store.readPending()?.preparation ?: requireNotNull(preparation.read()) { "请先完成准备信息" }
+        store.listSessions().filter { !it.isDiscarded && isRealLocal(it) }.forEach { session ->
+            runCatching { RealSessionDownload.cleanupCommittedTemporary(directory, session) }
+                .onFailure { error -> reportError(error as? Exception ?: Exception(error)) }
+        }
+        localProfile = requireNotNull(preparation.read()) { "请先完成准备信息" }
+        profile = store.readPending()?.preparation ?: localProfile
         require(profile?.ring != null && profile?.placement != null) { "请先选择戒指与佩戴位置" }
         coordinator.restore()
         val current = store.read()
@@ -299,16 +315,17 @@ class RealCollectionController(
             when (val message = packet.message) {
                 is HealthMessage.DataChunk -> { download.append(message); scheduleDownloadTimeout() }
                 is HealthMessage.ReadEnd -> {
+                    if (download.isDelayedCompletedPrefix(message)) {
+                        scheduleDownloadTimeout()
+                        return@safely
+                    }
                     if (download.checkpoint(message)) {
-                        val current = requireNotNull(store.readPending())
                         val completed = download.finish(message)
-                        store.completeLocalData(current.sessionId, listOf(completed.file), clock.nowEpochMs())
                         downloader = null; downloadTimeout++
-                        runCatching { download.close() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
-                        runCatching { download.releaseTemporary() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
-                        coordinator.refresh()
-                        enqueueSavedRecords()
-                        publish(CollectionPage.COMPLETE)
+                        download.close()
+                        finalizingDownload = FinalizingDownload(download, completed,
+                            requireNotNull(store.readPending()?.deviceRecordEvidence).record)
+                        inspect()
                     } else requestWindow(download)
                 }
                 else -> Unit
@@ -412,7 +429,8 @@ class RealCollectionController(
                         check(port.queryBattery()) { "未能读取充电状态，请重新连接" }
                     } else finishReadinessInspection(round, observation)
                 } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null && current.completionPolicy != null) {
-                    beginDownload(current, observation)
+                    finalizingDownload?.let { reconcileCompletedDownload(current, observation, it) }
+                        ?: beginDownload(current, observation)
                 }
             }
             else -> Unit
@@ -480,16 +498,23 @@ class RealCollectionController(
     }
 
     private fun beginCapture() {
-        val before = lastIdle
+        val before = requireNotNull(lastIdle) { "请重新检查戒指后开始" }
+        require(isUsableStartBaseline(before)) { "戒指记录尚未完整返回，请重新检查" }
         val unknown = unknownPreservation?.takeIf { it.generation == generation }
-        val unknownEvidence = if (before?.records?.any { it.unixMs == 0L } == true) {
-            require(unknown != null && hasPreserved(before.address, before.records)) { "正在核对已有数据，请稍后重试" }
+        val reviewed = authorizedExisting()?.takeIf {
+            it.ringAddress.equals(before.address, ignoreCase = true) && it.status == before.status &&
+                it.records.size == before.records.size && it.records.toSet() == before.records.toSet()
+        }
+        val unknownEvidence = if (unknown != null && unknown.record in before.records &&
+            hasPreserved(before.address, listOf(unknown.record))) {
             val timing = requireNotNull(startingClockEvidence) { "请重新检查戒指时间后开始" }
             UnknownTimeStartEvidence(unknown.record, unknown.backupId, unknown.rawSha256,
                 preservationOwnerId, generation, unknown.savedAtMs, timing)
-        } else null
-        val allowed = if (unknownEvidence != null) ExistingRecordAuthorization(requireNotNull(before).address,
-            before.status, before.records, generation, unknownEvidence) else authorizedExisting()
+        } else reviewed?.unknownTimeStartEvidence
+        // The exact idle snapshot authorizes this one connection. Existing Flash records are a
+        // baseline for identifying the new record; their presence is not a reason to lock the ring.
+        val allowed = ExistingRecordAuthorization(before.address, before.status, before.records,
+            generation, unknownEvidence)
         browsingHome = false; lastIdle = null
         coordinator.refresh()
         coordinator.requestStart(requireNotNull(profile), allowed, requireNotNull(requestedActivity))
@@ -541,11 +566,33 @@ class RealCollectionController(
     override fun chooseFinish(uploadNow: Boolean) = safely(CollectionPage.FINISH) {
         if (saving || downloader != null || query != null) return@safely
         val current = requireNotNull(store.readPending())
-        store.setCompletionPolicy(current.sessionId, if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
+        store.setCompletionPolicy(current.sessionId,
+            if (uploadNow && uploadAvailable) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER)
         browsingHome = false
         if (current.reference == null) publish(CollectionPage.REFERENCE)
         else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
     }
+
+    override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) =
+        safely(CollectionPage.FINISH) {
+            if (saving || downloader != null || query != null) return@safely
+            browsingHome = false
+            val current = requireNotNull(store.readPending())
+            val policy = current.completionPolicy ?: if (uploadNow && uploadAvailable) {
+                CompletionPolicy.SAVE_UPLOAD
+            } else CompletionPolicy.SAVE_LATER
+            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+            saving = true
+            val saved = try {
+                publish(CollectionPage.SAVING)
+                store.finalizeStoppedSession(current.sessionId, policy, reference).also {
+                    val persisted = requireNotNull(store.read(current.sessionId))
+                    check(persisted.completionPolicy == it.completionPolicy && persisted.reference == it.reference)
+                }
+            } finally { saving = false }
+            if (connected) inspect()
+            else publish(CollectionPage.RECOVERY, "记录已保存，请重新连接以下载数据")
+        }
 
     override fun discardSession() = safely(CollectionPage.FINISH) {
         if (saving) return@safely
@@ -577,17 +624,7 @@ class RealCollectionController(
         val current = requireNotNull(store.readPending())
         if (current.reference != null) { retry(); return@safely }
         require(current.stopConfirmedAtMs == null || current.completionPolicy != null) { "请选择保存方式" }
-        val kind = ReferenceStatus.entries.singleOrNull { it.wireValue == status }
-            ?: throw IllegalArgumentException("请选择读数状态")
-        val steps = when {
-            kind == ReferenceStatus.MISSING -> null
-            stepsText.trim().matches(Regex("[0-9]+")) -> stepsText.trim().toLongOrNull()
-                ?: throw IllegalArgumentException("步数太大，请核对读数")
-            kind == ReferenceStatus.UNRELIABLE && stepsText.isBlank() -> null
-            else -> throw IllegalArgumentException("请输入计步器上的整数")
-        }
-        require(kind == ReferenceStatus.VALID || reason.isNotBlank()) { "请填写简短原因" }
-        val reference = SessionReference(kind, steps, clock.nowEpochMs(), if (kind == ReferenceStatus.VALID) null else reason.trim())
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
         saving = true
         val saved = try {
             publish(CollectionPage.SAVING)
@@ -640,10 +677,11 @@ class RealCollectionController(
 
     override fun retryUpload(sessionId: String) {
         if (closed) return
-        val upload = uploads ?: return
+        val upload = uploads?.takeIf { it.available } ?: return
         runCatching {
             val session = store.read(sessionId) ?: return@runCatching
-            if (!session.isDiscarded && isRealLocal(session) && session.transfer.status != SessionTransferStatus.COMPLETE &&
+            if (session.preparation.participantId == localProfile?.participantId &&
+                !session.isDiscarded && isRealLocal(session) && session.transfer.status != SessionTransferStatus.COMPLETE &&
                 !upload.isInFlight(sessionId)) {
                 store.allowUpload(sessionId)
                 upload.enqueue(sessionId, retry = true)
@@ -652,17 +690,30 @@ class RealCollectionController(
         refreshUploads()
     }
 
+    override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) = safely {
+        val session = requireNotNull(store.read(sessionId)) { "没有找到这条记录" }
+        require(session.preparation.participantId == localProfile?.participantId && isRealLocal(session)) {
+            "这条记录不属于当前身份"
+        }
+        require(session.completionPolicy in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.SAVE_UPLOAD) &&
+            session.transfer.status == SessionTransferStatus.PENDING && session.transfer.attempts == 0 &&
+            uploads?.isInFlight(sessionId) != true) { "本段已确认上传，原读数保持不变" }
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+        FreeLivingSessionPackage(directory, store).reviseUnpublishedReference(sessionId, reference)
+        publish(CollectionPage.HOME)
+    }
+
     /** Refresh transfer evidence without changing navigation, BLE queries or capture actions. */
     fun refreshUploads() {
         if (closed || !initialized) return
         runCatching {
-            state = state.copy(session = store.read()?.takeUnless { it.startAttemptArchive != null || it.isDiscarded || it.startAbort?.completedAtMs != null }, records = recordSummaries())
+            state = state.copy(session = visibleCurrentSession(), records = recordSummaries())
             observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
         }.onFailure { reportError(it as? Exception ?: Exception(it)) }
     }
 
     private fun enqueueSavedRecords() {
-        val upload = uploads ?: return
+        val upload = uploads?.takeIf { it.available } ?: return
         runCatching {
             store.listSessions().filter { it.uploadAllowed && isRealLocal(it) && it.transfer.status in
                 setOf(SessionTransferStatus.PENDING, SessionTransferStatus.TRANSFERRING) }.forEach { session ->
@@ -677,11 +728,26 @@ class RealCollectionController(
         files.isNotEmpty() && files.all { !it.simulated }
     } == true
 
-    private fun recordSummaries() = store.listSessions().filter { !it.isDiscarded && it.startAttemptArchive == null && it.startAbort == null && (it.localData == null || isRealLocal(it)) }
+    /** A pending capture remains recoverable; completed history belongs to the selected identity. */
+    private fun visibleCurrentSession() = store.read()?.takeUnless {
+        it.startAttemptArchive != null || it.isDiscarded || it.startAbort?.completedAtMs != null
+    }?.takeIf { it.isPending || it.preparation.participantId == localProfile?.participantId }
+
+    private fun recordSummaries() = store.listSessions().filter {
+        it.preparation.participantId == localProfile?.participantId && !it.isDiscarded &&
+            it.startAttemptArchive == null && it.startAbort == null && (it.localData == null || isRealLocal(it))
+    }
         .map { FlowRecordSummary(it.sessionId, it.reference?.steps, it.reference?.status?.wireValue,
             it.transfer.status.wireValue, isRealLocal(it), uploads?.isInFlight(it.sessionId) == true,
             uploads?.needsLocalReview(it.sessionId) == true, activity = it.activity,
-            uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER) }
+            uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER,
+            startedAtMs = it.startedAtMs,
+            timeZoneId = it.timeZoneId,
+            referenceEditable = isRealLocal(it) && it.reference != null &&
+                it.completionPolicy in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.SAVE_UPLOAD) &&
+                it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
+                uploads?.isInFlight(it.sessionId) != true,
+            referenceReason = it.reference?.reason) }
 
     override fun home() = safely {
         browsingHome = !devicePreparationRequired
@@ -741,30 +807,26 @@ class RealCollectionController(
             observed.records.size == baseline.records.size && observed.records.toSet() == baseline.records.toSet())
         if (observed.status.collecting || !unchanged) {
             timeRound = null
-            publish(CollectionPage.RECOVERY, "戒指记录需要核对，请联系研究者")
+            publish(CollectionPage.RECOVERY, "戒指状态发生变化，请重新连接后检查")
             return
         }
         if (observed.status.errorCode == 0 || chargingRecovery != null) {
-            if (observed.records.any { store.hasUnresolvedDiscardedRecord(observed.address, it) }) {
-                devicePreparationRequired = true; browsingHome = false
-                publish(CollectionPage.RECOVERY, "已放弃的记录缺少设备时间，请返回设备页更换戒指")
+            if (!isUsableStartBaseline(observed)) {
+                timeRound = null
+                publish(CollectionPage.RECOVERY, "戒指记录尚未完整返回，请重新检查")
                 return
             }
-            if (observed.records.isNotEmpty() && !hasPreserved(observed.address, observed.records)) {
+            val hasUnresolvedDiscard = observed.records.any {
+                store.hasUnresolvedDiscardedRecord(observed.address, it)
+            }
+            val canBackUpBeforeStart = !hasUnresolvedDiscard &&
+                observed.records.count { it.unixMs == 0L } <= 1 &&
+                observed.records.all { it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 }
+            if (canBackUpBeforeStart && observed.records.isNotEmpty() &&
+                !hasPreserved(observed.address, observed.records)) {
                 val approved = authorizedExisting()
                 if (approved?.ringAddress != observed.address || approved.status != observed.status ||
                     approved.records.toSet() != observed.records.toSet()) {
-                    if (observed.records.count { it.unixMs == 0L } > 1) {
-                        devicePreparationRequired = true; browsingHome = false
-                        publish(CollectionPage.RECOVERY, "有多条时间未确定的记录，请保留戒指并联系研究者导出后再开始")
-                        return
-                    }
-                    if (!observed.records.all { it.unixMs >= 0 && it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 } ||
-                        observed.records.none { it.sessionId == observed.status.sessionId && it.bytes == observed.status.bytes && it.records == observed.status.records }) {
-                        devicePreparationRequired = true; browsingHome = false
-                        publish(CollectionPage.RECOVERY, "戒指记录信息不完整，请返回设备页更换戒指")
-                        return
-                    }
                     backupObservation = observed
                     continueExistingBackup(observed)
                     return
@@ -786,7 +848,7 @@ class RealCollectionController(
         }
         if (round.attempt >= READINESS_CHECK_LIMIT) {
             timeRound = null
-            publish(CollectionPage.RECOVERY, "戒指仍返回异常，请联系研究者")
+            publish(CollectionPage.RECOVERY, "请将戒指完全取出充电盒，靠近手机后重试")
             return
         }
         // A bounded read-only follow-up can observe an error clearing; it cannot explain its semantics.
@@ -801,6 +863,17 @@ class RealCollectionController(
                 inspect(round.attempt + 1, baseline ?: observed)
             }
         }
+    }
+
+    /** Mirrors the durable baseline contract before the UI can promise that START is available. */
+    private fun isUsableStartBaseline(observed: HealthRecordObservation): Boolean {
+        if (observed.status.collecting || observed.records.size > 255 ||
+            observed.records.map { it.sessionId }.distinct().size != observed.records.size ||
+            observed.records.any { it.sessionId !in 1..65535 || it.bytes !in 0..0xFFFF_FFFFL ||
+                it.records !in 0..0xFFFF_FFFFL || it.uptimeMs !in 0..0xFFFF_FFFFL || it.unixMs < 0 }) return false
+        if (observed.records.isEmpty()) return observed.status.bytes == 0L && observed.status.records == 0L
+        return observed.records.any { it.sessionId == observed.status.sessionId &&
+            it.bytes == observed.status.bytes && it.records == observed.status.records }
     }
 
     private fun continueExistingBackup(observed: HealthRecordObservation, onlyRecord: HealthMessage.ListItem? = null) {
@@ -843,16 +916,14 @@ class RealCollectionController(
             observed.records.toSet() == before.records.toSet() && observed.records.size == before.records.size) {
             "记录已有变化，请保留戒指数据并重新检查"
         }
-        require(observed.records.count { it.unixMs == 0L } == 1 &&
-            observed.records.all { it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 }) {
-            "有多条时间未确定的记录，请保留戒指并联系研究者导出后再开始"
-        }
-        if (!hasPreserved(observed.address, observed.records)) {
+        val canAttachUnknownProof = observed.records.count { it.unixMs == 0L } == 1 &&
+            observed.records.all { it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 }
+        if (canAttachUnknownProof && !hasPreserved(observed.address, observed.records)) {
             if (backupObservation == null) backupObservation = observed
             continueExistingBackup(observed)
             return
         }
-        val proof = requireNotNull(unknownPreservation).let {
+        val proof = unknownPreservation?.takeIf { canAttachUnknownProof }?.let {
             UnknownTimeRecordProof(it.record, it.backupId, it.rawSha256, preservationOwnerId, generation, it.savedAtMs)
         }
         store.archiveStartAttempt(current.sessionId, observed, clock.nowEpochMs(), requireNotNull(unknownArchiveReason), proof)
@@ -883,7 +954,7 @@ class RealCollectionController(
         abortStopPollCount = 0
         abortHighWater = observed
         require(port.stop()) { "停止请求未发送，请保留戒指并重新检查" }
-        scheduleAbortStopCheck(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS)
+        scheduleAbortStopCheck(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
     }
 
     /** Keep every observed counter across incomplete or rejected STOP query rounds. */
@@ -930,7 +1001,7 @@ class RealCollectionController(
         if (stopped == null) {
             require(abort.ownerId == preservationOwnerId &&
                 observed.connectionGeneration == abort.collectingObservation.connectionGeneration) {
-                "停止尚未确认，请保留戒指并联系研究者检查设备状态"
+                "停止尚未确认，请将戒指靠近手机后继续恢复"
             }
             val previous = abortHighWater ?: abort.collectingObservation
             val before = abort.collectingObservation.records.single { it.sessionId == previous.status.sessionId }
@@ -948,7 +1019,7 @@ class RealCollectionController(
             abortHighWater = observed
             abortStopPollCount++
             if (observed.status.collecting) {
-                if (abortStopPollCount < FreeLivingCaptureCoordinator.STOP_POLL_LIMIT)
+                if (abortStopPollCount < FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT)
                     scheduleAbortStopCheck(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
                 else publish(CollectionPage.RECOVERY, "暂未确认停止，请保留戒指并重新检查")
                 return
@@ -998,26 +1069,92 @@ class RealCollectionController(
         val expected = requireNotNull(current.deviceRecordEvidence) { "本次戒指记录需要核对" }.record
         require(!current.deviceAssociationInvalidated && observed.address == current.preparation.ring?.address)
         require(expected.unixMs > 0L || stopEvidenceGeneration == generation) {
-            "戒指时间信息不足，请联系研究者核对本次记录"
+            "戒指时间信息不足，请重新连接后继续保存"
         }
         require(!observed.status.collecting && observed.status.errorCode == 0 && observed.status.sessionId == expected.sessionId)
         val actual = observed.records.singleOrNull { it.sessionId == expected.sessionId }
-        require(actual == expected && observed.status.bytes == expected.bytes && observed.status.records == expected.records) {
+        require(actual != null && FreeLivingSessionStore.sameDeviceRecord(expected, actual) &&
+            actual.bytes >= expected.bytes && actual.records >= expected.records &&
+            observed.status.bytes == actual.bytes && observed.status.records == actual.records) {
             "戒指记录发生变化，已保留本次信息"
         }
-        require(observed.records.all { it == expected || it in current.startBaseline?.records.orEmpty() }) {
-            "戒指中出现其他记录，请联系研究者核对"
+        require(otherRecordsAreStable(current, observed, actual)) {
+            "戒指记录发生变化，请重新连接后继续保存"
         }
         if (unknownReadGeneration == generation) {
             require(expected.unixMs > 0) { "本次时间尚未确认，请保留戒指数据并重新检查" }
             connect() // Separate untagged DATA from the previously preserved old original.
             return
         }
-        val next = downloadFactory(directory, current, expected)
+        if (actual != expected) store.updateDeviceEvidence(current.sessionId,
+            DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
+        val next = downloadFactory(directory, current, actual)
         lastIdle = observed
+        if (next.nextOffset == actual.bytes) {
+            val completed = next.finish(HealthMessage.ReadEnd(actual.bytes, true))
+            finalizingDownload = FinalizingDownload(next, completed, actual)
+            reconcileCompletedDownload(current, observed, requireNotNull(finalizingDownload))
+            return
+        }
         downloader = next
         publish(CollectionPage.DOWNLOADING)
         requestWindow(next)
+    }
+
+    private fun reconcileCompletedDownload(
+        current: FreeLivingSession,
+        observed: HealthRecordObservation,
+        pending: FinalizingDownload,
+    ) {
+        val expected = pending.record
+        require(!observed.status.collecting && observed.status.errorCode == 0 &&
+            observed.status.sessionId == expected.sessionId) {
+            "下载完成后戒指状态尚未稳定，原始文件已保留"
+        }
+        val actual = observed.records.singleOrNull { it.sessionId == expected.sessionId }
+            ?: throw IllegalStateException("下载完成后未找到同一戒指记录，原始文件已保留")
+        require(FreeLivingSessionStore.sameDeviceRecord(expected, actual)) {
+            "下载完成后戒指记录身份发生变化，原始文件已保留"
+        }
+        require(actual.bytes >= expected.bytes && actual.records >= expected.records &&
+            observed.status.bytes == actual.bytes && observed.status.records == actual.records) {
+            "下载完成后戒指计数尚未稳定，原始文件已保留"
+        }
+        require(otherRecordsAreStable(current, observed, actual)) {
+            "下载完成后出现其他记录变化，原始文件已保留"
+        }
+        if (actual != expected) {
+            store.updateDeviceEvidence(current.sessionId,
+                DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
+            pending.download.extendTo(actual)
+            finalizingDownload = null
+            downloader = pending.download
+            lastIdle = observed
+            publish(CollectionPage.DOWNLOADING)
+            requestWindow(pending.download)
+            return
+        }
+        store.completeLocalData(current.sessionId, listOf(pending.completed.file), clock.nowEpochMs())
+        finalizingDownload = null
+        runCatching { pending.download.releaseTemporary() }
+            .onFailure { reportError(it as? Exception ?: Exception(it)) }
+        coordinator.refresh()
+        enqueueSavedRecords()
+        publish(CollectionPage.COMPLETE)
+    }
+
+    private fun otherRecordsAreStable(
+        current: FreeLivingSession,
+        observed: HealthRecordObservation,
+        target: HealthMessage.ListItem,
+    ): Boolean {
+        val baseline = current.startBaseline?.records.orEmpty()
+            .filter { it.sessionId != target.sessionId }.toSet()
+        val currentOthers = observed.records.filter { it.sessionId != target.sessionId }.toSet()
+        // The original firmware may naturally overwrite an older Flash record after START.
+        // Preparation already preserves eligible old records; a missing baseline item is allowed,
+        // while a new or changed unrelated item must never be folded into this session.
+        return currentOthers.all { it in baseline }
     }
 
     private fun requestWindow(download: RealSessionDownload) {
@@ -1041,10 +1178,14 @@ class RealCollectionController(
         downloadTimeout++
         val previous = downloader
         downloader = null
+        val pendingFinalization = finalizingDownload
+        finalizingDownload = null
         val previousBackup = backupDownloader
         backupDownloader = null; backupObservation = null; backupRecord = null
         unknownBackupAttempt = null
-        try { previous?.close() } finally { previousBackup?.close() }
+        try { previous?.close() } finally {
+            try { pendingFinalization?.download?.close() } finally { previousBackup?.close() }
+        }
     }
 
     fun close() {
@@ -1064,7 +1205,7 @@ class RealCollectionController(
     }
 
     /** Called on the serial owner executor before committing a UI-requested release. */
-    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && timeRound == null && downloader == null && backupObservation == null &&
+    fun canReleaseIfIdle(): Boolean = !closed && initialized && !saving && timeRound == null && downloader == null && finalizingDownload == null && backupObservation == null &&
         coordinator.state.timeoutOperationId == null && !coordinator.state.settling && store.readPending() == null
 
     /** Confirmed-stop choices and reference entry are local work, including during BLE recovery. */
@@ -1073,7 +1214,7 @@ class RealCollectionController(
     }?.let { if (it.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE }
 
     private fun publish(page: CollectionPage, error: String? = null) {
-        val current = store.read()?.takeUnless { it.startAttemptArchive != null || it.isDiscarded || it.startAbort?.completedAtMs != null }
+        val current = visibleCurrentSession()
         val pending = current?.takeIf { it.isPending }
         val task = if (page == CollectionPage.RECOVERY) pendingReferencePage() ?: page else page
         if (task != CollectionPage.HOME) { taskPage = task; taskError = error }
@@ -1082,9 +1223,14 @@ class RealCollectionController(
         val idle = lastIdle
         val checkingDevice = pending == null && connected && (query != null || readinessWait != null || timeRound != null)
         val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null
-        state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploads != null,
-            hasProfile = profile?.ring != null, participantId = (pending?.preparation ?: profile)?.participantId.orEmpty(),
-            placement = (pending?.preparation ?: profile)?.placement, session = current,
+        val visibleProfile = pending?.preparation ?: profile
+        val participantLabel = localProfile?.takeIf {
+            it.participantId == visibleProfile?.participantId
+        }?.displayLabel ?: visibleProfile?.participantId.orEmpty()
+        state = CollectionFlowState(page = visible, taskPage = taskPage, isSimulation = false, uploadAvailable = uploadAvailable,
+            hasProfile = profile?.ring != null, participantId = visibleProfile?.participantId.orEmpty(),
+            participantLabel = participantLabel, ringName = visibleProfile?.ring?.name.orEmpty(),
+            placement = visibleProfile?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
             preservingExisting = backupObservation != null,
             busy = saving || (!localReference && (connecting || query != null || readinessWait != null || timeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null)) ||
@@ -1126,7 +1272,7 @@ class RealCollectionController(
                 ?: "暂时无法完成，本次记录已保留"
             try { publish(failurePage, message) } catch (_: Exception) {
                 state = state.copy(page = CollectionPage.ERROR, busy = false, canStart = false, canStop = false,
-                    connecting = false, error = "记录读取失败，请联系研究者", canRetry = false, canEndStartAttempt = false)
+                    connecting = false, error = "记录读取失败，请检查身份与戒指设置", canRetry = false, canEndStartAttempt = false)
                 observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
             }
         }

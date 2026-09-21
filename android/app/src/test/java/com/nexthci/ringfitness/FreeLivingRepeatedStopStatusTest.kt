@@ -19,7 +19,7 @@ class FreeLivingRepeatedStopStatusTest {
     private val stopped = collecting.copy(collecting = false, bytes = 64, records = 4)
     private val higher = stopped.copy(bytes = 128, records = 8)
 
-    @Test fun repeatedGrowthDrainsTheListThenRequiresAnotherCompleteRoundWithinTheLimit() {
+    @Test fun repeatedGrowthUsesTheLatestStoppedStatusAndPollingContinuesBeyondThreeRounds() {
         val f = Fixture()
         f.beginStopQuery()
         val before = f.count("status")
@@ -38,22 +38,21 @@ class FreeLivingRepeatedStopStatusTest {
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
         assertEquals(1, f.count("stop"))
 
-        val bounded = Fixture()
-        bounded.beginStopQuery()
-        val initialQueries = bounded.count("status")
-        repeat(3) { index ->
-            val low = stopped.copy(bytes = 64L + index * 64L, records = 4L + index * 4L)
-            bounded.health(low)
-            bounded.health(low.copy(bytes = low.bytes + 64, records = low.records + 4))
-            bounded.list(low.bytes, low.records)
-            if (index < 2) bounded.nextDelay()
+        val continuing = Fixture()
+        continuing.beginStopQuery()
+        val initialQueries = continuing.count("status")
+        val initialLists = continuing.count("list")
+        repeat(5) { index ->
+            val current = collecting.copy(bytes = 16L + index, records = 1L + index)
+            continuing.health(current)
+            continuing.nextDelay()
         }
-        assertEquals(initialQueries + 2, bounded.count("status"))
-        assertEquals(CaptureControlPhase.NEEDS_REVIEW, bounded.coordinator.state.phase)
-        assertFalse(bounded.coordinator.state.settling)
-        assertEquals(0, bounded.pendingCount())
-        assertEquals(1, bounded.count("stop"))
-        assertNull(bounded.store.readPending()!!.stopConfirmedAtMs)
+        assertEquals(initialQueries + 5, continuing.count("status"))
+        assertEquals(initialLists, continuing.count("list"))
+        assertEquals(CaptureControlPhase.STOPPING, continuing.coordinator.state.phase)
+        assertNull(continuing.coordinator.state.issue)
+        assertEquals(1, continuing.count("stop"))
+        assertNull(continuing.store.readPending()!!.stopConfirmedAtMs)
     }
 
     @Test fun repeatedOwnedStatusHighWaterMarkSurvivesReopeningBeforeListEnd() {
@@ -147,6 +146,10 @@ class FreeLivingRepeatedStopStatusTest {
             if (sameRecord) {
                 assertEquals(higher, f.openStore().readPending()!!.deviceRecordEvidence!!.status)
                 assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+                f.nextDelay()
+                f.health(higher)
+                f.list(128, 8)
+                assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
                 f.nextDelay()
                 f.health(higher)
                 f.list(128, 8)

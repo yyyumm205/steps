@@ -1,5 +1,6 @@
 package com.nexthci.ringfitness
 
+import com.google.gson.JsonParser
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -27,22 +28,29 @@ class RealUploadQueueTest {
         assertEquals(1, f.requests)
     }
 
-    @Test fun reopeningKeepsFailureUntilManualRetryAndRestoresThatRetryAfterAnotherExit() {
+    @Test fun reopeningKeepsAutomaticNetworkRetryAndStopsAfterFiveAttempts() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
         f.failUpload = true
-        f.queue.run(f.id)
-        val failed = f.queue.task(f.id)
-        assertFalse(f.openQueue().restore(link))
-        assertEquals(failed, f.queue.task(f.id))
+        assertTrue(f.queue.run(f.id))
+        val queued = f.queue.task(f.id)
+        assertEquals("sending", queued!!.state)
+        assertTrue(f.openQueue().restore(link))
+        assertEquals(queued, f.queue.task(f.id))
         assertEquals(1, f.requests)
+        repeat(3) { assertTrue(f.openQueue().run(f.id)) }
+        assertFalse(f.openQueue().run(f.id))
+        val failed = f.queue.task(f.id)
+        assertEquals("failed", failed!!.state)
+        assertEquals(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS, f.store.read()!!.transfer.attempts)
+        assertFalse(f.openQueue().restore(link))
         assertTrue(f.queue.enqueue(f.id, link, true))
         // The journal still says failed until a worker starts this already requested retry.
         assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
         assertTrue(f.openQueue().restore(""))
         assertEquals(listOf(f.id), f.queue.queuedIds())
-        assertEquals(failed!!.archiveSha256, f.queue.task(f.id)!!.archiveSha256)
-        assertEquals(1, f.requests)
+        assertEquals(failed.archiveSha256, f.queue.task(f.id)!!.archiveSha256)
+        assertEquals(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS, f.requests)
     }
 
     @Test fun reopeningIsolatesDamagedTaskWhileRecoveringAnotherRecord() {
@@ -96,10 +104,11 @@ class RealUploadQueueTest {
         assertEquals(SessionTransferStatus.PENDING, f.store.read()!!.transfer.status)
     }
 
-    @Test fun failureRequiresManualRetryAndKeepsOriginalDestinationAndPackage() {
+    @Test fun networkFailureRetriesFiveTimesThenManualRetryKeepsOriginalDestinationAndPackage() {
         val f = Fixture()
         assertTrue(f.queue.enqueue(f.id, link, false))
         f.failUpload = true
+        repeat(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS - 1) { assertTrue(f.queue.run(f.id)) }
         assertFalse(f.queue.run(f.id))
         assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
         assertEquals("transport", f.queue.task(f.id)!!.failureStage)
@@ -109,13 +118,13 @@ class RealUploadQueueTest {
         f.failUpload = false
         assertTrue(f.queue.enqueue(f.id, "https://cloud.tsinghua.edu.cn/u/d/another/", true))
         assertFalse(f.queue.run(f.id))
-        assertEquals(listOf(link, link), f.destinations)
+        assertEquals(List(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS + 1) { link }, f.destinations)
         assertEquals(original.archiveSha256, f.queue.task(f.id)!!.archiveSha256)
-        assertEquals(2, f.store.read()!!.transfer.attempts)
+        assertEquals(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS + 1, f.store.read()!!.transfer.attempts)
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
         assertFalse(f.queue.enqueue(f.id, link, true))
         assertFalse(f.queue.run(f.id))
-        assertEquals(2, f.requests)
+        assertEquals(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS + 1, f.requests)
     }
 
     @Test fun cancelledSendingResumesSameBytesAfterQueueReconstruction() {
@@ -130,6 +139,84 @@ class RealUploadQueueTest {
         assertFalse(reopened.run(f.id))
         assertEquals(1, f.uploadedHashes.distinct().size)
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun repeatedCancellationBeforeHttpDoesNotConsumeNetworkAttempts() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+
+        repeat(RealUploadQueue.MAX_AUTOMATIC_ATTEMPTS + 2) {
+            var cancellationChecks = 0
+            assertTrue(f.openQueue().run(f.id) { ++cancellationChecks >= 2 })
+            assertEquals(0, f.requests)
+            assertEquals(0, f.store.read()!!.transfer.attempts)
+            assertEquals(SessionTransferStatus.PENDING, f.store.read()!!.transfer.status)
+            assertEquals("queued", f.queue.task(f.id)!!.state)
+        }
+
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun cancellationInsideTransportBeforeFirstHttpDoesNotConsumeNetworkAttempts() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.checkCancellationBeforeDispatch = true
+        var cancellationChecks = 0
+
+        assertTrue(f.queue.run(f.id) { ++cancellationChecks >= 3 })
+        assertEquals(0, f.requests)
+        assertEquals(0, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.PENDING, f.store.read()!!.transfer.status)
+        assertEquals("queued", f.queue.task(f.id)!!.state)
+
+        f.checkCancellationBeforeDispatch = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun processExitDuringFreezeReleasesUndispatchedClaimOnReopen() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        var exitDuringFreeze = true
+        f.duringFreeze = { if (exitDuringFreeze) throw SimulatedProcessExit() }
+
+        assertThrows(SimulatedProcessExit::class.java) { f.queue.run(f.id) }
+        assertEquals(0, f.requests)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
+        assertEquals("queued", f.queue.task(f.id)!!.state)
+
+        exitDuringFreeze = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun legacyQueuedTaskWithUnknownDispatchKeepsItsConsumedAttempt() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.failUpload = true
+        assertTrue(f.queue.run(f.id))
+        val taskFile = File(f.directory, "upload-tasks/${f.id}.json")
+        val legacy = JsonParser.parseString(taskFile.readText()).asJsonObject
+        legacy.addProperty("version", 1)
+        legacy.addProperty("state", "queued")
+        legacy.remove("dispatchStarted")
+        taskFile.writeText(legacy.toString())
+
+        f.failUpload = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(2, f.requests)
+        assertEquals(2, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+        assertEquals(2, f.queue.task(f.id)!!.version)
+        assertEquals(true, f.queue.task(f.id)!!.dispatchStarted)
     }
 
     @Test fun persistedReceiptRecoversWithoutASecondHttpUpload() {
@@ -257,10 +344,30 @@ class RealUploadQueueTest {
         f.queue.enqueue(f.id, link, true)
         assertTrue(f.queue.needsLocalReview(f.id))
 
-        assertFalse(f.queue.run(f.id))
+        assertTrue(f.queue.run(f.id))
         assertFalse(f.queue.needsLocalReview(f.id))
         assertEquals("transport", f.queue.task(f.id)!!.failureStage)
+        assertEquals("sending", f.queue.task(f.id)!!.state)
         assertEquals(1, f.requests)
+        f.failUpload = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun uploadClaimsTheReferenceBeforeFreezingTheResearchPackage() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.duringFreeze = {
+            assertEquals(1, f.store.read(f.id)!!.transfer.attempts)
+            assertThrows(IllegalArgumentException::class.java) {
+                FreeLivingSessionPackage(f.directory, f.store).reviseUnpublishedReference(f.id,
+                    SessionReference(ReferenceStatus.VALID, 99, f.time + 20))
+            }
+        }
+
+        assertFalse(f.queue.run(f.id))
+        assertEquals(0L, f.store.read(f.id)!!.reference!!.steps)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read(f.id)!!.transfer.status)
     }
 
     @Test fun damagedTaskDoesNotBlockAnotherSavedSessionOrRebindItsDestination() {
@@ -306,8 +413,10 @@ class RealUploadQueueTest {
         var requests = 0
         var failUpload = false
         var interruptUpload = false
+        var checkCancellationBeforeDispatch = false
         var failAfterResponse = false
         var failFreeze = false
+        var duringFreeze: (() -> Unit)? = null
         val destinations = mutableListOf<String>()
         val uploadedHashes = mutableListOf<String>()
         init {
@@ -331,9 +440,12 @@ class RealUploadQueueTest {
         val queue get() = openQueue()
         fun openQueue() = RealUploadQueue(directory, store, freeze = { session ->
             if (failFreeze) throw IOException("Injected package preparation failure")
+            duringFreeze?.invoke()
             val file = archiveFor(session.sessionId)
             FrozenSessionPackage(file, sha(file), file.length(), session.sessionId)
-        }, transport = SessionUploadTransport { destination, file, _ ->
+        }, transport = SessionUploadTransport { destination, file, cancelled, onDispatch ->
+            if (checkCancellationBeforeDispatch && cancelled()) throw InterruptedException()
+            onDispatch()
             requests++; destinations += destination; uploadedHashes += sha(file)
             if (interruptUpload) throw InterruptedException()
             if (failUpload) throw IOException("Injected lost response")
@@ -341,5 +453,6 @@ class RealUploadQueueTest {
             RemoteSessionReceipt(file.name, "a".repeat(40), file.length())
         }, now = { time + 10 }, sync = {})
     }
+    private class SimulatedProcessExit : Error()
     private fun sha(file: File) = MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") { "%02x".format(it.toInt() and 255) }
 }

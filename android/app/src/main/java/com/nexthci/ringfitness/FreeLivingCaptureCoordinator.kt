@@ -2,6 +2,7 @@ package com.nexthci.ringfitness
 
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.UUID
 
 /** Acceptance means queued locally, not acknowledged by the ring. No download commands belong here. */
 interface HealthControlPort {
@@ -78,7 +79,7 @@ class FreeLivingCaptureCoordinator(
     var state = CaptureControlState()
         private set
 
-    private enum class Purpose { PREFLIGHT, START, STOP, INSPECT, ARCHIVE_START }
+    private enum class Purpose { PREFLIGHT, START, RECOVER_START, STOP, INSPECT, ARCHIVE_START }
     private data class Round(
         val id: Long,
         val generation: Long,
@@ -98,6 +99,7 @@ class FreeLivingCaptureCoordinator(
     private data class StopWait(val id: Long, val generation: Long, val sessionId: String)
 
     private val events = ArrayDeque<() -> Unit>()
+    private val commandOwnerId = UUID.randomUUID().toString()
     private var draining = false
     private var restored = false
     private var session: FreeLivingSession? = null
@@ -117,9 +119,12 @@ class FreeLivingCaptureCoordinator(
     private var startPollCount = 0
     private var stopWait: StopWait? = null
     private var stopPollCount = 0
+    private var stopListRetryCount = 0
+    private var firstStoppedObservation: HealthRecordObservation? = null
     private var closed = false
     private var chargingRecoveryDeadline: Long? = null
     private var startCommandIssued = false
+    private var stopCommandIssued = false
     private var unconfirmedStartStopCandidate: HealthRecordObservation? = null
 
     /** Initialization only; repeated calls cannot replace an active untagged response round. */
@@ -174,10 +179,21 @@ class FreeLivingCaptureCoordinator(
         }
         if (current.phase != FreeLivingSessionPhase.COLLECTING ||
             state.phase !in setOf(CaptureControlPhase.COLLECTING, CaptureControlPhase.STORAGE_ERROR)) return@dispatch
-        if (save { store.requestStop(current.sessionId, clock.nowEpochMs()) } == null) return@dispatch
+        val connection = requireNotNull(generation)
+        if (save { store.requestStop(current.sessionId, clock.nowEpochMs(), commandOwnerId, connection) } == null) return@dispatch
         publish(CaptureControlPhase.STOPPING)
-        if (!send(port::stop)) return@dispatch
+        stopCommandIssued = true
+        val accepted = try { port.stop() } catch (_: Exception) { false }
+        if (!accepted) {
+            stopCommandIssued = false
+            if (save { store.cancelStopRequest(current.sessionId) } == null) return@dispatch
+            publish(CaptureControlPhase.COLLECTING, CaptureControlIssue.COMMAND_NOT_ACCEPTED)
+            return@dispatch
+        }
+        if (save { store.confirmStopCommandAccepted(current.sessionId, clock.nowEpochMs()) } == null) return@dispatch
         stopPollCount = 0
+        stopListRetryCount = 0
+        firstStoppedObservation = null
         waitForStop(STOP_FIRST_POLL_DELAY_MS)
     }
 
@@ -189,7 +205,16 @@ class FreeLivingCaptureCoordinator(
         if (!connectedTo(current.preparation.ring?.address)) return@dispatch
         val sameConnection = baseline?.connectionGeneration == generation
         val purpose = when {
-            sameConnection && current.phase == FreeLivingSessionPhase.START_REQUESTED -> Purpose.START
+            current.phase == FreeLivingSessionPhase.START_REQUESTED && current.startCommandDispatch?.let {
+                startCommandIssued && it.ownerId == commandOwnerId && it.connectionGeneration == generation
+            } == true -> {
+                val durable = requireNotNull(current.startBaseline)
+                baseline = HealthRecordObservation(requireNotNull(address), requireNotNull(generation), durable.status,
+                    durable.observedAtMs, durable.records)
+                startCommandIssued = true
+                Purpose.RECOVER_START
+            }
+            current.phase == FreeLivingSessionPhase.START_REQUESTED -> Purpose.INSPECT
             sameConnection && ownership != null && current.phase == FreeLivingSessionPhase.STOP_REQUESTED -> Purpose.STOP
             else -> Purpose.INSPECT
         }
@@ -280,9 +305,13 @@ class FreeLivingCaptureCoordinator(
             val status = packet.message as? HealthMessage.Status ?: return@dispatch
             val watchingOwnedCollection = ownership != null && session?.phase == FreeLivingSessionPhase.COLLECTING
             if (watchingOwnedCollection &&
-                (!validStatus(status) || !status.collecting || status.errorCode != 0 ||
+                (!validStatus(status) || packet.receivedEpochMs <= 0 || status.errorCode != 0 ||
                     status.sessionId != ownership?.sessionId || statusRegressed(status))) {
                 rejectAssociation(CaptureControlIssue.UNEXPECTED_DEVICE_STATE)
+            } else if (watchingOwnedCollection && !status.collecting) {
+                // STATUS alone cannot finalize a record. Query a complete STATUS/LIST pair and
+                // retain the proved association while the ring settles its Flash tail.
+                beginRound(Purpose.INSPECT)
             } else if (watchingOwnedCollection) {
                 val previous = session?.deviceRecordEvidence
                 if (previous != null && save { store.updateDeviceEvidence(requireNotNull(session).sessionId,
@@ -337,6 +366,30 @@ class FreeLivingCaptureCoordinator(
                     if (message != evidence.status && save { store.updateDeviceEvidence(current.sessionId,
                             evidence.copy(status = message, observedAtMs = packet.receivedEpochMs)) } == null) return@dispatch
                     lastStatus = message
+                    if (firstStoppedObservation == null) {
+                        round = null
+                        stopPollCount++
+                        val snapshot = HealthRecordObservation(
+                            address = requireNotNull(address),
+                            connectionGeneration = connectionGeneration,
+                            status = message,
+                            statusReceivedAtMs = packet.receivedEpochMs,
+                            records = current.startBaseline?.records.orEmpty()
+                                .filter { it.sessionId != evidence.record.sessionId } + evidence.record,
+                        )
+                        if (message.collecting) {
+                            waitForStop(STOP_POLL_INTERVAL_MS, snapshot)
+                        } else {
+                            firstStoppedObservation = snapshot
+                            stopListRetryCount = 0
+                            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, snapshot)
+                        }
+                        return@dispatch
+                    }
+                    if (message.collecting) {
+                        rejectAssociation(CaptureControlIssue.RECORD_CHANGED)
+                        return@dispatch
+                    }
                 }
                 active.status = packet
                 send(port::queryRecords)
@@ -420,8 +473,10 @@ class FreeLivingCaptureCoordinator(
     private fun completeUpdatedStopRound(active: Round, observed: HealthRecordObservation) {
         val current = session ?: return
         val evidence = current.deviceRecordEvidence
+        val sameOwnedConnection = ownership != null && active.generation == generation &&
+            evidence?.record?.let(::identity) == ownership
         if (evidence == null || current.deviceAssociationInvalidated ||
-            (active.purpose == Purpose.INSPECT && evidence.record.unixMs == 0L)) {
+            (active.purpose == Purpose.INSPECT && evidence.record.unixMs == 0L && !sameOwnedConnection)) {
             review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)
             return
         }
@@ -439,16 +494,20 @@ class FreeLivingCaptureCoordinator(
             rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
             return
         }
+        val latestObserved = observed.copy(status = latest, statusReceivedAtMs = packet.receivedEpochMs)
         if (save { store.updateDeviceEvidence(current.sessionId,
                 DeviceRecordEvidence(candidate, latest, packet.receivedEpochMs)) } == null) return
         ownership = identity(candidate)
         lastRecord = candidate
         lastStatus = latest
         stopPollCount++
-        if (stopPollCount < STOP_POLL_LIMIT) waitForStop(STOP_POLL_INTERVAL_MS,
-            observed.copy(status = latest, statusReceivedAtMs = packet.receivedEpochMs))
-        else review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed.copy(status = latest,
-            statusReceivedAtMs = packet.receivedEpochMs))
+        if (!latest.collecting && candidate.bytes == latest.bytes && candidate.records == latest.records) {
+            firstStoppedObservation = latestObserved
+            stopListRetryCount = 0
+            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, latestObserved)
+        } else {
+            waitForStop(STOP_POLL_INTERVAL_MS, latestObserved)
+        }
     }
 
     /** Host schedules this using elapsed time, never by comparing wall-clock timestamps. */
@@ -460,11 +519,11 @@ class FreeLivingCaptureCoordinator(
     private fun beginRound(purpose: Purpose) {
         val connectedGeneration = generation ?: return
         if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
-        if (purpose == Purpose.START) startPollCount++
+        if (purpose == Purpose.START || purpose == Purpose.RECOVER_START) startPollCount++
         round = Round(++operation, connectedGeneration, purpose, clock.nowElapsedMs())
         publish(when (purpose) {
             Purpose.PREFLIGHT, Purpose.INSPECT, Purpose.ARCHIVE_START -> CaptureControlPhase.CHECKING
-            Purpose.START -> CaptureControlPhase.STARTING
+            Purpose.START, Purpose.RECOVER_START -> CaptureControlPhase.STARTING
             Purpose.STOP -> CaptureControlPhase.STOPPING
         })
         send(port::queryStatus)
@@ -488,11 +547,12 @@ class FreeLivingCaptureCoordinator(
             }
             return
         }
-        if (purpose == Purpose.START && startPollCount < START_POLL_LIMIT && unchangedIdleBaseline(observed, statusReason)) {
+        if (purpose in setOf(Purpose.START, Purpose.RECOVER_START) && startPollCount < START_POLL_LIMIT &&
+            unchangedIdleBaseline(observed, statusReason)) {
             // A complete idle reply may precede firmware readiness. Recheck only that same
             // baseline; an unfamiliar record or collecting error keeps the protective exit.
             waitForStart(StartWaitStage.BEFORE_STATUS, START_POLL_INTERVAL_MS, observed) {
-                beginRound(Purpose.START)
+                beginRound(purpose)
             }
             return
         }
@@ -511,7 +571,20 @@ class FreeLivingCaptureCoordinator(
                 }
                 // A second owner of this journal is unsupported. Recheck before issuing a command.
                 val existing = try { store.readPending() } catch (_: Exception) { storageFailure(); return }
-                if (existing != null) { session = existing; publishRestored(); return }
+                if (existing != null) {
+                    session = existing
+                    val sameRing = existing.preparation.ring?.address?.uppercase(Locale.ROOT) == observed.address
+                    if (sameRing && existing.phase == FreeLivingSessionPhase.START_REQUESTED &&
+                        existing.startCommandDispatch == null) {
+                        // A durable request can survive a directory-sync failure even though START
+                        // was never sent. A fresh, unchanged read proves that this was an empty
+                        // attempt and lets the user return to idle without weakening data recovery.
+                        recoverAssociation(observed)
+                    } else {
+                        publishRestored()
+                    }
+                    return
+                }
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
                     DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs, chargingRecovery,
                         requested.allowedExisting?.unknownTimeStartEvidence),
@@ -525,16 +598,29 @@ class FreeLivingCaptureCoordinator(
                         invalidateRound(CaptureControlIssue.INVALID_OBSERVATION)
                         return@waitForStart
                     }
-                    if (send(port::start)) {
-                        startCommandIssued = true
-                        // This delay starts at local enqueue, not at confirmed device execution.
-                        waitForStart(StartWaitStage.BEFORE_STATUS, START_FIRST_POLL_DELAY_MS) {
-                            beginRound(Purpose.START)
-                        }
+                    val current = session ?: return@waitForStart
+                    val connection = requireNotNull(generation)
+                    if (save { store.prepareStartCommand(current.sessionId, clock.nowEpochMs(),
+                            commandOwnerId, connection) } == null) return@waitForStart
+                    // Persist before crossing the BLE side-effect boundary. A synchronous callback
+                    // is dispatched only after this transition finishes and sees the same evidence.
+                    startCommandIssued = true
+                    val accepted = try { port.start() } catch (_: Exception) { false }
+                    if (!accepted) {
+                        startCommandIssued = false
+                        if (save { store.cancelPreparedStartCommand(current.sessionId) } == null) return@waitForStart
+                        invalidateRound(CaptureControlIssue.COMMAND_NOT_ACCEPTED)
+                        return@waitForStart
+                    }
+                    if (save { store.confirmStartCommandAccepted(current.sessionId, clock.nowEpochMs()) } == null) return@waitForStart
+                    // This delay starts at local enqueue, not at confirmed device execution.
+                    waitForStart(StartWaitStage.BEFORE_STATUS, START_FIRST_POLL_DELAY_MS) {
+                        beginRound(Purpose.START)
                     }
                 }
             }
             Purpose.START -> confirmStart(observed)
+            Purpose.RECOVER_START -> confirmStart(observed)
             Purpose.STOP -> confirmStop(observed)
             Purpose.INSPECT -> recoverAssociation(observed)
             Purpose.ARCHIVE_START -> error("Handled before capture confirmation")
@@ -589,12 +675,14 @@ class FreeLivingCaptureCoordinator(
             candidate.sessionId != observed.status.sessionId || (candidate.unixMs == 0L && candidate.uptimeMs == 0L) ||
             candidate.bytes < observed.status.bytes || candidate.records < observed.status.records ||
             !onlyKnownRecords(observed, candidate)) {
-            val proof = current.startBaseline?.unknownTimeStartEvidence
             val pendingRecord = observed.records.singleOrNull { it.sessionId == observed.status.sessionId }
             if (startCommandIssued && before?.connectionGeneration == generation && observed.status.collecting &&
-                observed.status.errorCode == 0 && proof != null && pendingRecord != null &&
-                proof.canStopWithoutUnix(pendingRecord) && pendingRecord.bytes >= observed.status.bytes &&
+                observed.status.errorCode == 0 && pendingRecord != null &&
+                pendingRecord.bytes >= observed.status.bytes &&
                 pendingRecord.records >= observed.status.records && onlyKnownRecords(observed, pendingRecord)) {
+                // The record is not strong enough to become research data, but the same-connection
+                // idle -> START -> collecting transition is enough to offer a protective STOP and
+                // raw-data preservation path instead of leaving the ring collecting indefinitely.
                 unconfirmedStartStopCandidate = observed
             }
             review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
@@ -610,30 +698,63 @@ class FreeLivingCaptureCoordinator(
 
     private fun confirmStop(observed: HealthRecordObservation) {
         val current = session ?: return
-        val candidate = observed.records.singleOrNull { it.sessionId == current.deviceSessionId }
         val previous = lastRecord
-        if (ownership == null || candidate == null || identity(candidate) != ownership ||
-            observed.status.sessionId != candidate.sessionId || previous == null ||
-            statusRegressed(observed.status) ||
-            candidate.bytes < previous.bytes || candidate.records < previous.records ||
-            candidate.bytes < observed.status.bytes || candidate.records < observed.status.records ||
-            !onlyKnownRecords(observed, candidate)) {
+        val owner = ownership
+        if (owner == null || previous == null || observed.status.sessionId != owner.sessionId ||
+            statusRegressed(observed.status)) {
             rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
             return
         }
-        stopPollCount++
+        val candidate = observed.records.singleOrNull { it.sessionId == current.deviceSessionId }
+        val knownWithoutTarget = current.startBaseline?.records.orEmpty()
+            .filter { it.sessionId != current.deviceSessionId }.toSet()
+        if (observed.records.any { it.sessionId != current.deviceSessionId && it !in knownWithoutTarget }) {
+            rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
+            return
+        }
+        if (candidate == null) {
+            retryStopList(observed)
+            return
+        }
+        if (identity(candidate) != owner || candidate.bytes < previous.bytes || candidate.records < previous.records) {
+            rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
+            return
+        }
         if (observed.status.collecting) {
-            // Persist each high-water mark before another read-only round or process restart.
+            if (firstStoppedObservation != null || candidate.bytes < observed.status.bytes ||
+                candidate.records < observed.status.records) {
+                rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
+                return
+            }
             if (save { store.updateDeviceEvidence(current.sessionId,
                     DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
             lastRecord = candidate
             lastStatus = observed.status
-            if (stopPollCount < STOP_POLL_LIMIT) waitForStop(STOP_POLL_INTERVAL_MS, observed)
-            else review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
+            stopPollCount++
+            waitForStop(STOP_POLL_INTERVAL_MS, observed)
             return
         }
-        if (candidate.bytes != observed.status.bytes || candidate.records != observed.status.records) {
-            rejectAssociation(CaptureControlIssue.RECORD_CHANGED, observed)
+        if (candidate.bytes < observed.status.bytes || candidate.records < observed.status.records) {
+            retryStopList(observed)
+            return
+        }
+        if (candidate.bytes > observed.status.bytes || candidate.records > observed.status.records) {
+            if (save { store.updateDeviceEvidence(current.sessionId,
+                    DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
+            lastRecord = candidate
+            lastStatus = observed.status
+            firstStoppedObservation = null
+            waitForStop(STOP_POLL_INTERVAL_MS, observed)
+            return
+        }
+        if (firstStoppedObservation == null) {
+            if (save { store.updateDeviceEvidence(current.sessionId,
+                    DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
+            firstStoppedObservation = observed
+            stopListRetryCount = 0
+            lastRecord = candidate
+            lastStatus = observed.status
+            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, observed)
             return
         }
         if (save { store.confirmStop(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs,
@@ -641,6 +762,15 @@ class FreeLivingCaptureCoordinator(
         lastRecord = candidate
         lastStatus = observed.status
         publish(CaptureControlPhase.AWAITING_REFERENCE, observed = observed)
+    }
+
+    private fun retryStopList(observed: HealthRecordObservation) {
+        if (stopListRetryCount < STOP_LIST_RETRY_LIMIT) {
+            stopListRetryCount++
+            waitForStop(STOP_LIST_RETRY_INTERVAL_MS, observed)
+        } else {
+            review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
+        }
     }
 
     private fun waitForStop(delayMs: Long, observed: HealthRecordObservation? = null) {
@@ -660,12 +790,30 @@ class FreeLivingCaptureCoordinator(
                         return@callback
                     }
                     stopWait = null
-                    beginRound(Purpose.STOP)
+                    if (firstStoppedObservation == null) beginRound(Purpose.STOP)
+                    else beginStopListRound()
                 }
             }
         } catch (_: Exception) {
             invalidateRound(CaptureControlIssue.COMMAND_NOT_ACCEPTED)
         }
+    }
+
+    private fun beginStopListRound() {
+        val connection = generation ?: return
+        val stopped = firstStoppedObservation ?: return
+        val latest = session?.deviceRecordEvidence
+        if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
+        round = Round(
+            id = ++operation,
+            generation = connection,
+            purpose = Purpose.STOP,
+            startedAtElapsedMs = clock.nowElapsedMs(),
+            status = SensorPacket.Health(latest?.status ?: stopped.status,
+                latest?.observedAtMs ?: stopped.statusReceivedAtMs),
+        )
+        publish(CaptureControlPhase.STOPPING)
+        send(port::queryRecords)
     }
 
     private fun allowedBaseline(observed: HealthRecordObservation, authorization: ExistingRecordAuthorization?): Boolean {
@@ -695,10 +843,50 @@ class FreeLivingCaptureCoordinator(
 
     private fun recoverAssociation(observed: HealthRecordObservation) {
         val current = session ?: return
+        if (current.phase == FreeLivingSessionPhase.START_REQUESTED) {
+            val startBaseline = current.startBaseline
+            if (current.startCommandDispatch == null && startBaseline != null &&
+                !observed.status.collecting && observed.status.errorCode in setOf(0, -16) &&
+                observed.status.copy(errorCode = 0) == startBaseline.status.copy(errorCode = 0) &&
+                observed.records.size == startBaseline.records.size &&
+                observed.records.toSet() == startBaseline.records.toSet()) {
+                try {
+                    store.archiveStartAttempt(current.sessionId, observed, clock.nowEpochMs(),
+                        INTERRUPTED_BEFORE_START_REASON)
+                    session = store.readPending()
+                    clearAssociation()
+                    publish(CaptureControlPhase.IDLE, observed = observed)
+                } catch (_: IllegalArgumentException) {
+                    review(CaptureControlIssue.START_ARCHIVE_BLOCKED, observed)
+                } catch (_: Exception) {
+                    storageFailure()
+                }
+                return
+            }
+            val candidate = startBaseline?.let { baseline -> observed.records.singleOrNull { record ->
+                FreeLivingSessionStore.isDistinctStartRecord(baseline, record)
+            } }
+            if (observed.status.errorCode == 0 && observed.status.collecting && candidate != null &&
+                candidate.sessionId == observed.status.sessionId && candidate.sessionId != 0 &&
+                (candidate.unixMs > 0L || candidate.uptimeMs > 0L) &&
+                candidate.bytes >= observed.status.bytes && candidate.records >= observed.status.records &&
+                onlyKnownRecords(observed, candidate)) {
+                // A different connection cannot prove which phone sent START. Preserve the record
+                // and offer a controlled STOP, but never promote it to this research session.
+                unconfirmedStartStopCandidate = observed
+                review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
+            } else {
+                review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)
+            }
+            return
+        }
         val evidence = current.deviceRecordEvidence
         // Zero UNIX means the device clock is unknown. An uninterrupted issuing connection can
         // prove a new ID plus uptime, but uptime alone cannot disambiguate another boot here.
-        if (evidence == null || current.deviceAssociationInvalidated || evidence.record.unixMs == 0L) {
+        val sameOwnedConnection = ownership != null && observed.connectionGeneration == generation &&
+            evidence?.record?.let(::identity) == ownership
+        if (evidence == null || current.deviceAssociationInvalidated ||
+            (evidence.record.unixMs == 0L && !sameOwnedConnection)) {
             review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)
             return
         }
@@ -716,16 +904,65 @@ class FreeLivingCaptureCoordinator(
         lastStatus = evidence.status
         if (current.phase == FreeLivingSessionPhase.STOP_REQUESTED) {
             ownership = identity(candidate)
-            confirmStop(observed)
-        } else if (current.phase == FreeLivingSessionPhase.COLLECTING && observed.status.collecting) {
-            if (save { store.updateDeviceEvidence(current.sessionId,
-                    DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
+            lastRecord = evidence.record
+            lastStatus = evidence.status
+            val dispatch = current.stopCommandDispatch
+            if (current.stopOrigin == StopOrigin.USER_REQUEST && dispatch != null &&
+                dispatch.acceptedAtMs == null && observed.status.collecting) {
+                val nextEvidence = DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)
+                if (save { store.updateDeviceEvidence(current.sessionId, nextEvidence) } == null) return
+                lastRecord = candidate
+                lastStatus = observed.status
+                publish(CaptureControlPhase.STOPPING, observed = observed)
+                val issuedByThisOwner = stopCommandIssued && dispatch.ownerId == commandOwnerId &&
+                    dispatch.connectionGeneration == generation
+                if (issuedByThisOwner) {
+                    stopPollCount = 0
+                    stopListRetryCount = 0
+                    firstStoppedObservation = null
+                    waitForStop(STOP_FIRST_POLL_DELAY_MS, observed)
+                    return
+                }
+                val connection = requireNotNull(generation)
+                if (save { store.prepareRecoveredStopCommand(current.sessionId, clock.nowEpochMs(),
+                        commandOwnerId, connection) } == null) return
+                stopCommandIssued = true
+                val accepted = try { port.stop() } catch (_: Exception) { false }
+                if (!accepted) {
+                    stopCommandIssued = false
+                    review(CaptureControlIssue.COMMAND_NOT_ACCEPTED, observed)
+                    return
+                }
+                if (save { store.confirmStopCommandAccepted(current.sessionId, clock.nowEpochMs()) } == null) return
+                stopPollCount = 0
+                stopListRetryCount = 0
+                firstStoppedObservation = null
+                waitForStop(STOP_FIRST_POLL_DELAY_MS, observed)
+            } else {
+                confirmStop(observed)
+            }
+        } else if (current.phase == FreeLivingSessionPhase.COLLECTING) {
+            val nextEvidence = DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)
+            if (observed.status.collecting) {
+                if (save { store.updateDeviceEvidence(current.sessionId, nextEvidence) } == null) return
+            } else {
+                // Match the original 0.5.3 recovery behavior: a proved active record that has
+                // stopped advances into Flash finalization. No second STOP command is sent.
+                if (save { store.beginObservedStopFinalization(current.sessionId,
+                        observed.statusReceivedAtMs, nextEvidence) } == null) return
+            }
             ownership = identity(candidate)
             lastRecord = candidate
             lastStatus = observed.status
-            publish(CaptureControlPhase.COLLECTING, observed = observed)
+            if (observed.status.collecting) {
+                publish(CaptureControlPhase.COLLECTING, observed = observed)
+            } else {
+                stopPollCount = 0
+                stopListRetryCount = 0
+                firstStoppedObservation = observed
+                waitForStop(STOP_FLASH_SETTLE_DELAY_MS, observed)
+            }
         } else {
-            // An unsolicited stop has no user stop request. Preserve the record and unknown end.
             review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
         }
     }
@@ -760,12 +997,15 @@ class FreeLivingCaptureCoordinator(
 
     private fun clearAssociation() {
         startCommandIssued = false
+        stopCommandIssued = false
         unconfirmedStartStopCandidate = null
         chargingRecoveryDeadline = null
         startWait = null
         startPollCount = 0
         stopWait = null
         stopPollCount = 0
+        stopListRetryCount = 0
+        firstStoppedObservation = null
         round = null
         intent = null
         baseline = null
@@ -794,6 +1034,7 @@ class FreeLivingCaptureCoordinator(
     private fun publishRestored() = when (session?.phase) {
         null -> publish(CaptureControlPhase.IDLE)
         FreeLivingSessionPhase.AWAITING_REFERENCE -> publish(CaptureControlPhase.AWAITING_REFERENCE)
+        FreeLivingSessionPhase.START_REQUESTED -> publish(CaptureControlPhase.STARTING)
         else -> review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW)
     }
 
@@ -858,8 +1099,13 @@ class FreeLivingCaptureCoordinator(
         const val START_FIRST_POLL_DELAY_MS = 1_000L
         const val START_POLL_INTERVAL_MS = 1_500L
         const val START_POLL_LIMIT = 3
-        const val STOP_FIRST_POLL_DELAY_MS = 5_000L
-        const val STOP_POLL_INTERVAL_MS = 1_500L
-        const val STOP_POLL_LIMIT = 3
+        const val STOP_FIRST_POLL_DELAY_MS = 500L
+        const val STOP_POLL_INTERVAL_MS = 1_000L
+        const val STOP_FLASH_SETTLE_DELAY_MS = 5_000L
+        const val STOP_LIST_RETRY_INTERVAL_MS = 2_000L
+        const val STOP_LIST_RETRY_LIMIT = 30
+        const val STOP_RECOVERY_POLL_LIMIT = 30
+        private const val INTERRUPTED_BEFORE_START_REASON =
+            "App 在发送开始命令前关闭，本次未开始采集"
     }
 }

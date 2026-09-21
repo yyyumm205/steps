@@ -17,6 +17,10 @@ data class FlowRecordSummary(
     val localReviewRequired: Boolean = false,
     val activity: SessionActivity = SessionActivity.FREE_LIVING,
     val uploadDeferred: Boolean = false,
+    val startedAtMs: Long? = null,
+    val timeZoneId: String? = null,
+    val referenceEditable: Boolean = false,
+    val referenceReason: String? = null,
 )
 
 data class CollectionFlowState(
@@ -26,6 +30,9 @@ data class CollectionFlowState(
     val uploadAvailable: Boolean = true,
     val hasProfile: Boolean = false,
     val participantId: String = "",
+    /** Local-only label; research files continue to use [participantId]. */
+    val participantLabel: String = "",
+    val ringName: String = "",
     val placement: RingPlacement? = null,
     val session: FreeLivingSession? = null,
     val connected: Boolean = true,
@@ -58,6 +65,8 @@ interface CollectionFlow {
     fun selectActivity(activity: SessionActivity) = Unit
     fun stop()
     fun chooseFinish(uploadNow: Boolean) = Unit
+    /** Commits the completion choice and reference observation as one durable operation. */
+    fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String = "valid", reason: String = "")
     fun enterFinish() = Unit
     fun discardSession() = Unit
     fun enterReference()
@@ -65,8 +74,29 @@ interface CollectionFlow {
     fun retry()
     fun endStartAttempt(reason: String) = Unit
     fun retryUpload(sessionId: String)
+    /** Replaces a locally saved reference before the participant confirms its first upload. */
+    fun reviseReference(sessionId: String, stepsText: String, status: String = "valid", reason: String = "") = Unit
     fun home()
     fun setFault(fault: FlowTestFault)
     fun disconnect()
     fun reconnect()
+}
+
+internal fun sessionReferenceFromInput(
+    stepsText: String,
+    status: String,
+    reason: String,
+    recordedAtMs: Long,
+): SessionReference {
+    val kind = ReferenceStatus.entries.singleOrNull { it.wireValue == status }
+        ?: throw IllegalArgumentException("请选择读数状态")
+    val steps = when {
+        kind == ReferenceStatus.MISSING -> null
+        stepsText.trim().matches(Regex("[0-9]+")) -> stepsText.trim().toLongOrNull()
+            ?: throw IllegalArgumentException("步数太大，请核对读数")
+        else -> throw IllegalArgumentException("请输入计步器上的整数")
+    }
+    val note = reason.trim().ifEmpty { null }
+    require(kind == ReferenceStatus.VALID || note != null) { "请填写简短原因" }
+    return SessionReference(kind, steps, recordedAtMs, if (kind == ReferenceStatus.VALID) null else note)
 }

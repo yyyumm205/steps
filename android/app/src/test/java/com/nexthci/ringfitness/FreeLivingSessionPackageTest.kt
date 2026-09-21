@@ -8,19 +8,24 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.UUID
 import java.util.zip.CRC32
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipOutputStream
 
 class FreeLivingSessionPackageTest {
     @get:Rule val temporary = TemporaryFolder()
     private val t = 1_789_804_800_000L
+    private val packagedAt = Instant.ofEpochMilli(t + 5_000)
     private val preparation = PreparationSnapshot("pkg001", "83e56afb-a74c-4825-af0b-b226cfe9c630",
         RingPlacement.LEFT_INDEX, PreparedRing("AA:BB:CC:DD:EE:07", "Ringo package fixture"))
 
@@ -28,9 +33,17 @@ class FreeLivingSessionPackageTest {
         val f = fixture(SessionReference(ReferenceStatus.VALID, 0, t + 3000))
         val frozen = f.packager.freeze(f.session)
         val manifest = manifest(frozen)
-        assertEquals(2, manifest["version"].asInt)
+        assertEquals(7, manifest["version"].asInt)
         assertEquals(1, manifest["step_schema_version"].asInt)
         assertEquals(2, manifest["rfbin_version"].asInt)
+        assertEquals("hand_finger_v1", manifest["ring_placement_schema"].asString)
+        assertEquals("left", manifest["ring_hand"].asString)
+        assertEquals("index", manifest["ring_finger"].asString)
+        assertEquals(BuildConfig.VERSION_NAME, manifest["app_version"].asString)
+        assertEquals(packagedAt.toString(), manifest["created_at"].asString)
+        assertEquals("user_request", manifest["stop_origin"].asString)
+        assertTrue(manifest["stop_observed_at_ms"].isJsonNull)
+        assertNotEquals(Instant.ofEpochMilli(t).toString(), manifest["created_at"].asString)
         assertEquals("daily_activity_v2", manifest["activity_schema"].asString)
         assertEquals("free_living", manifest["activity_code"].asString)
         assertEquals("unlabelled", manifest["activity_label_status"].asString)
@@ -58,7 +71,6 @@ class FreeLivingSessionPackageTest {
     @Test fun missingAndUnreliableReadingsRemainDistinctAndLongMaxIsExact() {
         val values = listOf(
             SessionReference(ReferenceStatus.MISSING, null, t + 3000, "无法读取"),
-            SessionReference(ReferenceStatus.UNRELIABLE, null, t + 3000, "计步器归零"),
             SessionReference(ReferenceStatus.UNRELIABLE, 73, t + 3000, "忘记清零"),
             SessionReference(ReferenceStatus.VALID, Long.MAX_VALUE, t + 3000),
         )
@@ -87,11 +99,41 @@ class FreeLivingSessionPackageTest {
         f.store.markTransferStarted(f.session.sessionId)
         f.store.completeTransfer(f.session.sessionId,
             SessionTransferReceipt("real-server-file", t + 7000, false, f.session.sessionId))
-        val reopened = packager(f.directory, openStore(f.directory)).freeze(f.session)
+        val reopened = packager(f.directory, openStore(f.directory),
+            now = { Instant.ofEpochMilli(t + 90_000) }).freeze(f.session)
         assertEquals(first, reopened)
         assertArrayEquals(original, reopened.file.readBytes())
         assertEquals(manifestBefore, manifest(reopened))
         assertEquals(2, f.store.read()!!.transfer.attempts)
+    }
+
+    @Test fun deferredReferenceCorrectionInvalidatesAnUnpublishedZipAndFreezesOnlyTheCorrectedValue() {
+        val f = fixture(SessionReference(ReferenceStatus.VALID, 12, t + 3_000))
+        f.store.setCompletionPolicy(f.session.sessionId, CompletionPolicy.SAVE_LATER)
+        val first = f.packager.freeze(requireNotNull(f.store.read()))
+        assertEquals(12L, manifest(first)["ground_truth_steps"].asLong)
+
+        val corrected = SessionReference(ReferenceStatus.VALID, 21, t + 6_000)
+        val revised = f.packager.reviseUnpublishedReference(f.session.sessionId, corrected)
+        assertFalse(first.file.exists())
+        assertEquals(corrected, revised.reference)
+        assertEquals(listOf(SessionReferenceRevision(
+            SessionReference(ReferenceStatus.VALID, 12, t + 3_000), t + 6_000)), revised.referenceRevisions)
+        assertEquals(revised, openStore(f.directory).read())
+
+        val second = f.packager.freeze(revised)
+        assertEquals(21L, manifest(second)["ground_truth_steps"].asLong)
+        assertFalse(manifest(second).has("reference_revisions"))
+        f.store.allowUpload(f.session.sessionId)
+        val uploadConfirmedCorrection = SessionReference(ReferenceStatus.VALID, 22, t + 7_000)
+        val uploadConfirmed = f.packager.reviseUnpublishedReference(f.session.sessionId, uploadConfirmedCorrection)
+        assertEquals(uploadConfirmedCorrection, uploadConfirmed.reference)
+        assertEquals(2, uploadConfirmed.referenceRevisions.size)
+        f.store.markTransferStarted(f.session.sessionId)
+        assertThrows(IllegalArgumentException::class.java) {
+            f.store.reviseReferenceBeforeUpload(f.session.sessionId,
+                SessionReference(ReferenceStatus.VALID, 23, t + 8_000))
+        }
     }
 
     @Test fun recoveryPackageVersionsOnlyTheNewEvidenceAndKeepsSuccessfulRepliesStrict() {
@@ -102,7 +144,7 @@ class FreeLivingSessionPackageTest {
         val frozen = f.packager.freeze(f.session)
         val before = frozen.file.readBytes()
         val m = manifest(frozen)
-        assertEquals(3, m["version"].asInt)
+        assertEquals(7, m["version"].asInt)
         assertEquals(1, m["step_schema_version"].asInt)
         assertEquals("daily_activity_v2", m["activity_schema"].asString)
         assertEquals(-16, m.getAsJsonObject("start_baseline").getAsJsonObject("status")["error_code"].asInt)
@@ -132,6 +174,11 @@ class FreeLivingSessionPackageTest {
         payload.remove("completion_policy")
         payload.remove("discarded")
         payload.remove("start_abort")
+        payload.remove("reference_revisions")
+        payload.remove("start_command_dispatch")
+        payload.remove("stop_observed_at_ms")
+        payload.remove("stop_origin")
+        payload.remove("stop_command_dispatch")
         val hashed = JsonObject().apply {
             add("session", payload)
             add("archived_sessions", envelope["archived_sessions"])
@@ -141,13 +188,38 @@ class FreeLivingSessionPackageTest {
         val frozen = f.packager.freeze(f.session)
         val before = frozen.file.readBytes()
         val m = manifest(frozen)
-        assertEquals(2, m["version"].asInt)
+        assertEquals(7, m["version"].asInt)
         assertFalse(m.getAsJsonObject("start_baseline").has("charging_recovery_evidence"))
         assertFalse(m.has("start_attempt_archive"))
         f.store.markTransferStarted(f.session.sessionId)
-        assertEquals(9, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(12, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
         assertArrayEquals(before, packager(f.directory, openStore(f.directory)).freeze(f.session).file.readBytes())
         assertEquals(m, manifest(f.packager.freeze(f.session)))
+    }
+
+    @Test fun existingLegacyFrozenPackagesRemainByteIdenticalAfterManifestUpgrade() {
+        val recovery = ChargingRecoveryEvidence(statusErrorReason = 1, batteryChargeStatus = 0,
+            batteryReceivedAtMs = t - 100, statusReceivedAtMs = t, checkedAtMs = t,
+            statusConnectionGeneration = 1, batteryConnectionGeneration = 1)
+        data class LegacyCase(val version: Int, val recovery: ChargingRecoveryEvidence? = null,
+            val activity: SessionActivity = SessionActivity.FREE_LIVING, val unknownTime: Boolean = false)
+        listOf(
+            LegacyCase(2),
+            LegacyCase(3, recovery = recovery),
+            LegacyCase(4, activity = SessionActivity.WALKING),
+            LegacyCase(5, recovery = recovery, activity = SessionActivity.RUNNING, unknownTime = true),
+        ).forEach { legacy ->
+            val f = fixture(recoveryEvidence = legacy.recovery, activity = legacy.activity,
+                unknownTime = legacy.unknownTime)
+            val frozen = f.packager.freeze(f.session)
+            rewriteAsLegacy(frozen, legacy.version)
+            val original = frozen.file.readBytes()
+
+            val reopened = packager(f.directory, openStore(f.directory)).freeze(f.session)
+
+            assertArrayEquals(original, reopened.file.readBytes())
+            assertEquals(legacy.version, manifest(reopened)["version"].asInt)
+        }
     }
 
     @Test fun multipleRawFilesAndEvidenceShareOneReferenceAtTheRoot() {
@@ -272,14 +344,26 @@ class FreeLivingSessionPackageTest {
     private fun fixture(reference: SessionReference = SessionReference(ReferenceStatus.VALID, 73, t + 3000),
         rawCount: Int = 1, withEvidence: Boolean = false, simulated: Boolean = false,
         recoveryEvidence: ChargingRecoveryEvidence? = null,
+        activity: SessionActivity = SessionActivity.FREE_LIVING, unknownTime: Boolean = false,
         transform: (ByteArray) -> ByteArray = { it }): Fixture {
         val directory = temporary.newFolder()
         val store = openStore(directory)
         val payloads = (0 until rawCount).map { imu(it * 40L + 1000) }
-        val record = HealthMessage.ListItem(7, payloads.sumOf { it.size }.toLong(), rawCount.toLong(), 900, t)
+        val record = HealthMessage.ListItem(7, payloads.sumOf { it.size }.toLong(), rawCount.toLong(),
+            if (unknownTime) 1_100 else 900, t)
+        val previous = HealthMessage.ListItem(6, 20, 1, 900, 0)
+        val unknownEvidence = if (!unknownTime) null else UnknownTimeStartEvidence(
+            previous, UUID.randomUUID().toString(), "a".repeat(64), UUID.randomUUID().toString(), 1, t - 300,
+            PhoneClockSyncEvidence(UUID.randomUUID().toString(), preparation.ring!!.address, 1,
+                t - 110, t - 100, 100, 110, t - 105, 1_000),
+        )
+        val baselineRecords = if (unknownTime) listOf(previous) else emptyList()
+        val baselineStatus = if (unknownTime) HealthMessage.Status(false, previous.bytes, previous.records,
+            if (recoveryEvidence == null) 0 else -16, previous.sessionId)
+        else HealthMessage.Status(false, 0, 0, if (recoveryEvidence == null) 0 else -16, 6)
         val started = store.requestStart(preparation, t, "Asia/Shanghai",
-            DeviceStartBaseline(HealthMessage.Status(false, 0, 0, if (recoveryEvidence == null) 0 else -16, 6),
-                emptyList(), t, recoveryEvidence))
+            DeviceStartBaseline(baselineStatus, baselineRecords, t, recoveryEvidence,
+                unknownTimeStartEvidence = unknownEvidence), activity)
         val collecting = HealthMessage.Status(true, record.bytes, record.records, 0, 7)
         store.confirmStart(started.sessionId, preparation.ring!!.address, collecting, t + 1,
             recordEvidence = DeviceRecordEvidence(record, collecting, t + 1))
@@ -313,11 +397,45 @@ class FreeLivingSessionPackageTest {
         { source, target -> Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }, {})
 
     private fun packager(directory: File, store: FreeLivingSessionStore, sync: (File) -> Unit = {},
-        commit: (File, File) -> Unit = { source, target -> Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE) }) =
-        FreeLivingSessionPackage(directory, store, sync, commit)
+        commit: (File, File) -> Unit = { source, target -> Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE) },
+        now: () -> Instant = { packagedAt }) =
+        FreeLivingSessionPackage(directory, store, sync, commit, now)
 
     private fun manifest(value: FrozenSessionPackage): JsonObject = ZipFile(value.file).use { zip ->
         JsonParser.parseString(zip.getInputStream(zip.getEntry("manifest.json")).reader(Charsets.UTF_8).readText()).asJsonObject
+    }
+
+    private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int) {
+        val target = frozen.file.parentFile
+        val legacy = manifest(frozen).apply {
+            listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at",
+                "stop_origin", "stop_observed_at_ms").forEach(::remove)
+            addProperty("version", version)
+        }
+        val contents = ZipFile(frozen.file).use { zip ->
+            zip.entries().asSequence().associate { entry ->
+                entry.name to if (entry.name == "manifest.json") legacy.toString().toByteArray(Charsets.UTF_8)
+                else zip.getInputStream(entry).readBytes()
+            }
+        }
+        val replacement = File(target, "legacy.zip.tmp")
+        ZipOutputStream(FileOutputStream(replacement)).use { zip ->
+            contents.forEach { (name, bytes) ->
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+        }
+        Files.move(replacement.toPath(), frozen.file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        File(target, "manifest.snapshot.json").writeText(legacy.toString(), Charsets.UTF_8)
+        File(target, "package.json").writeText(JsonObject().apply {
+            addProperty("package_version", 1)
+            addProperty("session_id", frozen.sessionId)
+            addProperty("file_name", frozen.file.name)
+            addProperty("bytes", frozen.file.length())
+            addProperty("sha256", sha(frozen.file.readBytes()))
+            addProperty("manifest_sha256", sha(legacy.toString().toByteArray(Charsets.UTF_8)))
+        }.toString(), Charsets.UTF_8)
     }
 
     private fun imu(uptime: Long) = ByteArrayOutputStream().apply {

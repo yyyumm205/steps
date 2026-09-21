@@ -24,7 +24,6 @@ class FreeLivingSessionCompletionTest {
             SessionReference(ReferenceStatus.VALID, 0, t + 3_000),
             SessionReference(ReferenceStatus.MISSING, null, t + 3_000, "无法读取"),
             SessionReference(ReferenceStatus.UNRELIABLE, 562, t + 3_000, "忘记清零"),
-            SessionReference(ReferenceStatus.UNRELIABLE, null, t + 3_000, "读数不清"),
         )
         for (reference in references) {
             val file = file()
@@ -63,6 +62,7 @@ class FreeLivingSessionCompletionTest {
             SessionReference(ReferenceStatus.VALID, 0, t, "异常"),
             SessionReference(ReferenceStatus.MISSING, 0, t, "无法读取"),
             SessionReference(ReferenceStatus.MISSING, null, t),
+            SessionReference(ReferenceStatus.UNRELIABLE, null, t, "无法读取"),
             SessionReference(ReferenceStatus.UNRELIABLE, 3, t, " "),
             SessionReference(ReferenceStatus.VALID, 3, 0),
         )
@@ -259,18 +259,22 @@ class FreeLivingSessionCompletionTest {
         val session = envelope.getAsJsonObject("session")
         listOf("ground_truth_reason", "reference_saved_at_ms", "raw_files", "transfer",
             "start_baseline", "device_record_evidence", "device_association_invalidated",
-            "start_attempt_archive", "completion_policy", "discarded", "start_abort").forEach(session::remove)
+            "start_attempt_archive", "completion_policy", "discarded", "start_abort",
+            "reference_revisions", "start_command_dispatch", "stop_observed_at_ms", "stop_origin",
+            "stop_command_dispatch").forEach(session::remove)
         envelope.addProperty("journal_version", 1)
         envelope.remove("archived_sessions")
         envelope.addProperty("sha256", digest(session.toString().toByteArray()))
         file.writeText(envelope.toString())
         val originalBytes = file.readBytes()
-        assertEquals(stopped, open(file).read())
-        assertNull(open(file).read()!!.reference)
-        assertNull(open(file).read()!!.startAttemptArchive)
+        val restored = open(file).read()!!
+        assertEquals(stopped.copy(stopOrigin = StopOrigin.LEGACY_UNSPECIFIED,
+            stopCommandDispatch = null), restored)
+        assertNull(restored.reference)
+        assertNull(restored.startAttemptArchive)
         assertArrayEquals(originalBytes, file.readBytes())
         open(file).saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
-        assertEquals(9, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(0L, open(file).read()!!.reference!!.steps)
         assertNull(open(file).read()!!.startAttemptArchive)
     }
@@ -369,26 +373,26 @@ class FreeLivingSessionCompletionTest {
     }
 
     @Test fun confirmedMissingKeepsNumericTimestampNullAndPersistsSeparateObservationTime() {
-        for (status in listOf(ReferenceStatus.MISSING, ReferenceStatus.UNRELIABLE)) {
-            val file = file()
-            val store = open(file)
-            val stopped = stop(store)
-            val saved = store.saveReference(stopped.sessionId, SessionReference(status, null, t + 3_000, "无法读取"))
-            val payload = JsonParser.parseString(file.readText()).asJsonObject.getAsJsonObject("session")
-            assertTrue(payload.get("ground_truth_steps").isJsonNull)
-            assertTrue(payload.get("ground_truth_recorded_at_ms").isJsonNull)
-            assertEquals(t + 3_000, payload.get("reference_saved_at_ms").asLong)
-            assertNotNull(open(file).read()!!.reference)
-            assertNull(saved.reference!!.groundTruthRecordedAtMs)
-            assertEquals(saved, open(file).read())
-        }
         val file = file()
         val store = open(file)
         val stopped = stop(store)
-        store.saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
+        val saved = store.saveReference(stopped.sessionId,
+            SessionReference(ReferenceStatus.MISSING, null, t + 3_000, "无法读取"))
         val payload = JsonParser.parseString(file.readText()).asJsonObject.getAsJsonObject("session")
-        assertEquals(0L, payload.get("ground_truth_steps").asLong)
-        assertEquals(t + 3_000, payload.get("ground_truth_recorded_at_ms").asLong)
+        assertTrue(payload.get("ground_truth_steps").isJsonNull)
+        assertTrue(payload.get("ground_truth_recorded_at_ms").isJsonNull)
+        assertEquals(t + 3_000, payload.get("reference_saved_at_ms").asLong)
+        assertNotNull(open(file).read()!!.reference)
+        assertNull(saved.reference!!.groundTruthRecordedAtMs)
+        assertEquals(saved, open(file).read())
+
+        val zeroFile = file()
+        val zeroStore = open(zeroFile)
+        val zeroStopped = stop(zeroStore)
+        zeroStore.saveReference(zeroStopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
+        val zeroPayload = JsonParser.parseString(zeroFile.readText()).asJsonObject.getAsJsonObject("session")
+        assertEquals(0L, zeroPayload.get("ground_truth_steps").asLong)
+        assertEquals(t + 3_000, zeroPayload.get("ground_truth_recorded_at_ms").asLong)
     }
 
     @Test fun preservingAnomalousReadingBeforeDelayedStopConfirmationDoesNotImplyClockRollback() {

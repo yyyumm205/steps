@@ -32,7 +32,9 @@ class FreeLivingStartTimingTest {
         f.time.advanceTo(500)
         assertEquals(listOf(500L), f.times("start"))
         assertTrue(f.coordinator.state.settling)
-        assertEquals(pending, f.store.readPending())
+        val queued = requireNotNull(f.store.readPending())
+        assertEquals(pending.sessionId, queued.sessionId)
+        assertNotNull(queued.startCommandDispatch?.acceptedAtMs)
         f.time.advanceTo(1_499)
         assertEquals(1, f.count("status"))
         // Scheduling uses elapsed time; a wall-clock jump cannot shorten the settling window.

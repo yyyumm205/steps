@@ -135,6 +135,31 @@ class DemoFlowController(
         if (current.reference != null) download(current.sessionId) else publish(CollectionPage.REFERENCE)
     }
 
+    override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) =
+        safely(CollectionPage.FINISH) {
+            browsingHome = false
+            if (savingReference) { publish(CollectionPage.SAVING); return@safely }
+            val current = requireNotNull(store.readPending())
+            val policy = if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.SAVE_LATER
+            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+            savingReference = true
+            try {
+                publish(CollectionPage.SAVING)
+                later(350, CollectionPage.FINISH) {
+                    try {
+                        failNextReferenceCommit = consume(FlowTestFault.SAVE_FAILURE)
+                        val saved = store.finalizeStoppedSession(current.sessionId, policy, reference)
+                        val persisted = requireNotNull(store.read(current.sessionId))
+                        check(persisted.completionPolicy == saved.completionPolicy && persisted.reference == saved.reference)
+                        download(saved.sessionId)
+                    } finally { savingReference = false; failNextReferenceCommit = false }
+                }
+            } catch (error: Exception) {
+                savingReference = false
+                throw error
+            }
+        }
+
     override fun discardSession() = safely(CollectionPage.FINISH) {
         val current = requireNotNull(store.readPending())
         require(!savingReference && current.sessionId !in transferring)
@@ -185,25 +210,10 @@ class DemoFlowController(
         val current = requireNotNull(store.read())
         if (current.reference != null) { showStored(current); return@safely }
         require(current.stopConfirmedAtMs == null || current.completionPolicy != null) { "请选择保存方式" }
-        val referenceStatus = when (status) {
-            "valid" -> ReferenceStatus.VALID
-            "missing" -> ReferenceStatus.MISSING
-            "unreliable" -> ReferenceStatus.UNRELIABLE
-            else -> throw IllegalArgumentException("请选择读数状态")
-        }
-        val steps = when {
-            referenceStatus == ReferenceStatus.MISSING -> null
-            stepsText.trim().matches(Regex("[0-9]+")) -> stepsText.trim().toLongOrNull()
-                ?: throw IllegalArgumentException("步数太大，请核对读数")
-            referenceStatus == ReferenceStatus.UNRELIABLE && stepsText.isBlank() -> null
-            else -> throw IllegalArgumentException("请输入计步器上的整数")
-        }
-        require(referenceStatus == ReferenceStatus.VALID || reason.isNotBlank()) { "请填写简短原因" }
-        if (current.stopConfirmedAtMs == null && referenceStatus == ReferenceStatus.VALID) {
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+        if (current.stopConfirmedAtMs == null && reference.status == ReferenceStatus.VALID) {
             throw IllegalArgumentException("请先确认结束，或注明本次读数的异常")
         }
-        val reference = SessionReference(referenceStatus, steps, clock.nowEpochMs(),
-            if (referenceStatus == ReferenceStatus.VALID) null else reason.trim().ifEmpty { null })
         savingReference = true
         try {
             publish(CollectionPage.SAVING)
@@ -242,6 +252,12 @@ class DemoFlowController(
     }
 
     override fun retryUpload(sessionId: String) = safely { store.allowUpload(sessionId); upload(sessionId) }
+
+    override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) = safely {
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+        store.reviseReferenceBeforeUpload(sessionId, reference)
+        publish(CollectionPage.HOME)
+    }
 
     override fun home() = safely { browsingHome = true; publish(CollectionPage.HOME) }
 
@@ -530,7 +546,8 @@ class DemoFlowController(
         val busy = visiblePage in waitingPages
         val blockingWork = inFlightPage()?.let { it != CollectionPage.UPLOADING } == true
         state = CollectionFlowState(page = visiblePage, taskPage = taskPage, isSimulation = true, hasProfile = profile?.ring != null,
-            participantId = profile?.participantId.orEmpty(), placement = profile?.placement,
+            participantId = profile?.participantId.orEmpty(), participantLabel = profile?.displayLabel.orEmpty(),
+            ringName = profile?.ring?.name.orEmpty(), placement = profile?.placement,
             session = session, connected = connected, busy = busy, error = if (visiblePage == CollectionPage.HOME) taskError else error,
             savedSteps = reference?.steps, referenceStatus = reference?.status?.name?.lowercase(),
             canStart = !blockingWork && connected && profile?.ring != null && (session == null || session.localData != null),
@@ -541,7 +558,14 @@ class DemoFlowController(
             records = store.listSessions().filterNot { it.isDiscarded }.map { FlowRecordSummary(it.sessionId, it.reference?.steps,
                 it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null,
                 transferInFlight = it.sessionId in transferring, activity = it.activity,
-                uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER) }, fault = fault)
+                uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER,
+                startedAtMs = it.startedAtMs,
+                timeZoneId = it.timeZoneId,
+                referenceEditable = it.localData != null && it.reference != null &&
+                    it.completionPolicy == CompletionPolicy.SAVE_LATER &&
+                    it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
+                    it.sessionId !in transferring,
+                referenceReason = it.reference?.reason) }, fault = fault)
         broadcast()
     }
 

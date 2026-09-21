@@ -101,18 +101,24 @@ class StartAttemptArchiveTest {
         assertEquals(f.pending, f.open().readPending())
     }
 
-    @Test fun unknownDeviceTimeAndUnpreservedOldRecordRemainProtected() {
-        for (unixMs in listOf(0L, epoch)) {
+    @Test fun unchangedUnknownTimeBaselineCanBeAuditedButKnownUnpreservedDataStaysProtected() {
+        fun scenario(unixMs: Long): Triple<FreeLivingSessionStore, FreeLivingSession, HealthRecordObservation> {
             val journal = File(temporary.newFolder(), "session.json")
             val store = open(journal)
             val baseline = DeviceStartBaseline(stopped, listOf(record.copy(unixMs = unixMs)), epoch)
             val pending = store.requestStart(profile, epoch + 1, "UTC", baseline)
-            val observed = HealthRecordObservation(profile.ring!!.address, 2, stopped, epoch + 2, baseline.records)
-            assertThrows(IllegalArgumentException::class.java) {
-                store.archiveStartAttempt(pending.sessionId, observed, epoch + 3, reason)
-            }
-            assertEquals(pending, store.readPending())
+            return Triple(store, pending,
+                HealthRecordObservation(profile.ring!!.address, 2, stopped, epoch + 2, baseline.records))
         }
+        val (unknownStore, unknownPending, unknownObservation) = scenario(0L)
+        unknownStore.archiveStartAttempt(unknownPending.sessionId, unknownObservation, epoch + 3, reason)
+        assertNull(unknownStore.readPending())
+
+        val (knownStore, knownPending, knownObservation) = scenario(epoch)
+        assertThrows(IllegalArgumentException::class.java) {
+            knownStore.archiveStartAttempt(knownPending.sessionId, knownObservation, epoch + 3, reason)
+        }
+        assertEquals(knownPending, knownStore.readPending())
     }
 
     @Test fun failedAtomicCommitRetainsTheOriginalRequestAndCanBeRetried() {
@@ -150,6 +156,8 @@ class StartAttemptArchiveTest {
         (listOf(envelope.getAsJsonObject("session")) + envelope.getAsJsonArray("archived_sessions").map { it.asJsonObject })
             .forEach {
                 it.remove("completion_policy"); it.remove("discarded"); it.remove("start_abort")
+                it.remove("reference_revisions"); it.remove("start_command_dispatch")
+                it.remove("stop_observed_at_ms"); it.remove("stop_origin"); it.remove("stop_command_dispatch")
                 it.get("start_baseline").takeUnless { value -> value.isJsonNull }?.asJsonObject?.let { baseline ->
                     baseline.remove("charging_recovery_evidence"); baseline.remove("unknown_time_start_evidence")
                 }
@@ -161,8 +169,11 @@ class StartAttemptArchiveTest {
         f.journal.writeText(envelope.toString())
         assertEquals(f.pending, f.open().readPending())
         f.archive()
-        assertEquals(9, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
-        assertEquals(manifest, f.open().manifestSnapshot(f.saved.sessionId))
+        assertEquals(12, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
+        val expected = manifest.deepCopy().apply {
+            addProperty("stop_origin", StopOrigin.LEGACY_UNSPECIFIED.wireValue)
+        }
+        assertEquals(expected, f.open().manifestSnapshot(f.saved.sessionId))
     }
 
     private inner class Fixture(invalidCrc: Boolean = false) {

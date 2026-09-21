@@ -41,7 +41,10 @@ class ChargingStartCompatibilityTest {
         f.observe(active, listOf(record), reason = 0)
         assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
         f.coordinator.requestStop()
-        f.advance(6500) // STOP allows the firmware's five-second Flash finalization window.
+        f.advance(2_000)
+        f.observe(active.copy(collecting = false), listOf(record), reason = 0)
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        f.advance(7_000) // The five-second Flash window starts at the first stopped reply.
         f.observe(active.copy(collecting = false), listOf(record), reason = 0)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
         assertNotNull(f.store.readPending()!!.stopConfirmedAtMs)

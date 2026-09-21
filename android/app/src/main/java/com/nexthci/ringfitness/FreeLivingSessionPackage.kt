@@ -18,6 +18,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
+import java.time.Instant
 import java.util.UUID
 import java.util.zip.CRC32
 import java.util.zip.CheckedInputStream
@@ -37,6 +38,7 @@ class FreeLivingSessionPackage internal constructor(
     private val store: FreeLivingSessionStore,
     private val syncDirectory: (File) -> Unit,
     private val commitDirectory: (File, File) -> Unit,
+    private val now: () -> Instant = { Instant.now() },
 ) {
     constructor(directory: File, store: FreeLivingSessionStore) : this(
         directory, store,
@@ -54,10 +56,19 @@ class FreeLivingSessionPackage internal constructor(
     fun freeze(session: FreeLivingSession): FrozenSessionPackage = synchronized(lock) {
         require(UUID.fromString(session.sessionId).toString() == session.sessionId) { "采集段标识无效" }
         require(directory.isDirectory) { "采集目录尚未就绪" }
-        val initial = snapshot(session.sessionId)
         ensureDirectory(packages, directory)
         val target = child(packages, session.sessionId)
-        if (target.exists()) return@synchronized verifyFrozen(target, session.sessionId, initial)
+        // For an existing provenance package, its persisted timestamp is part of the immutable
+        // research snapshot. A new package receives the time of this first freeze attempt.
+        val savedManifest = if (target.exists()) runCatching { readJson(child(target, SNAPSHOT)) }.getOrNull() else null
+        val packageCreatedAt = savedManifest?.get("created_at")?.takeUnless { it.isJsonNull }?.asString
+            ?.let(Instant::parse) ?: now()
+        val initial = snapshot(session.sessionId, packageCreatedAt)
+        if (target.exists()) {
+            val savedVersion = savedManifest?.get("version")?.asInt
+            val expected = snapshotForVersion(initial, requireNotNull(savedVersion) { "冻结上传包缺少版本" })
+            return@synchronized verifyFrozen(target, session.sessionId, expected)
+        }
 
         val staging = Files.createTempDirectory(packages.toPath(), ".${session.sessionId}-").toFile()
         try {
@@ -65,7 +76,7 @@ class FreeLivingSessionPackage internal constructor(
             writeArchive(archive, initial)
             val frozen = FrozenSessionPackage(archive, digest(archive), archive.length(), session.sessionId)
             // A file or metadata change during packaging must not become a frozen snapshot.
-            val latest = snapshot(session.sessionId)
+            val latest = snapshot(session.sessionId, packageCreatedAt)
             require(latest.manifest == initial.manifest) { "采集信息发生变化，上传包未冻结" }
             verifyZip(archive, initial)
             writeSynced(child(staging, SNAPSHOT), initial.manifest.toString().toByteArray(Charsets.UTF_8))
@@ -91,8 +102,43 @@ class FreeLivingSessionPackage internal constructor(
         }
     }
 
-    private fun snapshot(sessionId: String): Snapshot {
-        val manifest = store.manifestSnapshot(sessionId)
+    /** Removes an unpublished snapshot before a local reference correction is committed. */
+    fun invalidateUnpublished(sessionId: String): Boolean = synchronized(lock) {
+        require(UUID.fromString(sessionId).toString() == sessionId) { "采集段标识无效" }
+        val session = requireNotNull(store.read(sessionId)) { "采集段不匹配" }
+        require(session.completionPolicy in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.SAVE_UPLOAD) &&
+            session.transfer.status == SessionTransferStatus.PENDING && session.transfer.attempts == 0 &&
+            session.transfer.receipt == null) { "本段已确认上传，原上传包保持不变" }
+        if (!packages.exists()) return@synchronized false
+        require(packages.isDirectory)
+        val target = child(packages, sessionId)
+        if (!target.exists()) return@synchronized false
+        val savedManifest = readJson(child(target, SNAPSHOT))
+        val savedVersion = savedManifest.get("version")?.asInt ?: throw IOException("冻结上传包缺少版本")
+        val createdAt = if (savedVersion >= 6) {
+            savedManifest.get("created_at")?.takeUnless { it.isJsonNull }?.asString?.let(Instant::parse)
+                ?: throw IOException("冻结上传包缺少创建时间")
+        } else {
+            Instant.ofEpochMilli(session.startRequestedAtMs)
+        }
+        verifyFrozen(target, sessionId, snapshotForVersion(snapshot(sessionId, createdAt), savedVersion))
+        val obsolete = child(packages, ".obsolete-$sessionId-${UUID.randomUUID()}")
+        Files.move(target.toPath(), obsolete.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        syncDirectory(packages)
+        listOf(archiveName(sessionId), SNAPSHOT, METADATA).forEach { child(obsolete, it).delete() }
+        obsolete.delete()
+        true
+    }
+
+    /** Keeps package invalidation and the replacement reference atomic with upload publication. */
+    fun reviseUnpublishedReference(sessionId: String, reference: SessionReference): FreeLivingSession =
+        synchronized(lock) {
+            invalidateUnpublished(sessionId)
+            store.reviseReferenceBeforeUpload(sessionId, reference)
+        }
+
+    private fun snapshot(sessionId: String, packageCreatedAt: Instant): Snapshot {
+        val manifest = store.manifestSnapshot(sessionId, packageCreatedAt)
         val rawEntries = manifest.getAsJsonArray("files").map { item ->
             val entry = item.asJsonObject.deepCopy()
             val name = entry.get("file_name").asString
@@ -138,6 +184,35 @@ class FreeLivingSessionPackage internal constructor(
         }.sortedBy { it.file.name }
         manifest.add("files", JsonArray().apply { entries.forEach { add(it.manifest) } })
         return Snapshot(manifest, entries)
+    }
+
+    private fun legacySnapshot(current: Snapshot): Snapshot {
+        val manifest = current.manifest.deepCopy().apply {
+            listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at",
+                "stop_origin", "stop_observed_at_ms").forEach(::remove)
+            val baseline = getAsJsonObject("start_baseline")
+            val version = when {
+                baseline?.get("unknown_time_start_evidence")?.isJsonNull == false -> 5
+                get("activity_schema")?.asString == "daily_activity_v3" -> 4
+                baseline?.get("charging_recovery_evidence")?.isJsonNull == false -> 3
+                else -> 2
+            }
+            addProperty("version", version)
+        }
+        return Snapshot(manifest, current.entries)
+    }
+
+    private fun snapshotForVersion(current: Snapshot, version: Int): Snapshot = when (version) {
+        in 2..5 -> legacySnapshot(current).also {
+            require(it.manifest.get("version").asInt == version) { "冻结上传包版本与采集证据不一致" }
+        }
+        6 -> Snapshot(current.manifest.deepCopy().apply {
+            addProperty("version", 6)
+            remove("stop_origin")
+            remove("stop_observed_at_ms")
+        }, current.entries)
+        7 -> current
+        else -> throw IOException("冻结上传包版本不受支持")
     }
 
     private fun writeArchive(archive: File, snapshot: Snapshot) {
@@ -267,6 +342,7 @@ class FreeLivingSessionPackage internal constructor(
 
     companion object {
         private val lock = Any()
+        internal fun <T> withPublicationLock(action: () -> T): T = synchronized(lock, action)
         private const val SNAPSHOT = "manifest.snapshot.json"
         private const val METADATA = "package.json"
         private const val MAX_METADATA_BYTES = 2L * 1024 * 1024

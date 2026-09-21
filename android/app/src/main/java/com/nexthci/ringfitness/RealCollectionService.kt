@@ -121,6 +121,9 @@ class RealCollectionService : Service() {
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
                     }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
                     syncClockBeforeStart = true, uploads = object : RealUploadPort {
+                        override val available: Boolean = runCatching {
+                            SeafileSessionTransport.validateLink(BuildConfig.ACTIVITY_UPLOAD_LINK.trim())
+                        }.isSuccess
                         override fun enqueue(sessionId: String, retry: Boolean) {
                             RealUploadScheduler.enqueue(applicationContext, sessionId, retry)
                         }
@@ -152,7 +155,7 @@ class RealCollectionService : Service() {
                 Log.e(TAG, "Cannot initialize collection owner", error)
                 main.post {
                     if (!destroyed) {
-                        RealCollectionBridge.fail("采集准备无法读取，请联系研究者")
+                        RealCollectionBridge.fail("准备信息无法读取，请检查身份与戒指设置")
                         stopSelf()
                     }
                 }
@@ -369,6 +372,9 @@ object RealCollectionBridge : CollectionFlow {
     override fun selectActivity(activity: SessionActivity) { dispatch?.invoke { it.selectActivity(activity) } }
     override fun stop() { dispatch?.invoke { it.stop() } }
     override fun chooseFinish(uploadNow: Boolean) { dispatch?.invoke { it.chooseFinish(uploadNow) } }
+    override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) {
+        dispatch?.invoke { it.finalizeSession(uploadNow, stepsText, status, reason) }
+    }
     override fun enterFinish() { dispatch?.invoke { it.enterFinish() } }
     override fun discardSession() { dispatch?.invoke { it.discardSession() } }
     override fun enterReference() { dispatch?.invoke { it.enterReference() } }
@@ -376,6 +382,9 @@ object RealCollectionBridge : CollectionFlow {
     override fun retry() { dispatch?.invoke { it.retry() } }
     override fun endStartAttempt(reason: String) { dispatch?.invoke { it.endStartAttempt(reason) } }
     override fun retryUpload(sessionId: String) { dispatch?.invoke { it.retryUpload(sessionId) } }
+    override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) {
+        dispatch?.invoke { it.reviseReference(sessionId, stepsText, status, reason) }
+    }
     override fun home() { dispatch?.invoke { it.home() } }
     override fun setFault(fault: FlowTestFault) = Unit
     override fun disconnect() = Unit

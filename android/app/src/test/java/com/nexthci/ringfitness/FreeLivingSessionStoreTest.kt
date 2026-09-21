@@ -5,6 +5,7 @@ import com.google.gson.JsonParser
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
@@ -44,6 +45,23 @@ class FreeLivingSessionStoreTest {
         assertNull(s.deviceSessionId)
         assertNull(s.startedAtMs)
         assertNull(s.endedAtMs)
+    }
+
+    @Test fun localDisplayIdentityCannotChangeTheDurableStartRequest() {
+        val file = file()
+        val localProfile = preparation.copy(
+            participantId = "local0123456789abcdef",
+            displayLabel = "Alice",
+            identityType = PreparationIdentityType.LOCAL_NAME,
+        )
+
+        val requested = openStore(file).requestStart(localProfile, t, "UTC")
+
+        assertEquals(localProfile.participantId, requested.preparation.participantId)
+        assertEquals(localProfile.participantId, requested.preparation.displayLabel)
+        assertEquals(PreparationIdentityType.RESEARCH_ID, requested.preparation.identityType)
+        assertEquals(requested, openStore(file).read())
+        assertEquals(requested, openStore(file).requestStart(localProfile, t + 100, "UTC"))
     }
 
     @Test fun everyPhaseSurvivesOpeningANewStoreInstance() {
@@ -117,6 +135,84 @@ class FreeLivingSessionStoreTest {
         assertEquals(ended, store.confirmStop(first.sessionId, address, status(false), t + 1_400, boundary(t + 1_200)))
         assertEquals(ended, store.requestStop(first.sessionId, t + 1_500))
         assertEquals(ended, store.confirmStart(first.sessionId, address, status(true), t + 1_600))
+    }
+
+    @Test fun cancellingALocallyRejectedStopRestoresTheExactCollectingSession() {
+        val file = file()
+        val store = openStore(file)
+        val collecting = start(store)
+        store.requestStop(collecting.sessionId, t + 1_000)
+
+        val restored = store.cancelStopRequest(collecting.sessionId)
+
+        assertEquals(collecting, restored)
+        assertEquals(FreeLivingSessionPhase.COLLECTING, restored.phase)
+        assertNull(restored.stopRequestedAtMs)
+        assertEquals(restored, openStore(file).read())
+    }
+
+    @Test fun startCommandOutboxSurvivesReopenAndDistinguishesPreparedFromAccepted() {
+        val file = file()
+        val store = openStore(file)
+        val baseline = DeviceStartBaseline(HealthMessage.Status(false, 0, 0, 0, 9), emptyList(), t)
+        val requested = store.requestStart(preparation, t, "UTC", baseline)
+
+        val prepared = store.prepareStartCommand(requested.sessionId, t + 10)
+        assertEquals(StartCommandDispatch(t + 10,
+            ownerId = "00000000-0000-0000-0000-000000000000", connectionGeneration = 1),
+            prepared.startCommandDispatch)
+        assertEquals(prepared, openStore(file).read())
+
+        val accepted = store.confirmStartCommandAccepted(requested.sessionId, t + 20)
+        assertEquals(StartCommandDispatch(t + 10, t + 20,
+            "00000000-0000-0000-0000-000000000000", 1), accepted.startCommandDispatch)
+        assertEquals(accepted, openStore(file).read())
+        assertThrows(IllegalArgumentException::class.java) {
+            store.cancelPreparedStartCommand(requested.sessionId)
+        }
+        assertEquals(accepted, openStore(file).read())
+    }
+
+    @Test fun observedDeviceStopAtomicallyEntersRecoverableFinalization() {
+        val file = file()
+        val store = openStore(file)
+        val baseline = DeviceStartBaseline(HealthMessage.Status(false, 0, 0, 0, 9), emptyList(), t)
+        val requested = store.requestStart(preparation, t, "UTC", baseline)
+        val collectingStatus = status(true)
+        val firstRecord = HealthMessage.ListItem(41, 1_024, 12, 12_345, t)
+        val collecting = store.confirmStart(requested.sessionId, address, collectingStatus, t + 100,
+            recordEvidence = DeviceRecordEvidence(firstRecord, collectingStatus, t + 100))
+        val stoppedStatus = status(false).copy(bytes = 1_200, records = 14)
+        val finalRecord = firstRecord.copy(bytes = 1_200, records = 14)
+
+        val finalizing = store.beginObservedStopFinalization(collecting.sessionId, t + 200,
+            DeviceRecordEvidence(finalRecord, stoppedStatus, t + 200))
+
+        assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, finalizing.phase)
+        assertNull(finalizing.stopRequestedAtMs)
+        assertEquals(t + 200, finalizing.stopObservedAtMs)
+        assertEquals(StopOrigin.DEVICE_OBSERVED, finalizing.stopOrigin)
+        assertNull(finalizing.stopConfirmedAtMs)
+        assertEquals(finalRecord, finalizing.deviceRecordEvidence!!.record)
+        assertEquals(finalizing, openStore(file).read())
+    }
+
+    @Test fun aRecoveredUnsentStopMovesItsOutboxToTheProvedConnection() {
+        val file = file()
+        val store = openStore(file)
+        val collecting = start(store)
+        val requested = store.requestStop(collecting.sessionId, t + 1_000)
+        val original = requireNotNull(requested.stopCommandDispatch)
+        val recoveringOwner = "11111111-1111-1111-1111-111111111111"
+
+        val recovered = store.prepareRecoveredStopCommand(collecting.sessionId, t + 2_000,
+            recoveringOwner, 9)
+
+        assertEquals(t + 1_000, recovered.stopRequestedAtMs)
+        assertEquals(StopCommandDispatch(t + 2_000, ownerId = recoveringOwner,
+            connectionGeneration = 9), recovered.stopCommandDispatch)
+        assertNotEquals(original, recovered.stopCommandDispatch)
+        assertEquals(recovered, openStore(file).read())
     }
 
     @Test fun stoppedOrStoppingDataBlocksANewSessionUntilFutureSafeDownloadFlow() {
@@ -402,7 +498,7 @@ class FreeLivingSessionStoreTest {
         assertEquals(requested, reopened)
         assertEquals(-16, reopened.startBaseline!!.status.errorCode)
         assertEquals(baseline.chargingRecoveryEvidence, reopened.startBaseline.chargingRecoveryEvidence)
-        assertEquals(9, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
 
         assertThrows(IllegalArgumentException::class.java) {
             openStore(file).confirmStart(requested.sessionId, address, status(true).copy(errorCode = -16), t + 100)
@@ -467,13 +563,15 @@ class FreeLivingSessionStoreTest {
         file.writeText(envelope.toString())
         editPayloadWithUpdatedDigest(file) {
             it.remove("completion_policy"); it.remove("discarded"); it.remove("start_abort")
+            it.remove("reference_revisions"); it.remove("start_command_dispatch")
+            it.remove("stop_observed_at_ms"); it.remove("stop_origin"); it.remove("stop_command_dispatch")
             it.getAsJsonObject("start_baseline").remove("charging_recovery_evidence")
             it.getAsJsonObject("start_baseline").remove("unknown_time_start_evidence")
         }
         assertEquals(requested, openStore(file).read())
         openStore(file).confirmStart(requested.sessionId, address, status(true), t + 100)
         val migrated = JsonParser.parseString(file.readText()).asJsonObject
-        assertEquals(9, migrated["journal_version"].asInt)
+        assertEquals(12, migrated["journal_version"].asInt)
         assertTrue(migrated.getAsJsonObject("session").getAsJsonObject("start_baseline")["charging_recovery_evidence"].isJsonNull)
         assertNull(openStore(file).read()!!.startBaseline!!.chargingRecoveryEvidence)
     }
@@ -521,7 +619,7 @@ class FreeLivingSessionStoreTest {
             assertEquals(SessionActivity.FREE_LIVING, openStore(file).read()!!.activity)
             assertArrayEquals(oldBytes, file.readBytes())
             store.confirmStart(requested.sessionId, address, status(true), t + 100)
-            assertEquals(9, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+            assertEquals(12, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
             val migrated = openStore(file).read()!!
             assertEquals(SessionActivity.FREE_LIVING, migrated.activity)
             val payload = JsonParser.parseString(file.readText()).asJsonObject.getAsJsonObject("session")
@@ -583,6 +681,17 @@ class FreeLivingSessionStoreTest {
         file.writeText(envelope.toString())
         editPayloadWithUpdatedDigest(file) { payload ->
             payload.remove("completion_policy"); payload.remove("discarded"); payload.remove("start_abort")
+            if (version < 10) payload.remove("reference_revisions")
+            if (version < 11) payload.remove("start_command_dispatch")
+            if (version < 12) {
+                payload.remove("stop_observed_at_ms")
+                payload.remove("stop_origin")
+                payload.remove("stop_command_dispatch")
+                payload.get("start_command_dispatch")?.takeIf { it.isJsonObject }?.asJsonObject?.let {
+                    it.remove("owner_id")
+                    it.remove("connection_generation")
+                }
+            }
             payload.get("start_baseline")?.takeIf { it.isJsonObject }?.asJsonObject?.remove("unknown_time_start_evidence")
             payload.get("start_attempt_archive")?.takeIf { it.isJsonObject }?.asJsonObject?.remove("unknown_preservation")
             if (version < 2) listOf("reference_saved_at_ms", "ground_truth_reason", "raw_files", "transfer").forEach(payload::remove)

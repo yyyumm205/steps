@@ -189,7 +189,10 @@ class SessionCompletionPolicyTest {
         val before = f.store.manifestSnapshot(f.id)
         f.downgradeJournal()
         assertEquals(CompletionPolicy.SAVE_UPLOAD, f.reopen().read()!!.completionPolicy)
-        assertEquals(before, f.reopen().manifestSnapshot(f.id))
+        val expected = before.deepCopy().apply {
+            addProperty("stop_origin", StopOrigin.LEGACY_UNSPECIFIED.wireValue)
+        }
+        assertEquals(expected, f.reopen().manifestSnapshot(f.id))
     }
 
     @Test fun legacyPendingStopWithMissingReferenceRemainsRecoverable() {
@@ -238,7 +241,8 @@ class SessionCompletionPolicyTest {
         fun queue(onUpload: () -> Unit = {}) = RealUploadQueue(directory, reopen(), freeze = { session ->
             val archive = File(directory, "fixture-${session.sessionId}.zip").apply { writeText("fixture archive") }
             FrozenSessionPackage(archive, hash(archive.readBytes()), archive.length(), session.sessionId)
-        }, transport = SessionUploadTransport { _, archive, _ ->
+        }, transport = SessionUploadTransport { _, archive, _, onDispatch ->
+            onDispatch()
             requests++; onUpload()
             RemoteSessionReceipt(archive.name, "a".repeat(40), archive.length())
         }, now = { time + 10 }, sync = {})
@@ -247,6 +251,8 @@ class SessionCompletionPolicyTest {
             val envelope = JsonParser.parseString(journal.readText()).asJsonObject
             val session = envelope.getAsJsonObject("session")
             session.remove("completion_policy"); session.remove("discarded"); session.remove("start_abort")
+            session.remove("reference_revisions"); session.remove("start_command_dispatch")
+            session.remove("stop_observed_at_ms"); session.remove("stop_origin"); session.remove("stop_command_dispatch")
             session.getAsJsonObject("start_baseline")?.remove("unknown_time_start_evidence")
             envelope.addProperty("journal_version", 6)
             val payload = JsonObject().apply {

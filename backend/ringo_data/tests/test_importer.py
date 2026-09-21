@@ -118,7 +118,7 @@ def test_real_zero_saved_once_and_unknown_clock_never_becomes_1970(tmp_path):
     assert quality["files"][0]["normalization_applied"] is False
 
 
-@pytest.mark.parametrize("status,steps", [("missing", None), ("unreliable", None), ("unreliable", 0),
+@pytest.mark.parametrize("status,steps", [("missing", None), ("unreliable", 0),
                                           ("unreliable", 562), ("valid", (1 << 63) - 1)])
 def test_reference_states_preserve_null_zero_and_full_integer_range(tmp_path, status, steps):
     def change(m, _):
@@ -131,6 +131,16 @@ def test_reference_states_preserve_null_zero_and_full_integer_range(tmp_path, st
     row = read_rows(Path(result.directory) / "reference.csv")[0]
     assert row["ground_truth_steps"] == ("" if steps is None else str(steps))
     assert row["ground_truth_status"] == status
+
+
+def test_unreliable_reference_requires_a_numeric_reading(tmp_path):
+    def change(m, _):
+        m.update(ground_truth_status="unreliable", ground_truth_steps=None,
+                 ground_truth_recorded_at_ms=None, ground_truth_reason="Reading uncertain")
+    source = tmp_path / "input.zip"
+    archive_at(source, mutate=change)
+    with pytest.raises(ArchiveRejected):
+        import_archive(source, tmp_path / "out")
 
 
 @pytest.mark.parametrize("key,value", [

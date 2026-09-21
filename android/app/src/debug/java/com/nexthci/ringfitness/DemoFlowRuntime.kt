@@ -56,12 +56,18 @@ object DemoFlowRuntime {
             override fun selectActivity(activity: SessionActivity) { executor.execute { controller.selectActivity(activity) } }
             override fun stop() { executor.execute { controller.stop() } }
             override fun chooseFinish(uploadNow: Boolean) { executor.execute { controller.chooseFinish(uploadNow) } }
+            override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) {
+                executor.execute { controller.finalizeSession(uploadNow, stepsText, status, reason) }
+            }
             override fun enterFinish() { executor.execute { controller.enterFinish() } }
             override fun discardSession() { executor.execute { controller.discardSession() } }
             override fun enterReference() { executor.execute { controller.enterReference() } }
             override fun saveReference(stepsText: String, status: String, reason: String) { executor.execute { controller.saveReference(stepsText, status, reason) } }
             override fun retry() { executor.execute { controller.retry() } }
             override fun retryUpload(sessionId: String) { executor.execute { controller.retryUpload(sessionId) } }
+            override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) {
+                executor.execute { controller.reviseReference(sessionId, stepsText, status, reason) }
+            }
             override fun home() { executor.execute { controller.home() } }
             override fun setFault(fault: FlowTestFault) { executor.execute { controller.setFault(fault) } }
             override fun disconnect() { executor.execute { controller.disconnect() } }

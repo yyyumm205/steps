@@ -48,6 +48,12 @@ data class SessionReference(
     val groundTruthRecordedAtMs: Long? get() = recordedAtMs.takeIf { steps != null }
 }
 
+/** Local audit retained when a participant corrects a reference before confirming upload. */
+data class SessionReferenceRevision(
+    val previous: SessionReference,
+    val replacedAtMs: Long,
+)
+
 data class SessionRawFile(
     val fileName: String,
     val deviceSessionId: Int,
@@ -64,6 +70,12 @@ enum class SessionTransferStatus(val wireValue: String) {
 
 enum class CompletionPolicy(val wireValue: String) {
     SAVE_UPLOAD("save_upload"), SAVE_LATER("save_later"),
+}
+
+enum class StopOrigin(val wireValue: String) {
+    USER_REQUEST("user_request"),
+    DEVICE_OBSERVED("device_observed"),
+    LEGACY_UNSPECIFIED("legacy_unspecified"),
 }
 
 /** Local cancellation audit. Ring flash remains untouched. */
@@ -103,6 +115,25 @@ data class DeviceStartBaseline(
     val unknownTimeStartEvidence: UnknownTimeStartEvidence? = null,
 )
 
+/**
+ * Durable outbox evidence for the START side effect. Preparation is persisted before calling BLE,
+ * so a process death cannot make a possibly queued command look like an untouched request.
+ */
+data class StartCommandDispatch(
+    val preparedAtMs: Long,
+    val acceptedAtMs: Long? = null,
+    val ownerId: String? = null,
+    val connectionGeneration: Long? = null,
+)
+
+/** Durable outbox evidence for STOP. Device confirmation remains in stopConfirmedAtMs. */
+data class StopCommandDispatch(
+    val preparedAtMs: Long,
+    val acceptedAtMs: Long? = null,
+    val ownerId: String? = null,
+    val connectionGeneration: Long? = null,
+)
+
 /** Durable association established by a complete STATUS/LIST round on the issuing connection. */
 data class DeviceRecordEvidence(
     val record: HealthMessage.ListItem,
@@ -127,6 +158,8 @@ data class FreeLivingSession(
     val startRequestedAtMs: Long,
     val startConfirmedAtMs: Long? = null,
     val stopRequestedAtMs: Long? = null,
+    val stopObservedAtMs: Long? = null,
+    val stopOrigin: StopOrigin? = null,
     val stopConfirmedAtMs: Long? = null,
     val startStatusEvidence: HealthMessage.Status? = null,
     val stopStatusEvidence: HealthMessage.Status? = null,
@@ -143,6 +176,9 @@ data class FreeLivingSession(
     val completionPolicy: CompletionPolicy? = null,
     val discarded: SessionDiscard? = null,
     val startAbort: UnconfirmedStartAbort? = null,
+    val referenceRevisions: List<SessionReferenceRevision> = emptyList(),
+    val startCommandDispatch: StartCommandDispatch? = null,
+    val stopCommandDispatch: StopCommandDispatch? = null,
 ) {
     val isDiscarded: Boolean get() = discarded != null
     val isPending: Boolean get() = localData == null && startAttemptArchive == null && !isDiscarded && startAbort?.completedAtMs == null
@@ -156,10 +192,12 @@ data class FreeLivingSession(
     val captureBoundaryStatus: String get() =
         if (startedAtMs != null && endedAtMs != null) "confirmed" else "uncertain"
     val timingWarnings: List<String> get() = buildList {
-        val phoneTimes = listOfNotNull(startRequestedAtMs, startConfirmedAtMs, stopRequestedAtMs, stopConfirmedAtMs)
+        val phoneTimes = listOfNotNull(startRequestedAtMs, startConfirmedAtMs,
+            stopRequestedAtMs ?: stopObservedAtMs, stopConfirmedAtMs)
         // An anomalous observation may precede a delayed stop confirmation. Compare only the
         // causal dependencies, so recovery does not turn that valid order into a clock warning.
-        val referenceEarliest = if (reference?.status == ReferenceStatus.VALID) stopConfirmedAtMs else stopRequestedAtMs
+        val referenceEarliest = if (reference?.status == ReferenceStatus.VALID) stopConfirmedAtMs
+            else stopRequestedAtMs ?: stopObservedAtMs
         val referenceWentBack = reference?.recordedAtMs?.let { recorded -> referenceEarliest?.let { recorded < it } } == true
         val downloadWentBack = localData?.completedAtMs?.let { completed ->
             listOfNotNull(stopConfirmedAtMs, reference?.recordedAtMs).any { completed < it }
@@ -215,6 +253,34 @@ class FreeLivingSessionStore internal constructor(
             }
             current.copy(completionPolicy = policy)
         }
+
+    /**
+     * Persists the participant's completion choice and reference observation in one journal commit.
+     * A retry after an uncertain commit keeps the first timestamp and cannot replace either value.
+     */
+    fun finalizeStoppedSession(sessionId: String, policy: CompletionPolicy,
+        reference: SessionReference): FreeLivingSession = update(sessionId) { current ->
+        validateReference(reference)
+        require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.stopConfirmedAtMs != null) {
+            "请等待戒指确认结束"
+        }
+        require(current.localData == null) { "本段已经完成本地保存" }
+        require(current.transfer.attempts == 0 && current.transfer.status == SessionTransferStatus.PENDING) {
+            "本段已开始上传，保留当前上传任务"
+        }
+        current.completionPolicy?.let { saved ->
+            require(saved == policy) { "本段保存方式已确认" }
+        }
+        current.reference?.let { saved ->
+            require(saved.status == reference.status && saved.steps == reference.steps && saved.reason == reference.reason) {
+                "本次读数已保存，请核对原记录"
+            }
+        }
+        current.copy(
+            completionPolicy = current.completionPolicy ?: policy,
+            reference = current.reference ?: reference,
+        )
+    }
 
     /** Explicit user action releases a durable save-for-later choice. */
     fun allowUpload(sessionId: String): FreeLivingSession = update(sessionId, allowArchived = true) { current ->
@@ -292,7 +358,7 @@ class FreeLivingSessionStore internal constructor(
         }
 
     /** Immutable research metadata; transport attempts and receipts never enter an upload package. */
-    fun manifestSnapshot(sessionId: String): JsonObject = synchronized(processLock) {
+    fun manifestSnapshot(sessionId: String, packageCreatedAt: Instant? = null): JsonObject = synchronized(processLock) {
         val journal = checkNotNull(readJournalLocked()) { "没有可打包的采集段" }
         val session = (journal.archived + journal.current).singleOrNull { it.sessionId == sessionId }
             ?: throw IllegalArgumentException("采集段不匹配")
@@ -313,15 +379,19 @@ class FreeLivingSessionStore internal constructor(
             }
             if (session.activity != SessionActivity.FREE_LIVING) addActivity(session.activity)
             if (unknownTime != null) getAsJsonObject("start_baseline").add("unknown_time_start_evidence", unknownTime.encode())
-            addProperty("version", when {
-                unknownTime != null -> 5
-                session.activity != SessionActivity.FREE_LIVING -> 4
-                chargingRecovery != null -> 3
-                else -> 2
-            })
+            addProperty("version", 7)
             addProperty("step_schema_version", 1)
             addProperty("rfbin_version", 2)
             addProperty("simulated", false)
+            addProperty("ring_placement_schema", RingPlacement.SCHEMA)
+            addProperty("ring_hand", session.preparation.placement!!.hand)
+            addProperty("ring_finger", session.preparation.placement.finger)
+            addProperty("app_version", BuildConfig.VERSION_NAME)
+            addProperty("stop_origin", requireNotNull(session.stopOrigin).wireValue)
+            addNullable("stop_observed_at_ms", session.stopObservedAtMs)
+            // The package owner supplies the first freeze time. The fallback keeps direct
+            // diagnostic snapshots deterministic without changing any already frozen package.
+            addProperty("created_at", (packageCreatedAt ?: Instant.ofEpochMilli(session.startRequestedAtMs)).toString())
             add("files", JsonArray().apply {
                 local.files.sortedBy { it.fileName }.forEach { file ->
                     add(encodeFile(file).apply { addProperty("role", "raw") })
@@ -334,12 +404,20 @@ class FreeLivingSessionStore internal constructor(
         baseline: DeviceStartBaseline? = null, activity: SessionActivity = SessionActivity.FREE_LIVING): FreeLivingSession =
         synchronized(processLock) {
             validatePreparation(preparation)
+            // A session freezes research identity and device fields. Local display metadata stays
+            // in PreparationStore, so the object returned here must match its durable journal form.
+            val sessionPreparation = PreparationSnapshot(
+                participantId = preparation.participantId,
+                installationId = preparation.installationId,
+                placement = preparation.placement,
+                ring = preparation.ring,
+            )
             require(requestedAtMs > 0) { "开始请求时间无效" }
             val zone = ZoneId.of(timeZoneId)
             val journal = readJournalLocked()
             val existing = journal?.current
             if (existing != null && existing.isPending) {
-                require(existing.preparation == preparation) { "已有采集段的编号、位置或戒指不能更改" }
+                require(existing.preparation == sessionPreparation) { "已有采集段的编号、位置或戒指不能更改" }
                 require(existing.activity == activity) { "已有采集段的活动类型不能更改" }
                 require(existing.phase == FreeLivingSessionPhase.START_REQUESTED ||
                     existing.phase == FreeLivingSessionPhase.COLLECTING) { "上一段原始数据尚未安全保存，暂不能开始新采集" }
@@ -347,7 +425,7 @@ class FreeLivingSessionStore internal constructor(
             }
             existing?.takeUnless { it.isDiscarded }?.localData?.let { verifyLocalFiles(existing, it.files) }
             persist(FreeLivingSession(
-                sessionId = UUID.randomUUID().toString(), preparation = preparation,
+                sessionId = UUID.randomUUID().toString(), preparation = sessionPreparation,
                 phase = FreeLivingSessionPhase.START_REQUESTED,
                 timeZoneId = zone.id,
                 utcOffsetSeconds = zone.rules.getOffset(Instant.ofEpochMilli(requestedAtMs)).totalSeconds,
@@ -356,6 +434,43 @@ class FreeLivingSessionStore internal constructor(
                 activity = activity,
             ), if (journal == null) emptyList() else journal.archived + journal.current)
         }
+
+    /** Persist before invoking BLE: after this point START may have reached the device. */
+    fun prepareStartCommand(
+        sessionId: String,
+        preparedAtMs: Long,
+        ownerId: String = LEGACY_COMMAND_OWNER_ID,
+        connectionGeneration: Long = 1L,
+    ): FreeLivingSession = update(sessionId) { current ->
+        require(preparedAtMs > 0) { "开始命令准备时间无效" }
+        require(UUID.fromString(ownerId).toString() == ownerId && connectionGeneration > 0) { "开始命令连接证据无效" }
+        require(current.phase == FreeLivingSessionPhase.START_REQUESTED && current.startConfirmedAtMs == null) {
+            "当前阶段不接受开始命令"
+        }
+        current.startCommandDispatch?.let { return@update current }
+        current.copy(startCommandDispatch = StartCommandDispatch(preparedAtMs,
+            ownerId = ownerId, connectionGeneration = connectionGeneration))
+    }
+
+    /** Record local queue acceptance; device execution still requires a STATUS/LIST confirmation. */
+    fun confirmStartCommandAccepted(sessionId: String, acceptedAtMs: Long): FreeLivingSession = update(sessionId) { current ->
+        require(acceptedAtMs > 0) { "开始命令入队时间无效" }
+        require(current.phase == FreeLivingSessionPhase.START_REQUESTED && current.startConfirmedAtMs == null) {
+            "当前阶段不接受开始命令"
+        }
+        val dispatch = requireNotNull(current.startCommandDispatch) { "开始命令尚未准备" }
+        dispatch.acceptedAtMs?.let { return@update current }
+        current.copy(startCommandDispatch = dispatch.copy(acceptedAtMs = acceptedAtMs))
+    }
+
+    /** Local rejection proves START never entered this BLE queue, so the outbox marker can clear. */
+    fun cancelPreparedStartCommand(sessionId: String): FreeLivingSession = update(sessionId) { current ->
+        val dispatch = requireNotNull(current.startCommandDispatch) { "开始命令尚未准备" }
+        require(current.phase == FreeLivingSessionPhase.START_REQUESTED && dispatch.acceptedAtMs == null) {
+            "开始命令已入队，需先查询戒指状态"
+        }
+        current.copy(startCommandDispatch = null)
+    }
 
     /** The coordinator supplies a newly completed STATUS/LIST round after explicit user input. */
     fun archiveStartAttempt(sessionId: String, observation: HealthRecordObservation,
@@ -366,30 +481,33 @@ class FreeLivingSessionStore internal constructor(
         }
         val audit = StartAttemptArchive(archivedAtMs, reason, observation, unknownPreservation)
         validateStartAttemptArchive(current, audit)
-        if (observation.records.isNotEmpty()) {
-            val known = observation.records.filter { it.unixMs > 0 }
-            require(known.isEmpty() || hasPreservedDeviceRecords(observation.address, known)) { "戒指记录尚未完整保存在手机" }
-            val sessions = listSessions()
-            observation.records.forEach { record ->
-                if (record.unixMs == 0L) {
-                    val proof = requireNotNull(unknownPreservation)
-                    val raw = DeviceRecordBackupStore(File(file.parentFile, "device-backups"), syncDirectory)
-                        .verifyUnknown(observation.address, record, proof.backupId)
-                    require(raw.sha256 == proof.rawSha256) { "旧记录保全证据不一致" }
-                    return@forEach
-                }
-                if (isDiscardedDeviceRecord(observation.address, record)) return@forEach
-                val saved = sessions.singleOrNull { it.preparation.ring?.address == observation.address &&
-                    it.deviceRecordEvidence?.record == record && !it.isDiscarded && !it.deviceAssociationInvalidated && it.localData != null }
-                if (saved == null) {
-                    require(DeviceRecordBackupStore(File(file.parentFile, "device-backups"), syncDirectory).isPreserved(observation.address, record))
-                    return@forEach
-                }
+        // An unchanged pre-START baseline is not a new research record. Known-time records
+        // still verify their existing local copy. Unknown-time Flash entries remain in the
+        // audit and do not become a permanent prerequisite for using the ring again.
+        val sessions = listSessions()
+        val knownRecords = observation.records.filter { it.unixMs > 0 }
+        require(knownRecords.isEmpty() || hasPreservedDeviceRecords(observation.address, knownRecords)) {
+            "戒指记录尚未完整保存在手机"
+        }
+        knownRecords.forEach { record ->
+            if (isDiscardedDeviceRecord(observation.address, record)) return@forEach
+            val saved = sessions.singleOrNull { it.preparation.ring?.address == observation.address &&
+                it.deviceRecordEvidence?.record == record && !it.isDiscarded &&
+                !it.deviceAssociationInvalidated && it.localData != null }
+            if (saved == null) {
+                require(DeviceRecordBackupStore(File(file.parentFile, "device-backups"), syncDirectory)
+                    .isPreserved(observation.address, record)) { "戒指记录尚未完整保存在手机" }
+            } else {
                 val raw = requireNotNull(saved.localData).files.singleOrNull()
-                    ?: throw IllegalArgumentException("本次记录需要研究者核对")
+                    ?: throw IllegalArgumentException("本次记录的本地文件需要检查")
                 RealSessionDownload.verifyPreservedContainer(File(file.parentFile, raw.fileName), record,
                     saved.startedAtMs ?: 0L, saved.endedAtMs ?: 0L)
             }
+        }
+        unknownPreservation?.let { proof ->
+            val raw = DeviceRecordBackupStore(File(file.parentFile, "device-backups"), syncDirectory)
+                .verifyUnknown(observation.address, proof.record, proof.backupId)
+            require(raw.sha256 == proof.rawSha256) { "旧记录保全证据不一致" }
         }
         current.copy(startAttemptArchive = audit)
     }
@@ -411,11 +529,100 @@ class FreeLivingSessionStore internal constructor(
             startStatusEvidence = status, startBoundaryEvidence = boundary, deviceRecordEvidence = recordEvidence)
     }
 
-    fun requestStop(sessionId: String, requestedAtMs: Long): FreeLivingSession = update(sessionId) { current ->
+    fun requestStop(
+        sessionId: String,
+        requestedAtMs: Long,
+        ownerId: String = LEGACY_COMMAND_OWNER_ID,
+        connectionGeneration: Long = 1L,
+    ): FreeLivingSession = update(sessionId) { current ->
         require(requestedAtMs > 0) { "停止请求时间无效" }
-        if (current.stopRequestedAtMs != null) return@update current
+        require(UUID.fromString(ownerId).toString() == ownerId && connectionGeneration > 0) { "停止命令连接证据无效" }
+        if (current.stopOrigin != null) return@update current
         require(current.phase == FreeLivingSessionPhase.COLLECTING) { "尚未确认开始采集" }
-        current.copy(phase = FreeLivingSessionPhase.STOP_REQUESTED, stopRequestedAtMs = requestedAtMs)
+        current.copy(
+            phase = FreeLivingSessionPhase.STOP_REQUESTED,
+            stopRequestedAtMs = requestedAtMs,
+            stopOrigin = StopOrigin.USER_REQUEST,
+            stopCommandDispatch = StopCommandDispatch(requestedAtMs,
+                ownerId = ownerId, connectionGeneration = connectionGeneration),
+        )
+    }
+
+    /** Record local queue acceptance; device execution still requires settled STATUS/LIST evidence. */
+    fun confirmStopCommandAccepted(sessionId: String, acceptedAtMs: Long): FreeLivingSession = update(sessionId) { current ->
+        require(acceptedAtMs > 0) { "停止命令入队时间无效" }
+        require(current.phase == FreeLivingSessionPhase.STOP_REQUESTED && current.stopConfirmedAtMs == null &&
+            current.stopOrigin == StopOrigin.USER_REQUEST) { "当前阶段不接受停止命令" }
+        val dispatch = requireNotNull(current.stopCommandDispatch) { "停止命令尚未准备" }
+        dispatch.acceptedAtMs?.let { return@update current }
+        current.copy(stopCommandDispatch = dispatch.copy(acceptedAtMs = acceptedAtMs))
+    }
+
+    /**
+     * A process restart can leave a durable STOP intent that never crossed the BLE boundary.
+     * After a fresh STATUS/LIST round proves the same owned record is still collecting, move the
+     * pending outbox entry to the recovering owner before it performs the single safe retry.
+     */
+    fun prepareRecoveredStopCommand(
+        sessionId: String,
+        preparedAtMs: Long,
+        ownerId: String,
+        connectionGeneration: Long,
+    ): FreeLivingSession = update(sessionId) { current ->
+        require(preparedAtMs > 0 && UUID.fromString(ownerId).toString() == ownerId && connectionGeneration > 0) {
+            "停止命令恢复证据无效"
+        }
+        require(current.phase == FreeLivingSessionPhase.STOP_REQUESTED && current.stopConfirmedAtMs == null &&
+            current.stopOrigin == StopOrigin.USER_REQUEST) { "当前阶段不接受停止命令恢复" }
+        val requestedAtMs = requireNotNull(current.stopRequestedAtMs) { "缺少停止请求时间" }
+        val dispatch = requireNotNull(current.stopCommandDispatch) { "停止命令尚未准备" }
+        require(dispatch.acceptedAtMs == null && preparedAtMs >= requestedAtMs) { "停止命令已入队或恢复时间无效" }
+        current.copy(stopCommandDispatch = StopCommandDispatch(preparedAtMs,
+            ownerId = ownerId, connectionGeneration = connectionGeneration))
+    }
+
+    /**
+     * The ring may stop before the phone can send STOP. Persist that observation as the start of
+     * finalization, then require another settled STATUS/LIST round before confirming completion.
+     */
+    fun beginObservedStopFinalization(
+        sessionId: String,
+        observedAtMs: Long,
+        evidence: DeviceRecordEvidence,
+    ): FreeLivingSession = update(sessionId) { current ->
+        require(observedAtMs > 0 && evidence.observedAtMs == observedAtMs) { "停止观察时间无效" }
+        require(current.phase == FreeLivingSessionPhase.COLLECTING && current.stopRequestedAtMs == null) {
+            "当前阶段不接受停止观察"
+        }
+        require(!evidence.status.collecting && evidence.status.errorCode == 0) { "戒指尚未安全停止" }
+        val previous = requireNotNull(current.deviceRecordEvidence) { "缺少设备记录关联证据" }
+        require(!current.deviceAssociationInvalidated && sameDeviceRecord(previous.record, evidence.record) &&
+            evidence.record.sessionId == evidence.status.sessionId &&
+            evidence.record.bytes >= previous.record.bytes && evidence.record.records >= previous.record.records &&
+            evidence.status.bytes >= previous.status.bytes && evidence.status.records >= previous.status.records &&
+            evidence.record.bytes >= evidence.status.bytes && evidence.record.records >= evidence.status.records) {
+            "设备记录已变化"
+        }
+        current.copy(
+            phase = FreeLivingSessionPhase.STOP_REQUESTED,
+            stopObservedAtMs = observedAtMs,
+            stopOrigin = StopOrigin.DEVICE_OBSERVED,
+            deviceRecordEvidence = evidence,
+        )
+    }
+
+    /** A locally rejected STOP was never queued to the ring, so the collecting state remains true. */
+    fun cancelStopRequest(sessionId: String): FreeLivingSession = update(sessionId) { current ->
+        require(current.phase == FreeLivingSessionPhase.STOP_REQUESTED && current.stopConfirmedAtMs == null) {
+            "当前没有可撤销的停止请求"
+        }
+        current.copy(
+            phase = FreeLivingSessionPhase.COLLECTING,
+            stopRequestedAtMs = null,
+            stopObservedAtMs = null,
+            stopOrigin = null,
+            stopCommandDispatch = null,
+        )
     }
 
     fun confirmStop(
@@ -491,6 +698,29 @@ class FreeLivingSessionStore internal constructor(
         current.copy(reference = reference)
     }
 
+    /**
+     * Corrects the reference while it is still a local draft for upload. The previous value stays
+     * in the private journal; the research manifest always receives only the final confirmed value.
+     */
+    fun reviseReferenceBeforeUpload(sessionId: String, reference: SessionReference): FreeLivingSession =
+        update(sessionId, allowArchived = true) { current ->
+            validateReference(reference)
+            val previous = requireNotNull(current.reference) { "本段还没有可修改的计步器读数" }
+            require(current.localData != null) { "请先完成戒指数据保存" }
+            require(current.transfer.status == SessionTransferStatus.PENDING && current.transfer.attempts == 0 &&
+                current.transfer.receipt == null) { "本段已确认上传，原读数保持不变" }
+            require(current.completionPolicy in setOf(CompletionPolicy.SAVE_LATER, CompletionPolicy.SAVE_UPLOAD)) {
+                "本段尚未选择保存方式"
+            }
+            if (previous.status == reference.status && previous.steps == reference.steps && previous.reason == reference.reason) {
+                return@update current
+            }
+            current.copy(
+                reference = reference,
+                referenceRevisions = current.referenceRevisions + SessionReferenceRevision(previous, reference.recordedAtMs),
+            )
+        }
+
     fun completeLocalData(sessionId: String, files: List<SessionRawFile>, completedAtMs: Long): FreeLivingSession =
         update(sessionId) { current ->
             require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null) {
@@ -513,6 +743,19 @@ class FreeLivingSessionStore internal constructor(
         current.copy(transfer = current.transfer.copy(status = SessionTransferStatus.TRANSFERRING,
             attempts = Math.addExact(current.transfer.attempts, 1)))
     }
+
+    /** Releases only a claim whose HTTP request has not been invoked. */
+    fun releaseTransferClaimBeforeDispatch(sessionId: String, claimedAttempt: Int): FreeLivingSession =
+        update(sessionId, allowArchived = true) { current ->
+            require(current.transfer.status == SessionTransferStatus.TRANSFERRING &&
+                current.transfer.receipt == null && current.transfer.attempts == claimedAttempt && claimedAttempt > 0) {
+                "上传任务状态已变化，保留当前记录"
+            }
+            current.copy(transfer = current.transfer.copy(
+                status = if (claimedAttempt == 1) SessionTransferStatus.PENDING else SessionTransferStatus.FAILED,
+                attempts = claimedAttempt - 1,
+            ))
+        }
 
     fun markTransferFailed(sessionId: String): FreeLivingSession = update(sessionId, allowArchived = true) { current ->
         require(current.transfer.status == SessionTransferStatus.TRANSFERRING ||
@@ -566,7 +809,7 @@ class FreeLivingSessionStore internal constructor(
                 value.asJsonObject
             }
             val version = envelope.strictLong("journal_version")
-            require(version in 1L..9L) { "版本不受支持" }
+            require(version in 1L..12L) { "版本不受支持" }
             val payload = envelope.getAsJsonObject("session") ?: error("缺少采集段")
             val archives = if (version >= 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
             val hashed = if (version == 1L) payload else journalPayload(payload, archives)
@@ -592,7 +835,7 @@ class FreeLivingSessionStore internal constructor(
         val payload = encode(journal.current)
         val archives = JsonArray().apply { journal.archived.forEach { add(encode(it)) } }
         val envelope = JsonObject().apply {
-            addProperty("journal_version", 9)
+            addProperty("journal_version", 12)
             add("session", payload)
             add("archived_sessions", archives)
             addProperty("sha256", digest(journalPayload(payload, archives).toString()))
@@ -638,6 +881,7 @@ class FreeLivingSessionStore internal constructor(
 
     companion object {
         private val processLock = Any()
+        private const val LEGACY_COMMAND_OWNER_ID = "00000000-0000-0000-0000-000000000000"
         private val participantPattern = Regex("^[a-z0-9]{3,24}$")
         private val ringAddressPattern = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 
@@ -655,7 +899,7 @@ class FreeLivingSessionStore internal constructor(
             when (reference.status) {
                 ReferenceStatus.VALID -> require(reference.steps != null && reference.reason == null)
                 ReferenceStatus.MISSING -> require(reference.steps == null && reference.reason != null)
-                ReferenceStatus.UNRELIABLE -> require(reference.reason != null)
+                ReferenceStatus.UNRELIABLE -> require(reference.steps != null && reference.reason != null)
             }
         }
 
@@ -721,7 +965,8 @@ class FreeLivingSessionStore internal constructor(
 
         private fun validateStartAttemptArchive(session: FreeLivingSession, audit: StartAttemptArchive) {
             require(session.phase == FreeLivingSessionPhase.START_REQUESTED && session.startConfirmedAtMs == null &&
-                session.stopRequestedAtMs == null && session.stopConfirmedAtMs == null &&
+                session.stopRequestedAtMs == null && session.stopObservedAtMs == null && session.stopOrigin == null &&
+                session.stopConfirmedAtMs == null && session.stopCommandDispatch == null &&
                 session.deviceRecordEvidence == null && !session.deviceAssociationInvalidated &&
                 session.reference == null && session.localData == null) { "本次记录仍需保留，请联系研究者" }
             require(audit.archivedAtMs > 0 && audit.reason.length in 1..200 && audit.reason == audit.reason.trim()) {
@@ -738,8 +983,7 @@ class FreeLivingSessionStore internal constructor(
                 observed.records.size == baseline.records.size && observed.records.toSet() == baseline.records.toSet()) {
                 "戒指状态或记录有变化，请联系研究者"
             }
-            if (observed.records.any { it.unixMs == 0L }) requireNotNull(audit.unknownPreservation).validate(observed)
-            else require(audit.unknownPreservation == null)
+            audit.unknownPreservation?.validate(observed)
         }
 
         fun sameDeviceRecord(first: HealthMessage.ListItem, second: HealthMessage.ListItem): Boolean =
@@ -765,16 +1009,42 @@ class FreeLivingSessionStore internal constructor(
             // Preserve the offset captured at start; later system tzdb updates can change rules.
             require(session.utcOffsetSeconds in -64_800..64_800)
             val hasStart = session.phase != FreeLivingSessionPhase.START_REQUESTED
-            val hasStopRequest = session.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE)
+            val hasStopTransition = session.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE)
             val hasStop = session.phase == FreeLivingSessionPhase.AWAITING_REFERENCE
             require((session.startConfirmedAtMs != null) == hasStart && (session.startStatusEvidence != null) == hasStart)
-            require((session.stopRequestedAtMs != null) == hasStopRequest)
+            require((session.stopOrigin != null) == hasStopTransition)
+            when (session.stopOrigin) {
+                null -> require(session.stopRequestedAtMs == null && session.stopObservedAtMs == null &&
+                    session.stopCommandDispatch == null)
+                StopOrigin.USER_REQUEST -> require(session.stopRequestedAtMs != null && session.stopObservedAtMs == null &&
+                    session.stopCommandDispatch != null)
+                StopOrigin.DEVICE_OBSERVED -> require(session.stopRequestedAtMs == null && session.stopObservedAtMs != null &&
+                    session.stopCommandDispatch == null)
+                StopOrigin.LEGACY_UNSPECIFIED -> require(session.stopRequestedAtMs != null && session.stopObservedAtMs == null &&
+                    session.stopCommandDispatch == null)
+            }
             require((session.stopConfirmedAtMs != null) == hasStop && (session.stopStatusEvidence != null) == hasStop)
             require(hasStart || session.startBoundaryEvidence == null)
             require(hasStop || session.endBoundaryEvidence == null)
             session.startStatusEvidence?.let { validateReply(session, session.preparation.ring!!.address, it, session.startConfirmedAtMs!!, true) }
             session.stopStatusEvidence?.let { validateReply(session, session.preparation.ring!!.address, it, session.stopConfirmedAtMs!!, false) }
             session.stopRequestedAtMs?.let { require(it > 0) }
+            session.stopObservedAtMs?.let { require(it > 0) }
+            session.startCommandDispatch?.let { dispatch ->
+                require(session.startBaseline != null && dispatch.preparedAtMs > 0)
+                dispatch.acceptedAtMs?.let { require(it > 0) }
+                require((dispatch.ownerId == null) == (dispatch.connectionGeneration == null))
+                dispatch.ownerId?.let { require(UUID.fromString(it).toString() == it) }
+                dispatch.connectionGeneration?.let { require(it > 0) }
+            }
+            session.stopCommandDispatch?.let { dispatch ->
+                require(session.stopOrigin == StopOrigin.USER_REQUEST && dispatch.preparedAtMs > 0 &&
+                    dispatch.preparedAtMs >= requireNotNull(session.stopRequestedAtMs))
+                dispatch.acceptedAtMs?.let { require(it > 0) }
+                require((dispatch.ownerId == null) == (dispatch.connectionGeneration == null))
+                dispatch.ownerId?.let { require(UUID.fromString(it).toString() == it) }
+                dispatch.connectionGeneration?.let { require(it > 0) }
+            }
             validateBoundary(session.startBoundaryEvidence)
             validateBoundary(session.endBoundaryEvidence)
             session.startBaseline?.let { baseline ->
@@ -794,12 +1064,21 @@ class FreeLivingSessionStore internal constructor(
                 if (hasStop) require(!evidence.status.collecting && evidence.record.bytes == evidence.status.bytes &&
                     evidence.record.records == evidence.status.records)
                 // A requested stop may preserve an early stopped reply while its LIST is pending.
-                else if (!hasStopRequest) require(evidence.status.collecting)
+                else if (!hasStopTransition) require(evidence.status.collecting)
             }
             session.reference?.let {
                 validateReference(it)
-                require(hasStopRequest && (hasStop || it.status != ReferenceStatus.VALID))
+                require(hasStopTransition && (hasStop || it.status != ReferenceStatus.VALID))
             }
+            session.referenceRevisions.forEachIndexed { index, revision ->
+                validateReference(revision.previous)
+                require(revision.replacedAtMs > 0)
+                val replacement = session.referenceRevisions.getOrNull(index + 1)?.previous ?: session.reference
+                require(replacement != null && revision.replacedAtMs == replacement.recordedAtMs) {
+                    "计步器读数修订记录不连续"
+                }
+            }
+            if (session.referenceRevisions.isNotEmpty()) require(session.localData != null)
             session.localData?.let {
                 require(hasStop && session.reference != null && it.completedAtMs > 0)
                 validateFiles(session, it.files)
@@ -826,7 +1105,7 @@ class FreeLivingSessionStore internal constructor(
             }
         }
 
-        private fun encode(s: FreeLivingSession, version: Long = 9L) = JsonObject().apply {
+        private fun encode(s: FreeLivingSession, version: Long = 12L) = JsonObject().apply {
             addProperty("session_id", s.sessionId)
             addProperty("participant_id", s.preparation.participantId)
             addProperty("participant_name", s.preparation.participantId)
@@ -865,6 +1144,10 @@ class FreeLivingSessionStore internal constructor(
             addProperty("start_requested_at_ms", s.startRequestedAtMs)
             addNullable("start_confirmed_at_ms", s.startConfirmedAtMs)
             addNullable("stop_requested_at_ms", s.stopRequestedAtMs)
+            if (version >= 12L) {
+                addNullable("stop_observed_at_ms", s.stopObservedAtMs)
+                add("stop_origin", s.stopOrigin?.let { com.google.gson.JsonPrimitive(it.wireValue) } ?: JsonNull.INSTANCE)
+            }
             addNullable("stop_confirmed_at_ms", s.stopConfirmedAtMs)
             addNullable("started_at_ms", s.startedAtMs)
             addNullable("ended_at_ms", s.endedAtMs)
@@ -920,6 +1203,30 @@ class FreeLivingSessionStore internal constructor(
                 addNullable("completed_at_ms", audit.completedAtMs)
                 add("completion_owner_id", audit.completionOwnerId?.let { com.google.gson.JsonPrimitive(it) } ?: JsonNull.INSTANCE)
             } } ?: JsonNull.INSTANCE)
+            if (version >= 10L) add("reference_revisions", JsonArray().apply {
+                s.referenceRevisions.forEach { revision -> add(JsonObject().apply {
+                    add("previous", encodeReference(revision.previous))
+                    addProperty("replaced_at_ms", revision.replacedAtMs)
+                }) }
+            })
+            if (version >= 11L) add("start_command_dispatch", s.startCommandDispatch?.let { dispatch ->
+                JsonObject().apply {
+                    addProperty("prepared_at_ms", dispatch.preparedAtMs)
+                    addNullable("accepted_at_ms", dispatch.acceptedAtMs)
+                    if (version >= 12L) {
+                        add("owner_id", dispatch.ownerId?.let { com.google.gson.JsonPrimitive(it) } ?: JsonNull.INSTANCE)
+                        addNullable("connection_generation", dispatch.connectionGeneration)
+                    }
+                }
+            } ?: JsonNull.INSTANCE)
+            if (version >= 12L) add("stop_command_dispatch", s.stopCommandDispatch?.let { dispatch ->
+                JsonObject().apply {
+                    addProperty("prepared_at_ms", dispatch.preparedAtMs)
+                    addNullable("accepted_at_ms", dispatch.acceptedAtMs)
+                    add("owner_id", dispatch.ownerId?.let { com.google.gson.JsonPrimitive(it) } ?: JsonNull.INSTANCE)
+                    addNullable("connection_generation", dispatch.connectionGeneration)
+                }
+            } ?: JsonNull.INSTANCE)
         }
 
         private fun decode(p: JsonObject, version: Long): FreeLivingSession {
@@ -935,6 +1242,11 @@ class FreeLivingSessionStore internal constructor(
                 startRequestedAtMs = p.strictLong("start_requested_at_ms"),
                 startConfirmedAtMs = p.nullableLong("start_confirmed_at_ms"),
                 stopRequestedAtMs = p.nullableLong("stop_requested_at_ms"),
+                stopObservedAtMs = if (version < 12L) null else p.nullableLong("stop_observed_at_ms"),
+                stopOrigin = if (version < 12L) {
+                    if (p.nullableLong("stop_requested_at_ms") == null) null else StopOrigin.LEGACY_UNSPECIFIED
+                } else if (p.required("stop_origin").isJsonNull) null else
+                    StopOrigin.entries.single { it.wireValue == p.strictString("stop_origin") },
                 stopConfirmedAtMs = p.nullableLong("stop_confirmed_at_ms"),
                 startStatusEvidence = decodeStatus(p.required("start_status_evidence")),
                 stopStatusEvidence = decodeStatus(p.required("stop_status_evidence")),
@@ -985,6 +1297,23 @@ class FreeLivingSessionStore internal constructor(
                         if (it.required("preserved_observation").isJsonNull) null else decodeObservation(it.getAsJsonObject("preserved_observation")),
                         it.nullableLong("completed_at_ms"),
                         if (it.required("completion_owner_id").isJsonNull) null else it.strictString("completion_owner_id")) },
+                referenceRevisions = if (version < 10L) emptyList() else
+                    p.required("reference_revisions").asJsonArray.map { item -> item.asJsonObject.let {
+                        SessionReferenceRevision(decodeReference(it.getAsJsonObject("previous")),
+                            it.strictLong("replaced_at_ms"))
+                    } },
+                startCommandDispatch = if (version < 11L || p.required("start_command_dispatch").isJsonNull) null else
+                    p.getAsJsonObject("start_command_dispatch").let {
+                        StartCommandDispatch(it.strictLong("prepared_at_ms"), it.nullableLong("accepted_at_ms"),
+                            if (version < 12L || it.required("owner_id").isJsonNull) null else it.strictString("owner_id"),
+                            if (version < 12L) null else it.nullableLong("connection_generation"))
+                    },
+                stopCommandDispatch = if (version < 12L || p.required("stop_command_dispatch").isJsonNull) null else
+                    p.getAsJsonObject("stop_command_dispatch").let {
+                        StopCommandDispatch(it.strictLong("prepared_at_ms"), it.nullableLong("accepted_at_ms"),
+                            if (it.required("owner_id").isJsonNull) null else it.strictString("owner_id"),
+                            it.nullableLong("connection_generation"))
+                    },
             )
             // Re-encoding checks required fields, fixed metadata, explicit nulls and derived values.
             require(encode(s, version) == p) { "采集段字段不完整或数据含义不一致" }
@@ -996,6 +1325,19 @@ class FreeLivingSessionStore internal constructor(
             addProperty("activity_code", activity.wireValue)
             if (activity != SessionActivity.FREE_LIVING) addProperty("activity_selection_source", "participant")
         }
+
+        private fun encodeReference(reference: SessionReference) = JsonObject().apply {
+            addProperty("status", reference.status.wireValue)
+            addNullable("steps", reference.steps)
+            addProperty("recorded_at_ms", reference.recordedAtMs)
+            add("reason", reference.reason?.let { com.google.gson.JsonPrimitive(it) } ?: JsonNull.INSTANCE)
+        }
+
+        private fun decodeReference(value: JsonObject) = SessionReference(
+            ReferenceStatus.entries.single { it.wireValue == value.strictString("status") },
+            value.nullableLong("steps"), value.strictLong("recorded_at_ms"),
+            if (value.required("reason").isJsonNull) null else value.strictString("reason"),
+        )
 
         private fun encodeObservation(observation: HealthRecordObservation) = JsonObject().apply {
             addProperty("ring_address", observation.address)

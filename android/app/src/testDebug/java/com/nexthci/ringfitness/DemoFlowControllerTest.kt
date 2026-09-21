@@ -62,6 +62,28 @@ class DemoFlowControllerTest {
         assertEquals(saved.localData, f.store.read()!!.localData)
     }
 
+    @Test fun atomicFinalizationFailureLeavesNoHalfStateAndRestartCanRetry() {
+        val f = Fixture()
+        f.begin()
+        f.stopAtFinish()
+        f.flow.setFault(FlowTestFault.SAVE_FAILURE)
+        f.flow.finalizeSession(false, "0", "valid", "")
+        f.advance(350)
+        assertNull(f.store.read()!!.completionPolicy)
+        assertNull(f.store.read()!!.reference)
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+
+        f.restart()
+        assertEquals(CollectionPage.FINISH, f.flow.state.page)
+        f.flow.finalizeSession(false, "0", "valid", "")
+        f.drain()
+        val restored = f.store.read()!!
+        assertEquals(CompletionPolicy.SAVE_LATER, restored.completionPolicy)
+        assertEquals(0L, restored.reference!!.steps)
+        assertNotNull(restored.localData)
+        assertEquals(0, restored.transfer.attempts)
+    }
+
     @Test fun archivedDeferredSessionStaysLocalWhileTheNextSessionUploadsAndRestarts() {
         val f = Fixture()
         f.begin(); f.stopAtFinish(); f.flow.chooseFinish(false)

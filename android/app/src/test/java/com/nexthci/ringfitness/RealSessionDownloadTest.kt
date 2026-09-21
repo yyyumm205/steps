@@ -227,6 +227,31 @@ class RealSessionDownloadTest {
         }
     }
 
+    @Test fun completedPrefixCanReopenAgainstAStableGrowingRecordAndResumeItsTail() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { download ->
+            download.append(HealthMessage.DataChunk(0, payload))
+            download.finish(end())
+        }
+        val prefixContainer = final(directory).readBytes()
+        val tail = imu(1, 1_120)
+        val grown = record.copy(bytes = payload.size + tail.size.toLong(), records = 3)
+
+        adapter(directory, grown).use { resumed ->
+            assertEquals(payload.size.toLong(), resumed.nextOffset)
+            assertFalse(final(directory).exists())
+            assertTrue(directory.listFiles()!!.any { it.name.endsWith(".prefix-${payload.size}.rfbin") })
+            resumed.append(HealthMessage.DataChunk(payload.size.toLong(), tail))
+            val result = resumed.finish(HealthMessage.ReadEnd(grown.bytes, true))
+            assertEquals(3L, result.evidence.records)
+            assertArrayEquals(payload + tail, part(directory).readBytes())
+            resumed.releaseTemporary()
+        }
+
+        assertFalse(prefixContainer.contentEquals(final(directory).readBytes()))
+        assertFalse(directory.listFiles()!!.any { it.name.contains(".prefix-") })
+    }
+
     @Test fun invalidSessionOrUnassociatedFilesCannotBeOverwritten() {
         val directory = temporary.newFolder()
         part(directory).writeText("unassociated original")

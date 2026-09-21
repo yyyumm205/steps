@@ -14,22 +14,25 @@ import java.net.URI
 data class RemoteSessionReceipt(val fileName: String, val fileId: String, val bytes: Long)
 
 fun interface SessionUploadTransport {
-    fun upload(link: String, archive: File, cancelled: () -> Boolean): RemoteSessionReceipt
+    fun upload(link: String, archive: File, cancelled: () -> Boolean,
+        onDispatch: () -> Unit): RemoteSessionReceipt
 }
 
 /** Upload-link transport shared in shape with the legacy worker; no participant account required. */
 class SeafileSessionTransport : SessionUploadTransport {
     private val calls = CancellableUploadCall()
 
-    override fun upload(link: String, archive: File, cancelled: () -> Boolean): RemoteSessionReceipt {
+    override fun upload(link: String, archive: File, cancelled: () -> Boolean,
+        onDispatch: () -> Unit): RemoteSessionReceipt {
         val page = validateLink(link)
         checkCancelled(cancelled)
-        val html = get(page, cancelled)
+        val html = get(page, cancelled, onDispatch)
         val parent = Regex("path:\\s*\"([^\"]+)\"").find(html)?.groupValues?.get(1)
             ?: error("上传位置暂时无法读取")
         require(parent.startsWith('/') && ".." !in parent && '\r' !in parent && '\n' !in parent)
         val token = page.path.trimEnd('/').substringAfterLast('/')
-        val metadata = JsonParser.parseString(get(URI("https://$HOST/api/v2.1/upload-links/$token/upload/"), cancelled)).asJsonObject
+        val metadata = JsonParser.parseString(get(URI("https://$HOST/api/v2.1/upload-links/$token/upload/"),
+            cancelled, onDispatch)).asJsonObject
         val upload = trustedUri(metadata.get("upload_link").asString)
         val destination = URI(upload.toString() + if (upload.rawQuery == null) "?ret-json=1" else "&ret-json=1")
         require(archive.name.matches(Regex("ringfitness-session-[a-f0-9-]+\\.zip")))
@@ -62,15 +65,16 @@ class SeafileSessionTransport : SessionUploadTransport {
             override fun isOneShot() = true
             override fun writeTo(sink: BufferedSink) = multipart.writeTo(sink)
         }
-        return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()), cancelled) { response ->
+        return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()),
+            cancelled, onDispatch) { response ->
             check(response.isSuccessful) { "上传暂未完成（HTTP ${response.code()}）" }
             parseReceipt(readLimited(response, cancelled), archive.length())
         }
     }
 
-    private fun get(uri: URI, cancelled: () -> Boolean): String {
+    private fun get(uri: URI, cancelled: () -> Boolean, onDispatch: () -> Unit): String {
         checkCancelled(cancelled)
-        return calls.execute(request(uri).get().build(), 60_000, cancelled) { response ->
+        return calls.execute(request(uri).get().build(), 60_000, cancelled, onDispatch) { response ->
             check(response.isSuccessful) { "云盘暂时无法连接（HTTP ${response.code()}）" }
             readLimited(response, cancelled)
         }

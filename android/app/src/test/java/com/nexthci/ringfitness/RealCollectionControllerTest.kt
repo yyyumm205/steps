@@ -152,7 +152,7 @@ class RealCollectionControllerTest {
                 f.finishDownload()
                 assertEquals(0L, f.store.read()!!.reference!!.steps)
                 assertNotNull(f.store.read()!!.localData)
-                assertEquals(5, f.store.manifestSnapshot(f.store.read()!!.sessionId)["version"].asInt)
+                assertEquals(7, f.store.manifestSnapshot(f.store.read()!!.sessionId)["version"].asInt)
                 assertEquals(2, f.port.reads.size)
             }
         }
@@ -201,8 +201,8 @@ class RealCollectionControllerTest {
                 assertTrue(uploads.requests.isEmpty())
                 assertEquals(2, File(f.directory, "device-backups").listFiles()!!.size)
                 f.observe(stopped, finalList) // Reuse the regular readiness guard after closing the audit.
-                assertEquals(!keepOld, f.owner.state.canStart)
-                if (keepOld) assertTrue(f.owner.state.error!!.contains("多条"))
+                assertTrue(f.owner.state.canStart)
+                assertEquals(CollectionPage.HOME, f.owner.state.page)
                 assertEquals(2, f.port.reads.size) // The old unknown record is never downloaded again here.
             }
         }
@@ -222,11 +222,11 @@ class RealCollectionControllerTest {
         assertEquals(1, f.port.reads.size) // Only the pre-START original existed.
         assertEquals(1, f.port.count("stop"))
         f.observe(stopped, listOf(initial))
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
-        assertTrue(f.owner.state.error!!.contains("返回设备页"))
-        assertFalse(f.owner.state.canStart)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
+        assertNull(f.owner.state.error)
+        assertTrue(f.owner.state.canStart)
         f.owner.home()
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
         assertEquals(1, f.port.reads.size)
     }
 
@@ -277,10 +277,11 @@ class RealCollectionControllerTest {
         f.runDelay(5_000)
         repeat(3) { attempt ->
             f.observe(collecting, listOf(initial))
-            if (attempt < 2) f.runDelay(1_500)
+            if (attempt < 2) f.runDelay(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
         }
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
-        f.owner.retry()
+        assertEquals(CollectionPage.STOPPING, f.owner.state.page)
+        assertNull(f.owner.state.error)
+        f.runDelay(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
         assertEquals(connection, f.port.generation)
         val final = initial.copy(bytes = payload.size.toLong(), records = 2)
         f.observe(stopped().copy(sessionId = initial.sessionId), listOf(final))
@@ -349,16 +350,41 @@ class RealCollectionControllerTest {
         assertEquals(1, f.port.reads.size)
     }
 
-    @Test fun severalZeroClockRecordsRemainIntactWithAnExplicitRecoveryMessage() = Fixture().use { f ->
+    @Test fun severalZeroClockRecordsRemainIntactAndDoNotBlockANewDistinctSession() = Fixture(syncClock = true).use { f ->
+        val old = listOf(finalRecord.copy(unixMs = 0), finalRecord.copy(sessionId = 8, unixMs = 0))
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
-        f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0), finalRecord.copy(sessionId = 8, unixMs = 0)))
-        assertFalse(f.owner.state.canStart)
-        assertTrue(f.owner.state.error!!.contains("多条"))
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
-        f.owner.home()
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        f.observe(stopped(), old)
+        assertTrue(f.owner.state.canStart)
+        assertNull(f.owner.state.error)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
+        f.startSelected(); f.observe(stopped(), old); f.timeReply()
+        f.observe(stopped(), old); f.observe(stopped(), old)
+        val fresh = initialRecord.copy(sessionId = 9, uptimeMs = 2_000, unixMs = epoch + 60_000)
+        f.observe(collecting().copy(sessionId = 9), old + fresh)
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertEquals(old, f.store.readPending()!!.startBaseline!!.records)
         assertTrue(f.port.reads.isEmpty())
-        assertEquals(0, f.port.count("start"))
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun inconsistentIdleStatusAndListNeverExposeStart() {
+        val cases = listOf(
+            stopped() to emptyList(),
+            stopped() to listOf(finalRecord.copy(sessionId = 8)),
+        )
+        cases.forEach { (status, records) -> Fixture().use { f ->
+            f.owner.initialize(); f.owner.onConnected(f.port.generation)
+            f.observe(status, records)
+            assertEquals(CollectionPage.HOME, f.owner.state.page)
+            assertEquals(CollectionPage.RECOVERY, f.owner.state.taskPage)
+            assertFalse(f.owner.state.canStart)
+            assertTrue(f.owner.state.canRetry)
+            assertTrue(f.owner.state.error!!.contains("重新检查"))
+            f.startSelected()
+            assertEquals(0, f.port.count("start"))
+            assertEquals(0, f.port.count("time"))
+            assertNull(f.store.readPending())
+        } }
     }
 
     @Test fun saveLaterCompletesLocallyAndReopeningKeepsUploadDeferredUntilExplicitRetry() {
@@ -386,6 +412,37 @@ class RealCollectionControllerTest {
         }
     }
 
+    @Test fun unavailableUploadConfigurationFallsBackToEditableLocalSaveWithoutQueuing() {
+        val uploads = RecordingUploads().apply { configured = false }
+        Fixture(uploads).use { f ->
+            assertFalse(f.owner.state.uploadAvailable)
+            f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            assertFalse(f.owner.state.uploadAvailable)
+
+            f.owner.finalizeSession(true, "9", "valid", "")
+            assertEquals(CompletionPolicy.SAVE_LATER, f.store.readPending()!!.completionPolicy)
+            f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+            val saved = f.store.read()!!
+            assertTrue(uploads.requests.isEmpty())
+            assertTrue(f.owner.state.records.single().referenceEditable)
+
+            f.owner.reviseReference(saved.sessionId, "11", "unreliable", "计步器短暂松动")
+            val revised = f.store.read(saved.sessionId)!!
+            assertEquals(11L, revised.reference!!.steps)
+            assertEquals(ReferenceStatus.UNRELIABLE, revised.reference!!.status)
+            assertEquals(9L, revised.referenceRevisions.single().previous.steps)
+            assertEquals(revised.reference!!.recordedAtMs, revised.referenceRevisions.single().replacedAtMs)
+            assertTrue(f.owner.state.records.single().referenceEditable)
+
+            f.owner.retryUpload(saved.sessionId)
+            assertTrue(uploads.requests.isEmpty())
+            assertEquals(CompletionPolicy.SAVE_LATER, f.store.read(saved.sessionId)!!.completionPolicy)
+            f.reopen()
+            assertEquals(revised.reference, f.store.read(saved.sessionId)!!.reference)
+            assertEquals(revised.referenceRevisions, f.store.read(saved.sessionId)!!.referenceRevisions)
+        }
+    }
+
     @Test fun discardedStoppedRecordDoesNotRedownloadAndKeepsOtherRecordsAndFiles() = Fixture().use { f ->
         val previous = f.seedLocal()
         val previousRaw = File(f.directory, previous.localData!!.files.single().fileName)
@@ -407,36 +464,38 @@ class RealCollectionControllerTest {
         assertTrue(f.port.reads.isEmpty())
     }
 
-    @Test fun discardedZeroTimeRecordReturnsToDeviceRecoveryWithoutRedownload() = Fixture().use { f ->
+    @Test fun discardedZeroTimeRecordStaysExcludedWithoutBlockingTheRing() = Fixture().use { f ->
         f.beginCollecting(initialRecord.copy(unixMs = 0))
         f.owner.stop(); f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
         f.owner.discardSession()
         f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
-        assertTrue(f.owner.state.error!!.contains("返回设备页"))
-        assertFalse(f.owner.state.canStart)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
+        assertNull(f.owner.state.error)
+        assertTrue(f.owner.state.canStart)
         assertTrue(f.port.reads.isEmpty())
         f.owner.home()
-        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
     }
 
-    @Test fun anUnreliableReadingWaitsForStopConfirmationAndFinishChoiceBeforeDownload() = Fixture().use { f ->
+    @Test fun anUnreliableReadingIsSavedAfterStopConfirmationAndFinishChoice() = Fixture().use { f ->
         f.beginCollecting()
         f.port.accept = { it != "stop" }
-        f.owner.stop(); f.owner.enterReference(); f.owner.saveReference("73", "unreliable", "等待停止确认")
-        val savedReference = f.store.readPending()!!.reference
+        f.owner.stop()
+        assertEquals(FreeLivingSessionPhase.COLLECTING, f.store.readPending()!!.phase)
+        assertNull(f.store.readPending()!!.reference)
         assertNull(f.store.readPending()!!.stopConfirmedAtMs)
         assertTrue(f.port.reads.isEmpty())
         f.port.accept = { true }
-        f.owner.retry(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord))
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
         assertEquals(CollectionPage.FINISH, f.owner.state.page)
-        assertEquals(savedReference, f.store.readPending()!!.reference)
         assertTrue(f.port.reads.isEmpty())
         f.owner.chooseFinish(false)
+        f.owner.saveReference("73", "unreliable", "计步器读数可能偏低")
+        val savedReference = f.store.readPending()!!.reference
         f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
         assertEquals(savedReference, f.store.read()!!.reference)
         assertEquals(CompletionPolicy.SAVE_LATER, f.store.read()!!.completionPolicy)
-        assertEquals(1, f.port.count("stop"))
+        assertEquals(2, f.port.count("stop"))
     }
 
     @Test fun interruptedUnknownRecordBackupResumesOnlyItsVerifiedPrefixAfterReopen() = Fixture().use { f ->
@@ -525,7 +584,7 @@ class RealCollectionControllerTest {
         val saved = f.store.read()!!
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(0L, saved.reference!!.steps)
-        assertEquals(4, f.store.manifestSnapshot(saved.sessionId).get("version").asInt)
+        assertEquals(7, f.store.manifestSnapshot(saved.sessionId).get("version").asInt)
         assertNotNull(f.store.manifestSnapshot(saved.sessionId).getAsJsonObject("start_baseline")["charging_recovery_evidence"])
         assertEquals(1, f.port.count("start"))
         f.reopen()
@@ -670,25 +729,54 @@ class RealCollectionControllerTest {
         assertEquals(1, f.port.reads.size)
     }
 
-    @Test fun rejectedStopPreservesAnUnreliableReadingWithoutInventingAnEndOrDownload() = Fixture().use { f ->
+    @Test fun atomicFinalizationFailureKeepsBothChoiceAndZeroReferenceRetriable() = Fixture().use { f ->
+        f.beginCollecting()
+        f.owner.stop()
+        f.observe(stopped(), listOf(finalRecord))
+        val before = requireNotNull(f.store.read())
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertNull(before.completionPolicy)
+        assertNull(before.reference)
+
+        f.failCommit = true
+        f.owner.finalizeSession(false, "0", "valid", "")
+        assertEquals(before, f.store.read())
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertTrue(f.port.reads.isEmpty())
+
+        f.failCommit = false
+        f.owner.finalizeSession(false, "0", "valid", "")
+        val saved = requireNotNull(f.store.read())
+        assertEquals(CompletionPolicy.SAVE_LATER, saved.completionPolicy)
+        assertEquals(0L, saved.reference!!.steps)
+        assertEquals(before.sessionId, saved.sessionId)
+        assertTrue(f.port.reads.isEmpty())
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(1, f.port.reads.size)
+    }
+
+    @Test fun rejectedStopReturnsToCollectingAndCanBeRetriedWithoutInventingAnEnd() = Fixture().use { f ->
         f.beginCollecting()
         val id = f.store.read()!!.sessionId
         f.port.accept = { it != "stop" }
         f.owner.stop()
         assertEquals(1, f.port.count("stop"))
-        assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, f.store.read()!!.phase)
+        assertEquals(FreeLivingSessionPhase.COLLECTING, f.store.read()!!.phase)
         assertNull(f.store.read()!!.stopConfirmedAtMs)
-        f.owner.enterReference()
-        f.saveReference("73", "unreliable", "尚未确认结束")
-        val saved = requireNotNull(f.store.read())
-        assertEquals(id, saved.sessionId)
-        assertEquals(73L, saved.reference!!.steps)
-        assertEquals(ReferenceStatus.UNRELIABLE, saved.reference!!.status)
-        assertNull(saved.stopConfirmedAtMs)
-        assertNull(saved.endedAtMs)
-        assertNull(saved.localData)
+        assertNull(f.store.read()!!.reference)
         assertTrue(f.port.reads.isEmpty())
         assertFalse(f.owner.state.canStart)
+        assertTrue(f.owner.state.canStop)
+
+        f.port.accept = { true }
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        val saved = requireNotNull(f.store.read())
+        assertEquals(id, saved.sessionId)
+        assertNotNull(saved.stopConfirmedAtMs)
+        assertNull(saved.reference)
+        assertNull(saved.localData)
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertEquals(2, f.port.count("stop"))
     }
 
     @Test fun homeAndRetryOnlyShowTheCurrentTaskWithoutRepeatingStartOrStop() = Fixture().use { f ->
@@ -750,12 +838,167 @@ class RealCollectionControllerTest {
         assertEquals(before.reference, f.store.read()!!.reference)
         f.health(HealthMessage.DataChunk(9, payload.copyOfRange(9, payload.size)))
         f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(1, f.directory.listFiles()!!.count { it.extension == "rfbin" })
         val final = f.store.read()!!.localData!!.files.single()
         assertArrayEquals(payload, File(f.directory, final.fileName).readBytes().drop(64).toByteArray())
         assertEquals(1, f.port.count("start"))
         assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun completePayloadWaitsForFinalDeviceInspectionAndReopensWithoutRedownload() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("563", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+
+        assertNull(f.store.read()!!.localData)
+        assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+        assertTrue(f.directory.listFiles()!!.any { it.extension == "rfbin" })
+        assertTrue(f.directory.listFiles()!!.any { it.name.endsWith(".download.json") })
+        val reads = f.port.reads.toList()
+
+        f.reopen()
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertNotNull(f.store.read()!!.localData)
+        assertEquals(reads, f.port.reads)
+        assertFalse(f.directory.listFiles()!!.any { it.name.endsWith(".download.json") || it.extension == "part" })
+    }
+
+    @Test fun finalInspectionContinuesAStableRecordTailAndLeavesOtherSavedRecordUntouched() = Fixture().use { f ->
+        val previous = f.seedLocal()
+        val previousFile = File(f.directory, previous.localData!!.files.single().fileName)
+        val previousBytes = previousFile.readBytes()
+        f.reachReference()
+        f.saveReference("564", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+
+        val tail = imu(1, 1_120)
+        val grown = finalRecord.copy(bytes = payload.size + tail.size.toLong(), records = 3)
+        val grownStatus = stopped().copy(bytes = grown.bytes, records = grown.records)
+        f.observe(grownStatus, listOf(grown))
+
+        assertNull(f.store.read()!!.localData)
+        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+        assertArrayEquals(previousBytes, previousFile.readBytes())
+        f.health(HealthMessage.DataChunk(payload.size.toLong(), tail))
+        f.health(HealthMessage.ReadEnd(grown.bytes, true))
+        f.observe(grownStatus, listOf(grown))
+
+        val saved = requireNotNull(f.store.read())
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(grown, saved.deviceRecordEvidence!!.record)
+        assertArrayEquals(payload + tail,
+            File(f.directory, saved.localData!!.files.single().fileName).readBytes().drop(HealthRawV2.HEADER_SIZE).toByteArray())
+        assertArrayEquals(previousBytes, previousFile.readBytes())
+        assertFalse(f.directory.listFiles()!!.any { it.name.contains(".prefix-") })
+    }
+
+    @Test fun growingTailCanGrowAgainAcrossOwnerReopenAndResumeFromTheDurablePrefix() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("566", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        val tailOne = imu(1, 1_120)
+        val grownOnce = finalRecord.copy(bytes = payload.size + tailOne.size.toLong(), records = 3)
+        f.observe(stopped().copy(bytes = grownOnce.bytes, records = grownOnce.records), listOf(grownOnce))
+        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+
+        f.reopen()
+        f.owner.onConnected(f.port.generation)
+        val tailTwo = imu(2, 1_140)
+        val grownTwice = finalRecord.copy(bytes = payload.size + tailOne.size + tailTwo.size.toLong(), records = 4)
+        val finalStatus = stopped().copy(bytes = grownTwice.bytes, records = grownTwice.records)
+        f.observe(finalStatus, listOf(grownTwice))
+        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(payload.size.toLong(), tailOne + tailTwo))
+        f.health(HealthMessage.ReadEnd(grownTwice.bytes, true))
+        f.observe(finalStatus, listOf(grownTwice))
+
+        val saved = requireNotNull(f.store.read())
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(grownTwice, saved.deviceRecordEvidence!!.record)
+        assertArrayEquals(payload + tailOne + tailTwo,
+            File(f.directory, saved.localData!!.files.single().fileName).readBytes().drop(HealthRawV2.HEADER_SIZE).toByteArray())
+    }
+
+    @Test fun finalInspectionAllowsAProtectedBaselineToDisappearButRejectsANewUnrelatedRecord() {
+        for (foreign in listOf(false, true)) Fixture().use { f ->
+            val old = finalRecord.copy(sessionId = 6, uptimeMs = 400, unixMs = epoch - 60_000)
+            val oldStatus = stopped().copy(sessionId = 6)
+            f.owner.initialize(); f.owner.onConnected(f.port.generation)
+            f.observe(oldStatus, listOf(old))
+            f.finishDownload()
+            f.owner.onConnected(f.port.generation)
+            f.observe(oldStatus, listOf(old)); f.observe(oldStatus, listOf(old))
+            assertTrue(f.owner.state.canStart)
+            f.startSelected(); f.observe(oldStatus, listOf(old))
+            f.observe(collecting(), listOf(old, initialRecord))
+            f.owner.stop(); f.observe(stopped(), listOf(old, finalRecord))
+            f.owner.chooseFinish(true); f.owner.saveReference("567", "valid", "")
+            f.observe(stopped(), listOf(old, finalRecord))
+            f.health(HealthMessage.DataChunk(0, payload))
+            f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+
+            val records = if (foreign) listOf(finalRecord,
+                old.copy(sessionId = 99, uptimeMs = old.uptimeMs + 1)) else listOf(finalRecord)
+            f.observe(stopped(), records)
+
+            if (foreign) {
+                assertNull(f.store.readPending()!!.localData)
+                assertTrue(f.owner.state.error!!.contains("其他记录变化"))
+                assertTrue(f.directory.listFiles()!!.any { it.extension == "rfbin" })
+            } else {
+                assertNotNull(f.store.read()!!.localData)
+                assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            }
+        }
+    }
+
+    @Test fun delayedCompletedPrefixEndIsIgnoredButAnUnknownEndStillStopsTheTransfer() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("568", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        val tail = imu(1, 1_120)
+        val grown = finalRecord.copy(bytes = payload.size + tail.size.toLong(), records = 3)
+        val grownStatus = stopped().copy(bytes = grown.bytes, records = grown.records)
+        f.observe(grownStatus, listOf(grown))
+        val reads = f.port.reads.size
+
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        assertEquals(reads, f.port.reads.size)
+        assertTrue(f.errors.isEmpty())
+        f.health(HealthMessage.ReadEnd(payload.size - 1L, true))
+        assertNull(f.store.readPending()!!.localData)
+        assertTrue(f.errors.any { it.message == "下载结束位置与已保存片段不一致" })
+    }
+
+    @Test fun changedIdentityAfterReadEndKeepsRawAndCheckpointForRecovery() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("565", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+
+        val replacement = finalRecord.copy(uptimeMs = finalRecord.uptimeMs + 1)
+        f.observe(stopped(), listOf(replacement))
+
+        assertNull(f.store.read()!!.localData)
+        assertTrue(f.owner.state.error!!.contains("身份发生变化"))
+        assertTrue(f.owner.state.canRetry)
+        assertTrue(f.directory.listFiles()!!.any { it.extension == "rfbin" })
+        assertTrue(f.directory.listFiles()!!.any { it.extension == "part" })
+        assertTrue(f.directory.listFiles()!!.any { it.name.endsWith(".download.json") })
     }
 
     @Test fun confirmedStopKeepsFinishAndReferenceAvailableWhileDisconnectedAndReconnecting() = Fixture().use { f ->
@@ -851,6 +1094,7 @@ class RealCollectionControllerTest {
         assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
         f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
         f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(22L, f.store.read()!!.reference!!.steps)
     }
@@ -872,6 +1116,26 @@ class RealCollectionControllerTest {
         assertFalse(f.owner.state.uploadAvailable)
         f.owner.retryUpload(saved.sessionId)
         assertEquals(saved, f.store.read())
+    }
+
+    @Test fun completedSessionReopenCleansOnlyItsVerifiedDownloadResidue() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("569", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.finishDownload()
+        val saved = requireNotNull(f.store.read())
+        val prefix = "${saved.sessionId}-ring-${finalRecord.sessionId}"
+        val leftovers = listOf("$prefix.part", "$prefix.download.json",
+            "$prefix.prefix-${payload.size}.rfbin", "$prefix.prefix-${payload.size}.raw-evidence.json")
+        leftovers.forEach { File(f.directory, it).writeText("restart residue") }
+        val otherId = "11111111-2222-4333-8444-555555555555"
+        val other = File(f.directory, "$otherId-ring-7.prefix-${payload.size}.rfbin").apply { writeText("other") }
+
+        f.reopen()
+
+        leftovers.forEach { assertFalse(File(f.directory, it).exists()) }
+        assertEquals("other", other.readText())
+        assertTrue(File(f.directory, saved.localData!!.files.single().fileName).isFile)
     }
 
     @Test fun unknownDeviceClockCanStopAndDownloadOnItsOriginalConnection() = Fixture().use { f ->
@@ -951,6 +1215,7 @@ class RealCollectionControllerTest {
         f.failDownloadSyncAfterLocalCommit = true
         f.health(HealthMessage.DataChunk(0, payload))
         f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
         assertFalse(f.failDownloadSyncAfterLocalCommit)
         assertTrue(f.errors.any { it.message == "注入已保存后的清理同步失败" })
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
@@ -1073,6 +1338,42 @@ class RealCollectionControllerTest {
         }
     }
 
+    @Test fun homeHistoryIsScopedToCurrentIdentityWhileBackgroundUploadStillQueuesAllIdentities() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            val owner = f.seedLocal()
+            val ownerProfile = f.preparation.read()!!
+            val otherProfile = ownerProfile.copy(participantId = "other001", displayLabel = "other001")
+            val other = f.seedLocal(profile = otherProfile)
+
+            f.owner.initialize()
+
+            assertEquals(listOf(owner.sessionId), f.owner.state.records.map { it.sessionId })
+            assertNull(f.owner.state.session)
+            assertEquals(setOf(owner.sessionId to false, other.sessionId to false), uploads.requests.toSet())
+            uploads.inFlight.clear()
+            f.owner.retryUpload(other.sessionId)
+            assertEquals(2, uploads.requests.size)
+            f.owner.retryUpload(owner.sessionId)
+            assertEquals(owner.sessionId to true, uploads.requests.last())
+        }
+    }
+
+    @Test fun pendingSessionUsesCurrentLocalNameOnlyForDisplay() {
+        Fixture(profileLabel = "张三", identityType = PreparationIdentityType.LOCAL_NAME).use { f ->
+            val local = f.preparation.read()!!
+            f.store.requestStart(local, ++f.clock.now, "Asia/Shanghai", activity = SessionActivity.WALKING)
+
+            f.owner.initialize()
+
+            val pending = f.store.readPending()!!
+            assertEquals(local.participantId, f.owner.state.participantId)
+            assertEquals("张三", f.owner.state.participantLabel)
+            assertEquals(pending.preparation.participantId, pending.preparation.displayLabel)
+            assertFalse(File(f.directory, "session.json").readText(Charsets.UTF_8).contains("张三"))
+        }
+    }
+
     @Test fun archivedRetryAndUploadRefreshKeepTheActiveCaptureAndHomeNavigationIntact() {
         val uploads = RecordingUploads()
         Fixture(uploads).use { f ->
@@ -1120,9 +1421,10 @@ class RealCollectionControllerTest {
             f.reachReference()
             f.saveReference("19", "valid", "")
             f.observe(stopped(), listOf(finalRecord))
-            val commands = f.port.calls.toList()
             f.health(HealthMessage.DataChunk(0, payload))
             f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            f.observe(stopped(), listOf(finalRecord))
+            val commands = f.port.calls.toList()
             val completed = f.store.read()!!
             assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
             assertTrue(f.owner.state.canStart)
@@ -1229,6 +1531,7 @@ class RealCollectionControllerTest {
         val saved = f.seedLocal()
         val before = File(f.directory, "session.json").readBytes()
         f.owner.initialize()
+        assertTrue("Legacy completed sessions must not fail restart cleanup: ${f.errors}", f.errors.isEmpty())
         f.owner.onConnected(f.port.generation)
         repeat(3) { index ->
             f.observe(stopped().copy(errorCode = -16), listOf(finalRecord))
@@ -1411,7 +1714,11 @@ class RealCollectionControllerTest {
                 f.owner.retry(); f.owner.onConnected(f.port.generation)
                 f.observe(idle())
                 assertEquals(0, f.port.count("start"))
-                assertTrue(f.owner.state.canEndStartAttempt)
+                assertEquals(CollectionPage.HOME, f.owner.state.page)
+                assertTrue(f.owner.state.canStart)
+                assertFalse(f.owner.state.canEndStartAttempt)
+                assertNull(f.store.readPending())
+                assertNotNull(f.store.read()!!.startAttemptArchive)
             }
         }
     }
@@ -1472,7 +1779,9 @@ class RealCollectionControllerTest {
     }
 
     private inner class Fixture(private val uploads: RealUploadPort? = null,
-        private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false) : AutoCloseable {
+        private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false,
+        profileLabel: String = "owner001",
+        identityType: PreparationIdentityType = PreparationIdentityType.RESEARCH_ID) : AutoCloseable {
         val directory = temporary.newFolder()
         var failCommit = false
         var failObservation = false
@@ -1480,7 +1789,7 @@ class RealCollectionControllerTest {
         var failClockEvidence = false
         val clockEvidence = mutableListOf<Pair<PhoneClockSyncEvidence, String?>>()
         val preparation = PreparationStore(File(directory, "profile")) { source, target -> replace(source, target) }.apply {
-            register("owner001", RingPlacement.LEFT_INDEX)
+            register(profileLabel, RingPlacement.LEFT_INDEX, identityType)
             selectRing(ring)
         }
         val store = FreeLivingSessionStore(File(directory, "session.json"), { source, target ->
@@ -1519,8 +1828,11 @@ class RealCollectionControllerTest {
             owner.onTime(port.generation, SensorPacket.TimeStatus(synced, clock.now - 5, 500, clock.now))
         }
 
-        fun seedLocal(simulated: Boolean = false): FreeLivingSession {
-            val session = store.requestStart(preparation.read()!!, ++clock.now, "Asia/Shanghai")
+        fun seedLocal(
+            simulated: Boolean = false,
+            profile: PreparationSnapshot = preparation.read()!!,
+        ): FreeLivingSession {
+            val session = store.requestStart(profile, ++clock.now, "Asia/Shanghai")
             store.confirmStart(session.sessionId, ring.address, collecting(), ++clock.now)
             store.requestStop(session.sessionId, ++clock.now)
             store.confirmStop(session.sessionId, ring.address, stopped(), ++clock.now)
@@ -1602,6 +1914,13 @@ class RealCollectionControllerTest {
             owner.onHealth(port.generation, SensorPacket.Health(status, ++clock.now, reason))
             records.forEach(::health)
             health(HealthMessage.ListEnd(records.size))
+            if (!deferCaptureWaits && !status.collecting &&
+                store.readPending()?.phase == FreeLivingSessionPhase.STOP_REQUESTED &&
+                owner.state.page == CollectionPage.STOPPING) {
+                owner.onHealth(port.generation, SensorPacket.Health(status, ++clock.now, reason))
+                records.forEach(::health)
+                health(HealthMessage.ListEnd(records.size))
+            }
         }
 
         fun battery(charge: Int? = 0) = owner.onBattery(port.generation, SensorPacket.Battery(4100, 100, charge, ++clock.now))
@@ -1620,6 +1939,9 @@ class RealCollectionControllerTest {
         fun finishDownload() {
             health(HealthMessage.DataChunk(0, payload))
             health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            store.readPending()?.takeIf { it.reference != null && it.localData == null }?.deviceRecordEvidence?.let { evidence ->
+                observe(evidence.status, listOf(evidence.record))
+            }
             assertTrue("No processing errors expected: $errors", errors.isEmpty())
         }
 
@@ -1633,6 +1955,8 @@ class RealCollectionControllerTest {
         val inFlight = mutableSetOf<String>()
         val localReview = mutableSetOf<String>()
         var reject = false
+        var configured = true
+        override val available get() = configured
         override fun enqueue(sessionId: String, retry: Boolean) {
             check(!reject) { "Injected upload scheduling failure" }
             requests += sessionId to retry

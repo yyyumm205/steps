@@ -444,17 +444,24 @@ class RealCollectionBridgeInstrumentedTest {
             observe(HealthMessage.Status(true, initialRecord.bytes, initialRecord.records, 0, 7), listOf(initialRecord))
             now += 60_000
             owner.stop()
+            assertEquals(1, port.stopCommands)
             observe(stopped(), listOf(finalRecord))
+            assertEquals(CollectionPage.FINISH, owner.state.taskPage)
+            assertEquals(0, port.readRequests)
+            observe(stopped(), listOf(finalRecord))
+            assertEquals(1, port.stopCommands)
             owner.chooseFinish(true)
             owner.saveReference("17", "valid", "")
             observe(stopped(), listOf(finalRecord))
             assertEquals("errors=$errors", CollectionPage.DOWNLOADING, owner.state.taskPage)
+            assertEquals(1, port.readRequests)
             assertFalse(owner.canReleaseIfIdle())
         }
 
         fun finishDownload() {
             health(HealthMessage.DataChunk(0, payload))
             health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            observe(stopped(), listOf(finalRecord))
             assertTrue("Download and durable commit should succeed: $errors", errors.isEmpty())
         }
 
@@ -469,14 +476,16 @@ class RealCollectionBridgeInstrumentedTest {
     private class FixturePort : RealCollectionPort {
         var generation = 0L
         var disconnects = 0
+        var stopCommands = 0
+        var readRequests = 0
         override fun connect(ring: PreparedRing, generation: Long): Boolean { this.generation = generation; return true }
         override fun disconnect() { disconnects++ }
         override fun queryStatus() = true
         override fun queryBattery() = true
         override fun queryRecords() = true
         override fun start() = true
-        override fun stop() = true
-        override fun read(sessionId: Int, offset: Long, length: Int) = true
+        override fun stop(): Boolean { stopCommands++; return true }
+        override fun read(sessionId: Int, offset: Long, length: Int): Boolean { readRequests++; return true }
     }
 
     private class FixtureUploads : RealUploadPort {

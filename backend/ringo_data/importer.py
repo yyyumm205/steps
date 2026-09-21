@@ -234,6 +234,10 @@ def decode_archive(stage, manifest, limits):
         reasons.append("reference_" + manifest["ground_truth_status"])
     if manifest["timing_warnings"]:
         reasons.append("phone_or_device_timing_warning")
+    if manifest.get("stop_origin") == "device_observed":
+        reasons.append("device_observed_stop")
+    elif manifest.get("stop_origin") == "legacy_unspecified":
+        reasons.append("legacy_stop_origin_unspecified")
     if not any(r["channels"]["imu"]["samples"] for r in reports):
         reasons.append("imu_signal_missing")
     if len(raw_entries) > 1:
@@ -249,16 +253,18 @@ def decode_archive(stage, manifest, limits):
                "reference_rows": 1, "reference_applies_to": "all_raw_files_in_session",
                "limits": asdict(limits)}
     write_json(stage / "quality.json", quality)
-    fields = ["session_id", "participant_id", "installation_id", "ring_placement", "time_zone_id",
+    fields = ["session_id", "participant_id", "installation_id", "ring_placement_schema", "ring_placement",
+              "ring_hand", "ring_finger", "app_version", "created_at", "time_zone_id",
               "utc_offset_seconds", "started_at_ms", "ended_at_ms", "capture_boundary_status",
-              "start_requested_at_ms", "start_confirmed_at_ms", "stop_requested_at_ms", "stop_confirmed_at_ms",
+              "start_requested_at_ms", "start_confirmed_at_ms", "stop_origin", "stop_requested_at_ms",
+              "stop_observed_at_ms", "stop_confirmed_at_ms",
               "ground_truth_source", "ground_truth_steps", "ground_truth_status", "ground_truth_recorded_at_ms",
               "reference_saved_at_ms", "download_completed_at_ms", "activity_code", "activity_label_status",
               "activity_label_source"]
     with (stage / "reference.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
-        writer.writerow({key: manifest[key] for key in fields})
+        writer.writerow({key: manifest.get(key, "") for key in fields})
         stream.flush()
         os.fsync(stream.fileno())
     return quality

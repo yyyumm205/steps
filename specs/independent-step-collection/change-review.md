@@ -1,12 +1,14 @@
 # 采集需求修订：差异与代码影响
 
+当前基线（2026-09-21，总纲3.3.1）：原版Android 0.5.3是实验设计与设备行为的默认信任参考。所有主动差异按第16节记录原版行为、当前行为、改变依据、数据影响、验证证据和“应恢复／已确认改变／证据不足”分类；Python SDK用于补充协议证据，不替代原版Android行为。当前工作区的STOP时序、下载末尾复核、设置owner门禁、五次上传重试及旧记录继续使用已进入软件实现，完整自动测试和真机结论分别记录。
+
 当前增量（2026-09-20，E26）：按已确认走跑分段及三种收尾更新总纲3.1.0。新建session明确选择走路/跑步；停止确认后提供保存上传、保存稍后上传与二次确认放弃。页面复用CollectionFlow，持久策略与放弃审计由SessionStore统一维护，后台恢复和队列执行都检查策略。旧自由活动及冻结包原文保持。
 
 SDK及原Android复核：旧Unix未知记录须先独立完整保全；停止后沿用5秒Flash收尾等待；已核对的HEALTH协议未提供单段物理删除，原版discard只删手机任务。本轮放弃限定本段手机文件和传输，并保存排除标记。无当前采集任务的恢复页可直接返回设备页；时间异常但可证明本次START产生的采集增加一次保护停止与独立保全出口，不生成研究成功状态。实际测试、审查、跨连接限制及设备结果统一记录E26，详细历史由Git保留。
 
 当前增量（2026-09-19）：在[总纲](../../CONSTITUTION.md)2.1.0下统一既有全流程页面与系统控件主题，版本0.6.7-t2p（33），见第12节；实际验证结果及限制记入validation的E17。完整演示与入口恢复的历史证据分别保留于E15/E16，设备确认、数据内容和回执仍为模拟。Q01/Q02状态保持原义，后续交付继续为真实采集与本地数据保全。
 
-更新日期：2026-09-19。分支：`codex/free-living-session-spec`。工作流文档检查与各版本运行证据见[validation](validation.md)，当前进度见[plan](plan.md)。第1–4节保留 `29486e6` 当时的文档审阅依据；第5节起为逐次变更。历史段落按当时版本理解，当前决策以requirements第6节为准。原始资料和本地配置保留。
+更新日期：2026-09-21。分支：`codex/free-living-session-spec`。工作流文档检查与各版本运行证据见[validation](validation.md)，当前进度见[plan](plan.md)。第1–4节保留 `29486e6` 当时的文档审阅依据；第5节起为逐次变更。历史段落按当时版本理解，当前决策以requirements第6节和本文件第16节为准。原始资料和本地配置保留。
 
 ## 1. 面向审阅的变化
 
@@ -19,11 +21,11 @@ SDK及原Android复核：旧Unix未知记录须先独立完整保全；停止后
 | 开始/结束字段较笼统，代码结束包含下载整理 | 分别保存请求/确认、采集边界、设备时间证据、填写和下载完成 | 用户要求参考覆盖同段活动；处理耗时不计入时长 |
 | 多文件已有结构，未定义参考聚合 | 一段全部对应 IMU 汇总后比较一个参考总数 | 文件切分和重传不增加参考步数 |
 | 日统计未规定覆盖/跨日含义 | 明确已采集时段累计、缺失和跨午夜未分配 | 单一参考总数无法准确拆日；完整目标日需另有覆盖证据 |
-| 固定5次走路＋5次跑步验收 | 短时、混合、同日多次、零步、恢复及逐级长时矩阵 | 验收围绕新流程和数据质量；正式人数/周期在试运行后确定 |
+| 至少5次走路＋5次跑步的历史数量要求 | 走路、跑步、同日多次、零步、误混、恢复及逐级长时场景矩阵 | **已确认改变**：验收按场景和数据质量，不预设固定次数；正式人数与周期由研究安排决定，不另设软件试运行阶段 |
 | 无明确长时设备验证方案 | 量化电量、Flash/手机空间、时间/信号连续性和下载/解码耗时 | 时长自主，支持边界由实测给出；接近一天仍待验证 |
 | 当前规格仍称云盘配置及构建待落实 | 引用原版重新构建、配置生效和电脑接口上传记录 | 保留已有证据；手机采集上传、读取和独立版本仍待验证 |
 
-旧规格和本轮核对的源码中未见“必须整日/固定时长”的要求；本轮补上灵活时长和实测边界，避免把示例时长或讨论的“两天/七天”变为限制。旧代码的48小时时间修正窗口也不代表硬件能力。
+旧规格和本轮核对的源码中未见“必须整日/固定时长”的要求；当前采用灵活时长和实测边界，避免把示例时长或讨论的“两天/七天”变为限制。旧代码的48小时时间修正窗口也不代表硬件能力。
 
 总纲由 1.1.0 修订为 2.0.0：采集单位内的活动语义、参考值有效性和分析契约发生变化，按既有修订规则提升主版本。`29486e6` 保存修订草稿，用户随后确认总纲；项目总纲继续唯一维护使命、技术栈和总体路线，三份规格引用它。
 
@@ -54,11 +56,11 @@ SDK及原Android复核：旧Unix未知记录须先独立完整保全；停止后
 
 **可按已确认需求推进的方向：** 自由活动统一入口、每次清零、自主开始结束、编号/位置记忆、整段一个非负总数、异常/缺失区分、旧依赖退出、跨文件归属、未标注语义、已采集时段日汇总、恢复与长时验证设计。T1准备与T2-P演示已完成各自软件范围，真实链路按plan推进。
 
-**重要交互仍供审阅：** requirements的Q01（编号更换）、Q02（确认后纠错），建议分别采用“仅新记录改编号”“保留原值并附研究者修订”。Q03已由用户确认：无法读数时保存缺失及原因，继续保全数据；T2-P已验证软件保存路径，真实上传后续验收。
+**当前交互结论：** Q01已确认空闲切换只影响新记录；Q02依据步数采集交接说明列为应恢复，上传首次尝试前允许修订并保留原值审计；Q03已由用户确认，无法读数时保存缺失及原因并继续保全数据。原版Android 0.5.3没有计步器字段，Q02的依据来自交接说明。
 
 **待补设备或运行证据：** 手机/固件/计步器型号及佩戴说明、真实开始/停止和计步器延迟对应、电量/容量/满后行为、长时信号连续性、长记录下载恢复、手机采集上传及云盘读回。连接断开能否继续采到信号按Flash实际内容判断。
 
-后端读取所需资料库/目录已有[核对记录](../../docs/upload-target-verification-20260918.md)，读取凭据和本机路径待配置。正式人数/周期、可用时长与丢样/时间容忍阈值，在试运行与质量检查后决定。
+后端读取所需资料库/目录已有[核对记录](../../docs/upload-target-verification-20260918.md)，读取凭据和本机路径按本地配置管理。正式人数与周期由研究安排决定；可用时长及丢样／时间容忍阈值以开发验收中的设备实测为依据。
 
 ## 4. 历史文档检查结果（29486e6）
 
@@ -175,31 +177,98 @@ SDK及原Android复核：旧Unix未知记录须先独立完整保全；停止后
 
 ## 15. 原版与 SDK 对照及本地恢复修复（2026-09-21，E27）
 
-依据总纲3.2.0，对照原始 Android 0.5.3、配套后端和 Python SDK `50549cc3`，复核当前0.8.1-local-recovery（43）的用户流程、数据归属与恢复出口。下表记录源码依据；本轮软件、页面和设备检查结果集中见[validation 的 E27](validation.md)，后续顺序见[plan](plan.md)。源码中的等待与校验条件分别说明软件行为，实际固件响应、Flash尾部稳定和可用时长继续按设备证据验收。
+依据总纲3.3.0，对照原始Android 0.5.3、配套后端、步数采集交接说明和Python SDK `50549cc3`，复核当前工作区的用户流程、数据归属与恢复出口。Android 0.5.3是实验设计与设备行为的默认信任基线；Python SDK只补充原版Android未覆盖的协议证据。下表记录源码依据；软件、页面和设备检查结果集中见[validation](validation.md)，后续顺序见[plan](plan.md)。源码中的等待与校验条件分别说明软件行为，实际固件响应、Flash尾部稳定和可用时长继续按设备证据验收。
 
 | 范围 | 原版／SDK依据 | 当前变化与复用边界 |
 | --- | --- | --- |
 | 原生界面与登记 | 原版[MainActivity:109、212、244](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/MainActivity.kt)以原生控件呈现页面，注册／登录调用远端用户服务 | 沿用原生界面；[独立安装身份](../../android/app/build.gradle.kts)和[PreparationStore.register:33](../../android/app/src/main/java/com/nexthci/ringfitness/PreparationStore.kt)支持本地编号、位置及戒指记忆，启动入口为StepPreparationActivity。旧平台账号、睡眠与外部设备流程退出当前被试入口 |
 | 活动与三种收尾 | 原版[MainActivity:793](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/MainActivity.kt)在STOP前选择立即上传、暂存戒指或删除；后续收集主观评价 | 当前每段显式选择走路／跑步并冻结；[StepCollectionActivity:394](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)在停止确认后提供保存上传、保存稍后上传和二次确认放弃。两种保存均先持久化整段参考，再下载至手机；SAVE_LATER跨重开保持暂缓，手机完整保存后可开始下一段 |
 | 放弃范围 | 原版[RingCaptureService.discardStoppedHealthCapture:1336](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)清理手机任务并明确保留戒指Flash；原版[HEALTH命令表:119](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingProtocol.kt)与SDK[命令表:460](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/core/constants.py)均只提供已核对的开始、停止、状态、列表及读取命令 | [FreeLivingSessionStore:225、240](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingSessionStore.kt)保存放弃标记、清理本段手机文件与任务，并排除重取和上传。戒指单条物理删除缺少协议依据，当前放弃按手机清理与排除语义执行 |
-| 本地账本与参考 | 原版UploadSessionStore保存上传元数据及传输状态；原版停止／下载路径还承担采集结束信息整理 | [FreeLivingSessionStore:478、494、598](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingSessionStore.kt)以原子账本保存身份、活动、请求／确认、设备证据、参考、原始文件及传输策略；参考确认先于READ。当前账本v9兼容历史版本，研究manifest v2–v5和既有冻结包分别维护；有效零值、缺失与不可靠参考保留独立含义 |
+| 本地账本与参考 | 原版UploadSessionStore保存上传元数据及传输状态；原版停止／下载路径还承担采集结束信息整理 | [FreeLivingSessionStore](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingSessionStore.kt)以原子账本保存身份、活动、请求／确认、设备证据、参考、原始文件及传输策略；参考确认先于READ。当前账本v12兼容历史版本，研究manifest v2–v7和既有冻结包分别维护；有效零值、缺失与不可靠参考保留独立含义 |
 | BLE串行与START等待 | 原版[RingCaptureService:813、2123](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)等待500ms发送START，1000ms后首查、后续间隔1500ms，最多两次START；SDK[control.py:492](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/ble/control.py)通过无响应GATT写入发送HEALTH命令 | 当前[RingGattCommandQueue:79](../../android/app/src/main/java/com/nexthci/ringfitness/RingGattCommandQueue.kt)等待本地写回调并串行执行；[Coordinator:554、581](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)保留500／1000ms等待和有限STATUS/LIST复查，以单次START及可靠保存的完整归属证据确认开始。命令受理、设备确认和研究边界分别记录 |
-| STOP与Flash收尾 | 原版[RingCaptureService:1122、956](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)收到stopped状态后进入FINALIZING，再等待5000ms查LIST | 当前[Coordinator:166、611](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)发送一次STOP，5000ms后首查完整STATUS/LIST；仍在采集时最多再查两轮、间隔1500ms。两版等待起点有差异，见下表D，当前尚缺停止后尾部稳定的完整保证 |
-| TIME与恢复 | SDK[time_sync.py:28](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/core/time_sync.py)定义SET／GET／STATUS；[connection.py:145、184、324](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/session/connection.py)在连接／重连路径校时 | 当前真实服务启用开始前校时；[Controller:124、471](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)保存TIME回复侧文件并绑定session，再复查空闲记录。旧Unix为0的基线通过UnknownTimeStartEvidence核验新记录的Unix／uptime锚；普通基线的新ID分支仍有缺口B。结束及重连只读TIME、统一开始锚核验与版本化上传证据继续按plan推进 |
-| 下载与上传 | 原版HealthFlashDownload与UploadWorker提供断点文件、打包和云盘任务；SDK[sensors.py:624](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/session/sensors.py)提供分窗读取接口 | [RealSessionDownload:116、138、145](../../android/app/src/main/java/com/nexthci/ringfitness/RealSessionDownload.kt)核对偏移、重放片段、完整长度／packet、CRC及SHA；[FreeLivingSessionPackage.freeze:54](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingSessionPackage.kt)冻结上传包。[RealUploadQueue:44、57、100](../../android/app/src/main/java/com/nexthci/ringfitness/RealUploadQueue.kt)各执行阶段检查持久策略，[RealUploadService:69、108](../../android/app/src/main/java/com/nexthci/ringfitness/RealUploadService.kt)通过网络任务独立上传。下载完成判据与手动入口分别待补C、E |
-| 后端数据含义与校验 | 原版[app.py:81](../../original/RingFitness-0.5.3-Backend-source/backend/ringo_data/app/app.py)接受六类daily_activity_v1；[label_daily_activity.py:128](../../original/RingFitness-0.5.3-Backend-source/backend/ringo_data/scripts/label_daily_activity.py)将整段活动赋给样本，综合同步入口加载Oura | 当前[schema.py:208](../../backend/ringo_data/schema.py)显式校验v2–v5、走跑声明、唯一参考与边界证据；[importer.py](../../backend/ringo_data/importer.py)独立导入原包、保留session关联并输出原始信号CSV和质量结果，逐样本活动保持未标注。START≤STOP≤最终记录的字节数／记录数约束已由`ce03677`实现；本轮[test_status_counters.py](../../backend/ringo_data/tests/test_status_counters.py)补跨版本及兼容分支的回退拒绝、原包保留与合法非递减回归 |
+| STOP与Flash收尾 | 原版[RingCaptureService:1069–1127](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)在STOP后约500ms查询；仍采集时每约1000ms继续查询STATUS；首次收到stopped即进入FINALIZING，约5000ms后才查询LIST，并对记录迟到另做有限重试 | 当前[FreeLivingCaptureCoordinator](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)已恢复同一软件顺序：500ms后只查STATUS、仍采集每1秒续查、首次stopped后等待5秒再查LIST，LIST迟到每2秒重查最多30次；STOP命令入队、高水位和重开恢复证据持久化。自动测试通过，真实固件尾部与断线行为待真机复测 |
+| TIME与恢复 | 原版Android 0.5.3没有TIME SET/GET；Python SDK[time_sync.py:28](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/core/time_sync.py)定义SET／GET／STATUS，[connection.py:145、184、324](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/session/connection.py)在连接／重连路径校时 | 当前真实服务按用户确认的手机时间基准启用开始前校时；[Controller](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)保存TIME回复侧文件并绑定session，再复查空闲记录。该能力是依据Python SDK的已确认技术补齐；结束及重连只读TIME、统一开始锚核验与版本化上传证据继续按plan推进 |
+| 下载与上传 | 原版HealthFlashDownload按8 KiB窗口读取并有限自动补缺，UploadWorker以持久任务对普通错误最多自动尝试5次；SDK[sensors.py:624](../../original/ring-python-sdk-50549cc3/src/ring_python_sdk/session/sensors.py)提供分窗读取接口 | 当前下载仍用16 KiB窗、超时后转手动恢复；完成后最终STATUS/LIST复核、尾部增长续传及跨重开处理已实现。上传已恢复最多5次持久自动重试，SAVE_LATER仍等待用户手动触发。手动入口仍受BLE权限前置影响 |
+| 后端数据含义与校验 | 原版[app.py:81](../../original/RingFitness-0.5.3-Backend-source/backend/ringo_data/app/app.py)接受六类daily_activity_v1；[label_daily_activity.py:128](../../original/RingFitness-0.5.3-Backend-source/backend/ringo_data/scripts/label_daily_activity.py)将整段活动赋给样本，综合同步入口加载Oura | 当前[schema.py](../../backend/ringo_data/schema.py)显式校验v2–v7、走跑声明、唯一参考、停止来源与边界证据；[importer.py](../../backend/ringo_data/importer.py)独立导入原包、保留session关联并输出原始信号CSV和质量结果，逐样本活动保持未标注。START≤STOP≤最终记录的字节数／记录数约束已由`ce03677`实现；本轮测试补跨版本及兼容分支的回退拒绝、原包保留与合法非递减回归 |
 
-本轮已修的恢复问题集中在两条路径。[Controller.pendingReferencePage:1071](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)依据已持久化的停止确认保留收尾和填数页，断连期间可保存参考；[StepCollectionActivity.render:120](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)在仅连接、重试或提示变化时更新提示，保持输入控件与焦点。[RealCollectionService:346](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionService.kt)在后台任务进展后重新检查页面占用及待处理任务，满足已请求释放且无页面占用、无待保存任务时释放采集owner，准备页可继续接管。实际回归范围以E27为准。
+E27已修复停止确认后断连仍可填数、输入焦点保持及后台完成后释放采集owner。当前工作区进一步完成设置写操作与真实owner统一门禁、STOP命令入队、来源审计及原版Flash收尾软件顺序、下载末尾最终STATUS/LIST复核、普通上传最多五次持久自动重试、上传前参考纠错，以及旧记录／已放弃记录不再直接形成文案阻断。Android全量565项、Python 506项及Debug／AndroidTest构建结果见E28。陌生旧记录开始前备份及手机边界入包仍是待编码缺口；STOP与Flash真机证据继续分开记录。
 
-以下为本次静态核对仍成立的缺口。影响限定于可触发的软件分支；实际设备是否发生记录变化及其信号影响，须结合命令日志、设备记录和原始文件判断。
+以下为静态核对仍成立的缺口。影响限定于可触发的软件分支；实际设备是否发生记录变化及其信号影响，须结合命令日志、设备记录和原始文件判断。
 
 | 项 | 证据与影响 | 待实现／待验方案 |
 | --- | --- | --- |
-| A．采集中意外停止的收尾出口 | [Coordinator:279、733、166](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)：无查询轮且账本为COLLECTING时，即使STATUS同ID、error=0、计数未回退，`collecting=false`仍调用rejectAssociation并持久失效。后续requestStop要求有效归属，普通停止／参考收尾出口因此不可达 | 为可核验的意外停止保留记录归属、完整STATUS/LIST复核和异常收尾出口；区分用户STOP与设备自行停止的边界证据。回归同ID正常stopped、错误码、计数回退、重连和重启 |
+| A．采集中意外停止的收尾出口 | 当前[Coordinator](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)在同ID、error=0、计数不回退时启动完整只读定稿，保存`DEVICE_OBSERVED`来源并在5秒Flash等待后进入参考收尾；身份、错误或计数矛盾仍保留数据并拒绝归属 | **软件已实现，设备待验**。回归覆盖正常stopped、错误码、计数回退、重开及不发送第二次STOP；真机须验证固件自行停止、尾部增长与断线恢复 |
 | B．TIME锚核验覆盖不一致 | [Controller.beginCapture:482](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)仅为旧Unix0基线构造强锚证据；[Store.isDistinctStartRecord:749](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingSessionStore.kt)在普通基线遇新ID可直接接受。[Coordinator:589、696](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)允许Unix0、uptime非零的新记录进入COLLECTING，跨连接恢复又要求Unix非零，造成已开始任务的恢复缺口。TIME侧文件已普遍保存，缺口位于统一使用这些证据的确认规则 | 统一新开始的TIME与记录锚核验；时间矛盾或Unix0时保留受控停止与原始保全出口。覆盖空基线、普通旧记录、旧Unix0、新ID／复用ID、时间矛盾及跨连接恢复；同步核对上传证据 |
-| C．正式下载期间缺少记录复核 | [Controller.onHealth:297](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)的正式下载分支忽略STATUS等其他消息；最终READ_END通过冻结长度及文件校验后直接completeLocalData，缺少末尾新STATUS/LIST。文件校验只能证明与下载前冻结记录一致，设备侧后续变化尚未纳入完成判定 | 下载中跟踪状态变化；完成前重新取得完整STATUS/LIST并比对身份、计数及停止状态，成功后再标记本地完整。回归增长、替换、计数回退、额外记录及最后一窗断连 |
-| D．5000ms等待起点不同 | [Coordinator:177、181、639](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)从STOP请求入队后计时，首次匹配stopped且STATUS/LIST计数相等即确认并冻结；原版从收到stopped后再等5000ms。若设备较晚停止，当前可能在Flash尾部仍增长时冻结较早计数，之后的下载预检可能因变化进入恢复 | 以首次可核验stopped为收尾等待起点，结合完整记录观察确认尾部稳定；保持一次STOP。记录STOP请求、首次stopped、后续计数和下载时间，回归延迟停止及停止后继续增长 |
-| E．手动上传入口仍经过BLE准备条件 | [StepPreparationActivity:343、352](../../android/app/src/main/java/com/nexthci/ringfitness/StepPreparationActivity.kt)先检查权限、蓝牙和适用系统的定位，再显示历史记录入口；[RealCollectionActivity:27](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionActivity.kt)也要求蓝牙权限。后台上传已独立，用户从启动页主动上传本地完整记录仍受这些条件影响 | 提供从本地记录直达手动上传的入口；采集和下载继续在各自操作边界检查BLE。验证蓝牙关闭、权限撤回、仅网络可用时的查看、暂缓与手动上传 |
-| F．历史卡缺少日期 | [StepCollectionActivity:267](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)卡片显示活动、步数及状态，未显示日期／时间；同日多段或不同日期相同步数的记录难以区分 | 按session已保存的时区展示采集日期与时间，未知边界保持对应状态；检查同日多段、跨日及手机时区变化后的辨认与重试对象 |
+| E．手动上传入口仍经过BLE准备条件 | [StepCollectionActivity:342–370](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)已在唯一首页显示本地记录和手动上传入口；但[RealCollectionActivity:27–34](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionActivity.kt)仍在页面启动时统一要求BLE权限，权限撤回时无法进入记录页。后台上传已独立，用户主动查看和上传本地完整记录仍受BLE条件影响 | 将查看记录和手动上传从采集连接前置条件中分离；采集和下载继续在各自操作边界检查BLE。验证蓝牙关闭、权限撤回、仅网络可用时的查看、暂缓与手动上传 |
+| F．历史卡日期已实现，验证待补 | [StepCollectionActivity:342–370](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)按`startedAtMs`显示日期、时间、活动、步数和状态；[StepCollectionActivity:795–797](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)当前按手机默认时区格式化历史时间 | 改为按session已保存的时区显示，并检查同日多段、跨日、手机时区变化及未知开始边界；完成行为验证后关闭本项 |
+| G．原版后台恢复能力尚未对齐 | 原版采集中约每3秒持续重连，记录延迟出现时约每2秒查询、最多30次；当前活跃采集采用有限重连和较短记录等待，且未完整记录断线区间 | 恢复持续重连、延迟记录等待和断线区间审计；覆盖后台、进程重建、手机重启、长时离线后恢复及记录迟到 |
+| H．长时系统保护不完整 | 当前采集服务存在，但通知权限、电池优化豁免和长时上传前台保护尚未形成完整用户路径 | 在支持系统上检查通知权限与电池优化状态；为长时上传提供可观察保护。验证拒绝、系统回收、重启和网络恢复 |
+| I．卸载／清数据会删除私有记录 | session、参考、rfbin和上传队列位于应用私有目录；原位升级可保留，卸载或清除数据后无法自动恢复 | 正式交付前提供并验证卸载前保全／导出与校验；未保全记录禁止把卸载重装作为恢复建议 |
+| J．上传前参考纠错 | 步数采集交接说明要求上传前可修改参考；原版0.5.3没有计步器字段 | 当前工作区已恢复未尝试上传记录的修订入口、原值审计和ZIP失效；修订与上传冻结共用发布锁，上传取得发布权后读数即冻结。自动回归和模拟器成功／失败反馈仍待本轮补证 |
+| K．手机采集边界未进入新包 | 原版[RingCaptureService:813–821、1027–1048](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)在START命令受理时记录手机开始时间，在下载完成时写入手机结束时间和rfbin | 当前账本保存START/STOP请求、命令入队和设备确认时间，但`started_at_ms`、`ended_at_ms`只接受尚未生成的设备边界证据，正常正式包与rfbin多为空；TIME校时侧文件也未进入冻结ZIP | **应恢复**：保留原版手机边界并标明来源，设备精确边界另行表达 | 当前字段为空会削弱跨包排序、时长核对和研究端追溯。以新版本字段保存手机命令／确认窗口及TIME证据，不把手机时间宣称为精确样本边界；旧包空值保持原义 |
 
-以上待验方案沿用已确认的分段、清零、唯一参考及三种收尾规则。下一步优先补齐异常停止、统一TIME确认和Flash收尾／下载复核，再完成设备故障恢复、逐级长时及独立操作验收。
+以上待验方案沿用已确认的分段、清零、唯一参考及三种收尾规则。下一步先恢复原版STOP顺序、手机边界和陌生旧记录非阻塞开始，再补齐持续重连／延迟记录、8 KiB补缺、统一TIME证据和卸载前保全；随后完成设备故障恢复、逐级长时及独立操作验收。意外停止的异常出口与下载末尾复核继续接受完整自动测试和真机验证。
+
+## 16. 原版信任基线差异登记（总纲 3.3.1）
+
+本表以 Android 0.5.3、配套后端、步数采集交接说明和 Python SDK 为基线，覆盖当前正式流程中的实质差异。后续设计和实现审查先查本表：界面精简只能改变呈现层级；实验字段、操作顺序、设备协议、Flash 处理或恢复规则发生变化时，必须补充批准依据、数据影响和验证证据。
+
+分类含义如下：**应恢复**表示基线要求仍适用但当前尚未对齐；**已确认改变**表示项目负责人或总纲已明确批准；**证据不足**表示当前实现可能合理，但设备或研究证据尚不足以替代原版行为。
+
+| 范围 | 原版／交接行为 | 当前行为 | 分类与改变依据 | 数据影响、证据及下一步 |
+| --- | --- | --- | --- | --- |
+| 身份 | 0.5.3通过远端注册／登录取得研究用户，用户名限3–24位字母数字；服务端分配`participant_id`，可跨手机保持一致，空闲时可切换用户 | 本地显式选择“研究编号”或“本地姓名”；姓名仅在手机内使用。研究编号直接规范化；本地姓名的匿名ID由姓名和本次安装ID共同生成，切换只影响新session | 本地入口与匿名上传为**已确认改变**；姓名身份映射为**证据不足** | 同一姓名在卸载重装或换手机后会分成不同匿名ID；同一安装内两名同名用户会合并到同一ID。正式实验先使用研究编号，或补可审计的唯一身份映射；验证切换、删除和重开不改写旧记录，本地姓名不进入ZIP或云端 |
+| App升级后的身份确认 | 0.5.3在versionCode变化后回到登录页，要求重新确认用户；服务端研究身份随后恢复 | 当前原位升级沿用本地身份、戒指、佩戴位置、session和上传任务 | **已确认改变**：负责人要求安装更新优先保留有效设置与新实验记录 | 避免升级中断采集，但须用连续两个versionCode验证身份与历史文件哈希不变、未完成任务仍归原session；卸载仍按独立保全规则处理 |
+| 佩戴位置 | 明确保留左右手食指、中指、无名指，共六种，并写入手与手指字段 | 同样保存六种并冻结到session，另记住最近一次选择 | 六种位置为**应保持的基线**；记住最近选择为**已确认的便利变化** | 删除手指选项会改变实验字段，目前无批准依据。须验证最近值仅作为下一段默认值，不回写旧session |
+| 戒指选择与连接 | 原版持久保存所选地址和名称；空闲冷启动仍回戒指页，要求搜索／选择并显式连接，只有活跃任务恢复时自动连接 | 选中后保存戒指并进入唯一首页；条件齐备的空闲冷启动自动尝试一次只读连接，由采集服务校时和检查 | **已确认改变**：总纲3.3.0允许收敛页面层级 | 原版并非完全不记戒指，差异在空闲冷启动是否自动连接。导航减少，但实际连接地址必须与保存地址一致；连接、切换、返回、自动尝试上限和进程重开仍需行为验证 |
+| 设置与采集owner | 0.5.3在健康采集非空闲时拒绝切换用户；连接、采集及戒指任务由同一服务状态约束 | 当前工作区同时检查pending session与真实采集服务owner；连接、设备检查、保全、下载或保存期间只允许返回当前任务，owner释放后才允许切换 | **应恢复，软件已实现** | Android全量回归通过；真机还须验证设置页与服务竞态、进程重建及旧回调隔离，未取得这些证据前不记为设备通过 |
+| 扫描候选信息 | 原版[MainActivity:294](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/MainActivity.kt)显示设备名称与RSSI，便于在多枚戒指中依据距离选择 | 当前[StepPreparationActivity:841](../../android/app/src/main/java/com/nexthci/ringfitness/StepPreparationActivity.kt)显示名称与地址尾号，RSSI未作为主候选信息 | **应恢复**：没有实验依据删除RSSI | 多戒指环境下地址尾号可追溯但不表达距离。恢复名称＋RSSI，地址尾号保留为辅助信息；验证刷新时选择对象稳定 |
+| 设备详情 | 原版[MainActivity:340–343](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/MainActivity.kt)显示名称、RSSI、电量和固件，并可刷新电量 | 当前正式入口只展示保存的名称及连接／就绪状态；正式owner尚未查询或展示常规RSSI、电量、固件，完整地址和Flash计数也尚未形成可用详情。`RingPreparationController`中的相关实现当前不可达 | 原版四项为**应恢复**；完整地址与Flash计数为**已确认的技术补充** | 电量影响长时采集，固件、地址和记录量影响追溯。详情按需展开，不增加主路径步骤；验证数据来自当前连接而非缓存或死代码 |
+| 活动范围 | 支持走路、骑车、跑步、工作、吃饭、其他，并含睡眠、Oura、Polar和评分流程 | 被试入口仅保留走路、跑步；每类为独立session，分别清零和填写参考步数 | **已确认改变**：总纲3.0.0及负责人明确选择“两次独立采集” | 活动枚举与原版不兼容，由版本化manifest和后端显式校验；旧平台、睡眠、外设和评分退出当前范围 |
+| START时序与错误处理 | 空闲后约500 ms发START，约1000 ms首查，之后约1500 ms轮询；每次最多3查、最多2次START；非零错误仍进入有限尝试 | 保留500／1000／1500 ms和最多3轮完整STATUS/LIST；只发一次START；除严格的同连接charging `-16`恢复证据外，空闲错误阻止开始 | **证据不足**：单次START和更严格门禁保护归属，但尚未证明覆盖原版设备恢复能力 | 需用真实戒指验证正常开始、迟到确认、charging `-16`和断连恢复。现阶段不得宣称当前策略优于原版，也不得循环发送START试错 |
+| HEALTH查询超时 | 原版START单轮约4秒，其他HEALTH命令通常约10秒 | 当前完整STATUS/LIST统一按30秒等待，超时后进入重连或恢复 | **证据不足** | 等待长度会改变失败反馈和重连节奏。分别记录命令发送、回复和超时，用两种手机及正常／迟到设备回复验证后决定保持或恢复原值 |
+| 初次BLE连接超时 | 原版BLE客户端及采集服务没有同等的整段初连超时 | 当前[RealCollectionController:775–779](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)在30秒仍未ready时主动断开并进入可重试状态 | 恢复出口属于技术增强，30秒阈值为**证据不足** | 用华为、三星覆盖正常、慢连接、戒指休眠和超时后重试；记录连接开始、GATT回调、ready及断开，确认阈值不会切断可恢复连接 |
+| 连接就绪后的查询节奏 | 原版[RingCaptureService:1565–1581](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)在普通空闲连接就绪后约250ms查询STATUS、约600ms查询固件；电量查询按用户请求或恢复探测另行调度 | 当前[RealCollectionService:69–72](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionService.kt)在BLE ready回调后立即交给正式owner查询STATUS/LIST；不可达的旧准备控制器虽然能排入电量、INFO和STATUS，但不属于运行路径 | **证据不足** | 当前正式入口缺少原版固件／常规电量查询，立即STATUS/LIST也可能影响初始化和历史`-16`。用同一手机／戒指分别验证250ms与当前节奏，记录完整TX、回复与文件指纹；确认前保持差异显式可追溯 |
+| STATUS扩展错误原因 | 原版兼容15字节STATUS并使用`collecting`、计数、`err_code`和`session_id`；第16字节不参与状态判断 | 当前继续兼容15字节，并依据Python SDK解析新版第16字节`error_reason`；只有同连接、5秒内、空闲`-16`、原因`charging`且电量接口确认未充电时，才允许一次兼容START | SDK协议解析为**已确认的技术补充**；用扩展原因改变START门禁仍需**真机验证** | 旧固件缺少第16字节时保持未知，不猜测原因。自动测试覆盖字段长度、符号错误码和证据组合；两枚戒指须验证charging原因何时清除、正常开始后错误归零及失败时不重复START |
+| STOP与Flash收尾 | STOP后约500ms查STATUS；仍采集则每约1000ms继续查；首次stopped后等待约5000ms，再查询LIST并等待迟到记录 | 当前工作区已按原版顺序拆开停止确认与Flash读取；LIST迟到每约2000ms重查，最多30次。已受理STOP后的进程重开继续只读查询，不重复发送STOP | **应恢复，软件已实现** | 565项JVM覆盖持续collecting、LIST迟到、计数增长、已受理STOP重开和最终定稿。须用真机确认实际回调节奏、Flash尾部、断连和整机恢复后再记为设备通过 |
+| 收尾选择 | STOP前选择立即上传、暂存戒指、删除或继续；“暂存”将原始数据留在戒指 | 先确认STOP，再选择保存并上传、保存稍后上传或放弃；两种保存均先下载到手机，网络上传独立执行 | **已确认改变**：总纲3.1.0及负责人确认的三分支 | 顺序变化提高手机端保全能力。须验证三分支、重启、删除中断和暂缓后手动上传；“放弃”只清理本段手机任务并排除重取，戒指Flash仍保留 |
+| 参考步数与异常读数 | 原版Android 0.5.3无计步器字段；步数采集交接说明要求一个session对应一个整数，并允许上传前修改 | 支持有效0、缺失及不可靠读数；未尝试上传前可修改，保留原值审计并原子失效旧ZIP；参考修订与上传冻结共用发布锁 | 异常类型为**已确认改变**；上传前纠错为**应恢复，软件已实现** | 缺失不得当作0。上传取得发布权后冻结，已发送记录不得静默覆盖；弹窗须在持久化成功后才显示成功。完整自动回归与模拟器交互仍待本轮补证 |
+| 独立session异常说明 | 原版结束时可填写本段活动细节；完整主观评分另属已退出范围 | 当前原因字段绑定计步器读数质量，无法独立表达误混其他活动、额外休息、佩戴中断或其他本段事件 | 窄范围session异常说明为**应恢复**；原版评分量表退出仍是**已确认改变** | 活动／佩戴事件不得写入计步器“不可靠”原因，以免改变参考值语义。收尾页提供简短可选说明，独立写入session质量与研究包；测试空白、重开、修订和后端读回 |
+| 既有Flash记录与归属 | 0.5.3启动前查询STATUS，不以LIST中的既有Flash记录阻断新START，也不在开始前强制下载全部陌生记录 | 当前把完整STATUS/LIST作为START基线；陌生记录虽不再显示人工阻断，但[RealCollectionController:818–905](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)通常会先逐条整段备份，数MB旧记录仍可能长时间占用入口 | 直接继续使用为**应恢复**；更严格的新段归属证据为**已确认的技术增强** | 只保护本App账本中的未完成任务；陌生旧记录作为只读基线，不归入当前被试。备份移到研究者工具或明确操作，不作为正常START前置；回归多记录、未知时间、ID复用和固件自然覆盖 |
+| 陌生的正在采集任务 | 原版[RingCaptureService:1085–1091](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)在本地空闲／开始中观察到`collecting=true`时，会按当前profile和手机时刻接管该任务 | 当前[FreeLivingCaptureCoordinator:800–824](../../android/app/src/main/java/com/nexthci/ringfitness/FreeLivingCaptureCoordinator.kt)拒绝以正在采集的基线授权新START；没有本地pending时也不自动归属 | 自动归入当前被试会扩大错绑风险，当前保守策略为**证据不足** | 必须提供可执行的保全后停止、继续或导出路径，不能停在无出口恢复页。用同一戒指覆盖App重装、换机和服务账本丢失，确认研究身份规则后再决定是否恢复自动接管 |
+| 放弃后的未知时间记录 | 0.5.3的“删除数据”只清理手机任务并保留戒指Flash，源码未以保留记录阻断下一次START | 当前工作区保留放弃标记并按设备指纹排除重取；`unix_ms=0`和跨连接不再直接锁住戒指，新段仍需同连接完整基线和可区分记录 | **应恢复，软件已实现** | 自动测试覆盖不重取、其他记录保持和继续开始；真机还须验证放弃后固件覆盖、重连和新段归属 |
+| 下载窗口与补缺 | 原版[RingCaptureService:2138、2140](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)使用8 KiB READ窗口，并对缺失窗口作最多3次自动补读 | 当前[RealCollectionController:878、1137](../../android/app/src/main/java/com/nexthci/ringfitness/RealCollectionController.kt)使用16 KiB窗口；超时后保留断点并转手动恢复 | **应恢复** | 不同窗口可能改变固件负载、超时率和长记录恢复体验。先恢复8 KiB及有限补缺，或取得真机证据后批准差异；验证断线、重复片段、缺窗和长记录 |
+| 下载完成判据 | 0.5.3冻结目标记录后完成下载，没有当前增强的末尾设备复核 | 当前工作区在READ_END后重新取得完整STATUS/LIST；尾部增长继续下载，跨重开可继续，旧基线自然消失可接受，陌生新增或替换拒绝 | **已确认的完整性增强，软件已实现** | 定向测试及Android全量回归覆盖尾部多次增长、迟到READ_END、替换和重开；真机尾部增长仍待验证，原始文件与冻结ZIP保持原文 |
+| TIME与实际时间 | 原版Android 0.5.3没有TIME SET/GET，但保存START受理与下载完成的手机边界；Python SDK在连接／重连路径提供SET、GET和STATUS | 当前只在新START前按手机时间校时并保存TIME侧文件；采集中重连不写时钟。请求、入队和确认时间在账本中，但新包的`started_at_ms`／`ended_at_ms`通常为空，TIME侧文件未冻结进ZIP | 手机校时为**已确认的技术补齐**；恢复原版手机边界及上传TIME证据为**应恢复**；重连期间是否SET为**证据不足** | 原版手机边界与设备精确边界须分来源保存。先在结束／重连做只读TIME GET，统一开始、恢复、结束和上传证据中的时间锚；真机验证漂移、重启及采集中连续性后再决定是否写时钟 |
+| 历史时间显示时区 | 原版按查看时手机当前默认时区格式化历史时间 | 当前按session创建时保存的IANA时区显示，日期和时间使用纯数字格式 | **已确认的可追溯增强，软件已实现** | 用户换时区后仍能看到采集发生地的原日期，减少跨午夜误读。自动与模拟器测试已覆盖session时区；真机还须核对换时区、跨午夜和旧账本缺少时区时的回退 |
+| 页面与后台任务 | 登录→戒指→模式→活动采集；采集中禁用返回，页面与采集服务共同管理流程 | 首次身份→选择戒指→唯一首页→同一采集页→同一收尾页；离开页面后服务继续持有任务 | **已确认改变**：总纲3.3.0的极简导航 | 页面可退出不等于任务终止。后台owner、账本恢复、停止出口和保存结果必须与页面状态一致；禁用外观不得伪装成可点击按钮 |
+| 连接与就绪语义 | 原版将BLE连接和可执行采集状态分阶段呈现，操作入口由实际状态决定 | 当前工作区统一为“正在连接／连接已中断／已连接，正在检查／正在保存已有数据／可以开始／暂不可开始”；检查完成前不显示可开始 | **应恢复，软件已实现** | 模拟器验证同屏只有一个权威结论；真机仍须把实际GATT、STATUS/LIST与页面逐帧对应，每个阻断状态只保留真实可执行动作 |
+| 设置入口与忙碌态 | 原版采集中禁止切换，但当前用户和设备信息仍可查看 | 当前工作区首页只保留顶部“设置”；busy时可进入只读管理并返回当前任务，身份／位置／戒指写操作在实际落盘前再次核对owner | **应恢复，软件已实现** | 模拟器覆盖连接、owner接管竞态和只读入口；真机继续验证采集、下载、保存和上传各阶段的信息及返回目标 |
+| 恢复页出口 | 原版按采集、传输、上传阶段提供继续、重连、重传或放弃等动作 | 当前部分恢复态没有可执行出口；服务停止后顶部“首页”动作可能失效 | **应恢复** | 每个恢复状态绑定可测试动作及目标页；服务不可用时重建owner或回到唯一首页。禁止只替换成“重开App”文案 |
+| 记录列表与本地工具 | 原版[MainActivity:482、1055–1128](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/MainActivity.kt)提供完整列表、重传、删除本地记录和CSV导出 | 当前[StepCollectionActivity:348](../../android/app/src/main/java/com/nexthci/ringfitness/StepCollectionActivity.kt)只显示全部未上传与最近3条已上传，缺少查看全部和导出；手动上传入口还受BLE权限／owner启动约束 | 查看全部、重传与导出为**应恢复**；删除本地记录为**证据不足** | 研究者和被试无法核对更早记录或在无BLE权限时上传。先恢复完整列表、导出和仅网络上传；删除须明确原始数据保全、云端回执及其他记录隔离后再开放 |
+| 冷启动首帧 | 原版依据持久资料决定登录或主流程 | 当前工作区在档案与账本载入完成前显示中性进度，完成后一次进入登记或首页；保存中同样使用进度而非禁用按钮 | **应恢复，软件已实现** | 模拟器覆盖载入、保存、损坏副本恢复和正式入口冷启动；真机强停、低速存储及进程重建仍待验 |
+| 错误与恢复入口 | 0.5.3按采集、传输和上传阶段显示具体失败，并保留相应重连、继续传输、放弃或重试入口；部分复杂错误仍需研究者处理 | 正式页面把所有含“联系研究者”的内部错误统一显示为“重新打开App后继续”；多条未知记录、设备信息不完整、时间证据不足和账本读取失败等状态重开后仍可能复现，部分状态没有可执行按钮 | **应恢复**：界面承诺的恢复操作必须与底层实际能力一致 | 虚假的重开建议会形成循环，并掩盖数据或设备阻断原因。每类错误应映射到已经实现且可验证的恢复动作；无自助恢复能力的状态保留数据并提供明确的导出／更换设备路径，不能只替换文案 |
+| 旧MainActivity | 0.5.3的MainActivity承载原版登录、记录、导出和多实验流程 | 独立版启动入口已不可达旧MainActivity，但旧代码仍参与编译 | **证据不足**：暂留作行为参考，不作为当前运行路径 | 团队容易误把不可达代码当现行实现。文档和测试明确入口归属；完成对照与迁移后再决定隔离或删除，架构调整须单独审阅 |
+| 正式包中的旧服务 | 原版只使用`RingCaptureService`和`UploadJobService`承担旧采集／上传契约 | 当前正式Manifest同时注册新的`RealCollectionService`、`RealUploadService`和两项旧服务；旧Activity虽不可达，旧服务仍可被包内代码启动 | **应恢复**：正式独立版只能有一套采集与上传owner | 发布前把旧服务从正式Manifest及可执行源集隔离，原版源码保留为只读参考；增加正式build无法启动旧采集／上传服务的回归，避免两套账本和两个BLE owner并存 |
+| Manifest与隐私 | 上传真实用户名、六类`daily_activity_v1`及主观评价，没有参考步数字段 | 版本化manifest上传匿名participant ID、走跑任务、参考质量、请求／确认边界、设备证据、佩戴位置与App版本；本地姓名不上传 | **已确认改变**：当前研究范围与隐私要求 | 新旧包必须按版本分路，原始清单与冻结ZIP保持原文；设备、身份、session和参考值的关联需由后端严格校验 |
+| 上传目标配置 | 原版构建脚本为活动上传提供硬编码默认云盘链接 | 当前默认值为空，只从被忽略的本地构建配置注入；无配置时允许完整本地保存和稍后上传 | **已确认改变**：总纲要求链接与凭据不进入Git | 发布APK验收必须读取构建产物确认目标已注入，同时扫描仓库无明文；无配置版本不得显示虚假上传成功 |
+| 上传网络超时 | 原版连接超时30秒、普通读取60秒、上传读取最长30分钟 | 当前连接20秒、读写30秒；单次任务总期限为120秒加文件大小按16 KiB/s计算的时间 | **证据不足** | 当前有界期限利于失败恢复，但小／中包在弱网下可能早于原版中止。用真实包覆盖正常网络、限速、断网和恢复，记录首字节、总耗时与重试；证据形成前不把当前阈值视为设备支持边界 |
+| 上传回执校验 | 原版读取响应数组第一项的名称和ID | 当前要求响应恰有一项、文件ID格式有效、服务端size与冻结ZIP字节数完全一致 | **已确认的完整性增强** | 严格回执阻止错误文件被记为成功；须用真实云盘覆盖正常回执、多项／缺字段／大小不符、回执丢失与幂等重试，原ZIP和任务绑定保持不变 |
+| 后端活动标签 | 原版接受六类`daily_activity_v1`，并可把整段活动标签写到每个样本；综合入口还同步Oura等数据 | 独立导入器接受版本化走跑数据包；`walking/running`只作为session任务声明，逐样本活动保持未标注 | **已确认改变**：负责人已确认走路／跑步独立session，总纲要求任务声明与逐样本真值分开 | 休息、起止过渡或误混不会自动标成走路／跑步真值。后续活动分类评价需另采明确时间标签；历史自由活动保持原义 |
+| 后端异常时间处理 | 原版解码器在设备epoch异常或相邻跳变超过5分钟时，使用手机开始时间和连续采样间隔重建确定时间 | 当前保留原始uptime，正式绝对时间未知时留空，并另给带来源和区间的手机估计时间 | 手机对齐方向为**已确认改变**；稳定估计仍依赖“手机边界入包”的**应恢复**项 | 当前方法更保守，但手机边界缺失时无法生成稳定区间。补齐版本化边界后，对照同一原始包验证排序、间隔、跨午夜和日汇总资格；原始字节与旧冻结包不改写 |
+| 研究端设备索引 | 原版导出可按原始session和设备文件核对；独立manifest已保存戒指地址、设备session及记录锚 | 当前导入保留原始manifest，但`reference.csv`和summary没有直接展开戒指、device session和记录锚 | **应恢复**：属于研究端可追溯性，不改变原始数据 | 补充稳定索引列并保持旧CSV兼容；用同一戒指ID复用、换戒指和重复导入验证，避免研究者仅凭文件名或时间猜测归属 |
+| 普通上传失败重试 | 0.5.3把普通上传异常重新置为queued，交给持久JobScheduler指数退避，最多自动尝试5次；永久错误或达到上限后才进入failed | 当前[RealUploadQueue](../../android/app/src/main/java/com/nexthci/ringfitness/RealUploadQueue.kt)已恢复最多5次持久自动重试；永久配置／本地校验错误隔离，SAVE_LATER等待用户首次手动触发；任务v2持久区分已取得发布权与已开始HTTP，联网前取消或进程退出可释放claim | **应恢复，软件已实现** | 定向队列及565项Android全量测试覆盖传输层首次联网前取消、冻结包时进程退出、旧v1任务保守恢复、五次上限、手动续试、回执恢复和任务隔离；手机重启及真实网络中断仍待验证 |
+| 上传完成后的本地副本 | 原版上传成功后删除临时archive，保留采集目录 | 当前保留raw、evidence、冻结ZIP及snapshot，完成后至少多留一份冻结副本 | 追溯性增强与长期空间成本并存，分类为**证据不足** | 冻结ZIP承担回执和重导核对，暂不删除。依据长时存储实测确定保留期、导出确认和按session清理规则；空间不足时必须保护未上传及未验证记录 |
+| 采集中重连与断线审计 | 原版[RingBleClient:544、557](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingBleClient.kt)连接丢失后约每3秒持续重连，[RingCaptureService:1517](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)记录断线区间 | 当前活跃采集只进行有限重连，断线区间尚未完整进入session质量证据 | **应恢复** | 长时离线后可能停留在不可恢复状态，研究者也无法区分BLE离线与信号缺失。恢复持续重连和断线开始／结束审计，真机验证远离、返回和后台运行 |
+| Flash记录延迟出现 | 原版[RingCaptureService:1145、2142–2143](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingCaptureService.kt)每约2秒查询记录，最多30次等待固件生成可读条目 | 当前工作区已恢复每约2秒查询、最多30次的软件顺序 | **应恢复，软件已实现** | 自动测试覆盖立即出现、迟到和始终缺失；真实较慢固件、查询中断、进程／整机恢复仍待真机验证 |
+| BLE无响应写回调 | 原版[RingBleClient:135、464](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingBleClient.kt)对WRITE_NO_RESPONSE按固定节奏推进，不依赖每次平台写完成回调 | 当前[RingGattCommandQueue:79](../../android/app/src/main/java/com/nexthci/ringfitness/RingGattCommandQueue.kt)等待本地写回调后推进，超时会关闭通道 | **证据不足** | 当前策略可增强串行性，也可能在不回调的Android实现上卡住。保持命令幂等边界，用不同手机真机核对回调、超时和重复发送后再决定保留或恢复原节奏 |
+| BLE写回调非零 | 原版[RingBleClient:190–210](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingBleClient.kt)在WRITE回调非零且特征支持NO_RESPONSE时切换写类型重试；其他非零结果记录错误后继续队列 | 当前[RingGattCommandQueue:72–84](../../android/app/src/main/java/com/nexthci/ringfitness/RingGattCommandQueue.kt)遇任意非零回调即关闭连接，由上层重连和核对 | **证据不足** | 直接降级可提高兼容性，也可能重复已生效命令；关闭连接更保守但会扩大中断。华为、三星分别记录特征属性、callback status、设备回复与命令是否生效后决定 |
+| MTU就绪门控 | 原版[RingBleClient:160–175](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingBleClient.kt)在CCCD成功并请求MTU 247后宣布ready，不等待`onMtuChanged` | 当前[RingBleClient:165–183](../../android/app/src/main/java/com/nexthci/ringfitness/RingBleClient.kt)与[RingGattCommandQueue:37–69](../../android/app/src/main/java/com/nexthci/ringfitness/RingGattCommandQueue.kt)要求收到MTU回调，约5秒无回调即关闭连接 | **证据不足** | 当前门控能明确协商结果，也可能让不回调的平台无法进入就绪。华为API31与三星API34分别记录请求、回调、实际MTU和失败行为后决定 |
+| GATT回调线程与PHY | 原版`connectGatt`使用系统默认回调线程和默认PHY | 当前显式使用主线程Handler与`PHY_LE_1M` | **证据不足** | 主线程串行化便于状态一致，但可能改变厂商栈调度与无线兼容。用两种手机、两枚戒指覆盖连接、重连、长时与切后台，并保存连接参数证据 |
+| INFO回复兼容 | 原版[RingProtocol:232–241](../../original/RingFitness-0.5.3-Android-source/app/src/main/java/com/nexthci/ringfitness/RingProtocol.kt)收到9字节基本头即可返回固件信息 | 当前[RingProtocol:288–313](../../android/app/src/main/java/com/nexthci/ringfitness/RingProtocol.kt)依据SDK要求完整`9 + 5 × count`组件；长度不足会丢弃整包 | **证据不足** | 严格解析可防截断，也可能让原版可识别的旧回复卡住准备。保存原始长度和声明数量，用现有设备覆盖0组件、完整组件与截断回复；基础固件字段可用时不应静默丢失 |
+| SDK补充字段解析 | Python SDK的INFO解析要求`hw_rev==1`，TIME的`synced`把任意非零值视为true | 当前Android INFO接受任意`hw_rev`，TIME只接受0或1 | **证据不足** | 现有戒指回复尚未覆盖边界值。增加原始协议夹具并保存未知值；在固件证据明确前不静默改写或拒绝整条可用回复 |
+| 长时后台与系统限制 | 原版包含前台采集服务及后台任务；目标是长时运行不被系统静默终止 | 当前尚未形成通知权限、电池优化豁免及长时上传前台保护的完整流程 | **应恢复** | 系统回收可能中断重连或上传。补权限／设置引导、可观察通知和恢复记录；验证拒绝、锁屏、重启、断网恢复与数小时运行 |
+| 卸载与清除数据 | 现有独立版session、参考、原始文件和任务保存在应用私有目录 | 原位升级可保留；卸载或清除数据会删除尚未外部保全的内容，当前没有卸载前保全机制 | **应恢复** | 正式交付前提供可验证的导出／保全路径；未完成保全时不得建议被试通过卸载重装恢复。验证导出完整性、重导和其他记录隔离 |
+| 验收采集次数 | 历史方案曾用至少5次走路和5次跑步作为数量要求 | 总纲3.2.0起改为场景覆盖及短时到长时逐级验证，不预设正式人数、周期或固定次数 | **已确认改变**：负责人要求软件完成后直接投入使用，研究安排独立决定 | 交付仍须覆盖走路、跑步、零步、误混、同日多段、恢复及长时场景；数量变化不得降低每个场景的数据完整性证据 |
+
+当前实施顺序由上述分类约束：先以本轮模拟器证据和真机STOP复测收口现有工作区，再补手机边界入包及陌生旧记录非阻塞开始；正式交付前隔离旧采集／上传服务。随后修复自助恢复入口、设备详情、持续重连、通用下载记录迟到、8 KiB补缺、研究端设备索引和卸载前保全。START次数、`-16`兼容、陌生正在采集任务、查询超时、WRITE_NO_RESPONSE及非零回调、MTU门控、GATT线程／PHY、INFO/TIME解析和复杂记录归属保留原始数据后做两手机真机对照；冻结ZIP保留期依据长时空间证据确定。每次改变原版行为时，同步更新本表、requirements验收项和validation证据。

@@ -39,7 +39,7 @@ class RealSessionDownload internal constructor(
     directory: File,
     private val sessionId: String,
     private val ringAddress: String,
-    private val record: HealthMessage.ListItem,
+    record: HealthMessage.ListItem,
     private val startedAtMs: Long,
     private val endedAtMs: Long,
     private val syncDirectory: (File) -> Unit,
@@ -54,12 +54,13 @@ class RealSessionDownload internal constructor(
         val evidenceFileName: String)
 
     private val directory = directory.canonicalFile
+    private var record = record
     private val prefix = "$sessionId-ring-${record.sessionId}"
     private val partial = safeFile("$prefix.part")
     private val checkpointFile = safeFile("$prefix.download.json")
     private val destination = safeFile("$prefix.rfbin")
     private val evidenceFile = safeFile("$prefix.raw-evidence.json")
-    private val descriptor = JsonObject().apply {
+    private fun descriptor(record: HealthMessage.ListItem = this.record) = JsonObject().apply {
         addProperty("schema_version", 1)
         addProperty("session_id", sessionId)
         addProperty("ring_address", ringAddress)
@@ -73,6 +74,7 @@ class RealSessionDownload internal constructor(
     }
     private var output: RandomAccessFile? = null
     private var completed: Completed? = null
+    private val completedPrefixOffsets = mutableSetOf<Long>()
     private val prefixDigest = MessageDigest.getInstance("SHA-256")
     var nextOffset: Long = 0L
         private set
@@ -87,13 +89,17 @@ class RealSessionDownload internal constructor(
         require(this.directory.isDirectory) { "采集目录尚未就绪" }
         if (checkpointFile.exists()) {
             val saved = JsonParser.parseString(checkpointFile.readText(Charsets.UTF_8)).asJsonObject
-            require(saved.getAsJsonObject("record") == descriptor) { "戒指记录已变化，原始片段已保留" }
+            val savedDescriptor = saved.getAsJsonObject("record")
+            require(savedDescriptor == descriptor() || isPrefixDescriptor(savedDescriptor, record)) {
+                "戒指记录身份已变化，原始片段已保留"
+            }
             nextOffset = saved.get("durable_bytes").asLong
             require(nextOffset in 0..record.bytes && partial.isFile && partial.length() in nextOffset..record.bytes) {
                 "下载断点与原始片段不一致"
             }
             hashInto(partial, nextOffset, prefixDigest)
             require(saved.get("prefix_sha256").asString == prefixHash()) { "原始片段校验失败" }
+            if (savedDescriptor != descriptor()) migrateCompletedPrefix(savedDescriptor.get("bytes").asLong)
             syncDirectory(this.directory)
         } else {
             // The first checkpoint may fail after creating an empty part. It contains no
@@ -170,7 +176,7 @@ class RealSessionDownload internal constructor(
             SessionRawFile(destination.name, record.sessionId, destination.length(), sha256(destination), false),
             evidence, evidenceFile.name,
         )
-        val details = descriptor.deepCopy().apply {
+        val details = descriptor().deepCopy().apply {
             addProperty("payload_crc32", evidence.crc32)
             addProperty("file_sha256", result.file.sha256)
             addProperty("parsed_records", evidence.records)
@@ -191,6 +197,27 @@ class RealSessionDownload internal constructor(
         return result
     }
 
+    /** Continue the same stopped Flash record when a final LIST exposes a durable tail. */
+    fun extendTo(updated: HealthMessage.ListItem) {
+        require(FreeLivingSessionStore.sameDeviceRecord(record, updated) &&
+            updated.bytes >= record.bytes && updated.records >= record.records &&
+            (updated.bytes > record.bytes || updated.records > record.records)) {
+            "戒指记录身份或计数发生变化，原始文件已保留"
+        }
+        require(nextOffset == record.bytes && completed != null) { "原始记录前缀尚未完整保存" }
+        completedPrefixOffsets += record.bytes
+        migrateCompletedPrefix(record.bytes)
+        record = updated
+        completed = null
+        output = RandomAccessFile(partial, "rw")
+        persistCheckpoint()
+        syncDirectory(directory)
+    }
+
+    /** A completed READ from the frozen prefix may arrive after its final LIST exposed a tail. */
+    fun isDelayedCompletedPrefix(end: HealthMessage.ReadEnd): Boolean = end.done &&
+        end.nextOffset in completedPrefixOffsets && end.nextOffset <= nextOffset && end.nextOffset < record.bytes
+
     /** Call only after the session journal durably accepts Completed.file. */
     fun releaseTemporary() {
         verifyFinal(checkNotNull(completed) { "原始文件尚未完成" })
@@ -198,6 +225,9 @@ class RealSessionDownload internal constructor(
         output = null
         if (partial.exists() && !partial.delete()) throw IOException("无法清理已保全的下载片段")
         if (checkpointFile.exists() && !checkpointFile.delete()) throw IOException("无法清理已保全的下载断点")
+        directory.listFiles { file -> file.name.startsWith("$prefix.prefix-") }?.forEach { file ->
+            if (!file.delete()) throw IOException("无法清理已核对的原始前缀")
+        }
         syncDirectory(directory)
     }
 
@@ -209,7 +239,7 @@ class RealSessionDownload internal constructor(
     private fun persistCheckpoint() {
         checkNotNull(output) { "下载已关闭" }.fd.sync()
         val saved = JsonObject().apply {
-            add("record", descriptor)
+            add("record", descriptor())
             addProperty("durable_bytes", nextOffset)
             addProperty("prefix_sha256", prefixHash())
         }
@@ -232,6 +262,39 @@ class RealSessionDownload internal constructor(
         require(it.parentFile == this.directory && it.name == name) { "下载文件路径无效" }
     }
 
+    private fun isPrefixDescriptor(saved: JsonObject, updated: HealthMessage.ListItem): Boolean =
+        saved.get("schema_version")?.asInt == 1 &&
+            saved.get("session_id")?.asString == sessionId &&
+            saved.get("ring_address")?.asString == ringAddress &&
+            saved.get("device_session_id")?.asInt == updated.sessionId &&
+            saved.get("anchor_uptime_ms")?.asLong == updated.uptimeMs &&
+            saved.get("anchor_unix_ms")?.asLong == updated.unixMs &&
+            saved.get("started_at_ms")?.asLong == startedAtMs &&
+            saved.get("ended_at_ms")?.asLong == endedAtMs &&
+            saved.get("bytes")?.asLong in 1..updated.bytes &&
+            saved.get("records")?.asLong in 1..updated.records
+
+    private fun migrateCompletedPrefix(bytes: Long) {
+        output?.close()
+        output = null
+        completed = null
+        archivePrefixFile(destination, safeFile("$prefix.prefix-$bytes.rfbin"))
+        archivePrefixFile(evidenceFile, safeFile("$prefix.prefix-$bytes.raw-evidence.json"))
+    }
+
+    private fun archivePrefixFile(source: File, archive: File) {
+        if (!source.exists()) return
+        if (archive.exists()) {
+            require(source.length() == archive.length() && sha256(source) == sha256(archive)) {
+                "已保存的原始前缀证据冲突"
+            }
+            require(source.delete()) { "无法整理已保存的原始前缀" }
+        } else {
+            Files.move(source.toPath(), archive.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        }
+        syncDirectory(directory)
+    }
+
     private fun verifyFinal(value: Completed) {
         require(destination.isFile && destination.length() == value.file.bytes &&
             sha256(destination) == value.file.sha256) { "已保存的原始文件校验失败" }
@@ -245,6 +308,40 @@ class RealSessionDownload internal constructor(
     }
 
     companion object {
+        /** Remove only restart leftovers belonging to a durably completed real session. */
+        internal fun cleanupCommittedTemporary(
+            directory: File,
+            session: FreeLivingSession,
+            syncDirectory: (File) -> Unit = {
+                FileChannel.open(it.toPath(), StandardOpenOption.READ).use { channel -> channel.force(true) }
+            },
+        ) {
+            val local = requireNotNull(session.localData) { "本次原始文件尚未完成" }
+            val record = session.deviceRecordEvidence?.record ?: return
+            val root = directory.canonicalFile
+            require(root.isDirectory)
+            val prefix = "${session.sessionId}-ring-${record.sessionId}"
+            val fixed = listOf("$prefix.part", "$prefix.download.json")
+            val archived = root.listFiles()?.filter {
+                it.name.startsWith("$prefix.prefix-") &&
+                    (it.name.endsWith(".rfbin") || it.name.endsWith(".raw-evidence.json"))
+            }.orEmpty()
+            val leftovers = fixed.map { File(root, it) }.filter { it.exists() } + archived
+            if (leftovers.isEmpty()) return
+            val finalName = "$prefix.rfbin"
+            val finalEntry = local.files.singleOrNull { !it.simulated && it.fileName == finalName }
+                ?: throw IllegalArgumentException("本次原始文件与设备记录不匹配")
+            val finalFile = File(root, finalName).canonicalFile
+            require(finalFile.parentFile == root && finalFile.isFile && finalFile.length() == finalEntry.bytes &&
+                sha256(finalFile) == finalEntry.sha256) { "已完成的原始文件校验失败" }
+            leftovers.forEach { file ->
+                val safe = file.canonicalFile
+                require(safe.parentFile == root && safe.name == file.name)
+                if (safe.exists()) require(safe.isFile && safe.delete()) { "已完成记录的临时文件清理失败" }
+            }
+            syncDirectory(root)
+        }
+
         internal fun inspectPayload(file: File, record: HealthMessage.ListItem): HealthPayloadEvidence {
             require(file.length() == record.bytes) { "原始数据字节数不完整" }
             var records = 0L

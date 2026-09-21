@@ -3,6 +3,7 @@ package com.nexthci.ringfitness
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -76,7 +77,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(1, f.port.count("start"))
     }
 
-    @Test fun aRenamedStartWhoseDirectorySyncFailedIsNeverDispatchedOrReplaced() {
+    @Test fun aDurableUnsentStartIsArchivedAfterAnUnchangedRecoveryCheck() {
         val f = Fixture()
         f.failSyncAfterCommit = true
         f.beginStart()
@@ -88,10 +89,15 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(FreeLivingSessionPhase.START_REQUESTED, saved.phase)
         f.coordinator.requestStart(preparation)
         f.observe(idle())
-        assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, f.coordinator.state.issue)
-        assertEquals(saved, f.coordinator.state.session)
+        assertEquals(CaptureControlPhase.IDLE, f.coordinator.state.phase)
+        assertNull(f.coordinator.state.issue)
+        assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
+        assertNull(f.coordinator.state.session)
+        val archived = requireNotNull(f.store.read())
+        assertEquals(saved.sessionId, archived.sessionId)
+        assertNotNull(archived.startAttemptArchive)
         assertEquals(0, f.port.count("start"))
-        assertArrayEquals(original, f.file.readBytes())
+        assertFalse(original.contentEquals(f.file.readBytes()))
     }
 
     @Test fun duplicateClicksBeforeAndAfterStartConfirmationKeepOneIdentityAndCommand() {
@@ -143,6 +149,28 @@ class FreeLivingCaptureCoordinatorTest {
         f.coordinator.requestStop()
         assertEquals(commands, f.port.calls)
         assertEquals(saved, f.store.read())
+    }
+
+    @Test fun stopWaitsFromTheFirstStoppedReplyBeforeFinalFlashConfirmation() {
+        val f = Fixture(immediateSchedule = false)
+        f.connect()
+        f.coordinator.requestStart(preparation)
+        f.observe(idle())
+        f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+        assertEquals(1, f.port.count("start"))
+        f.runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+        f.observe(collecting(), listOf(record()))
+        f.coordinator.requestStop()
+        assertEquals(listOf(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS), f.pendingDelays())
+        f.runDelay(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS)
+        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
+        assertNull(f.store.read()!!.stopConfirmedAtMs)
+        assertEquals(listOf(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS), f.pendingDelays())
+        f.runDelay(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
+        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
+        assertNotNull(f.store.read()!!.stopConfirmedAtMs)
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertEquals(1, f.port.count("stop"))
     }
 
     @Test fun existingDeviceRecordsAndExistingCollectionBlockStart() {
@@ -251,28 +279,60 @@ class FreeLivingCaptureCoordinatorTest {
         f.beginStart()
         val saved = requireNotNull(f.store.read())
         assertEquals(FreeLivingSessionPhase.START_REQUESTED, saved.phase)
+        assertNull(saved.startCommandDispatch)
         assertEquals(CaptureControlIssue.COMMAND_NOT_ACCEPTED, f.coordinator.state.issue)
         f.coordinator.requestStart(preparation)
         f.connect(2)
         f.coordinator.reconcile()
         f.observe(collecting(), listOf(record()), connection = 2)
-        assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, f.coordinator.state.issue)
+        assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
+        assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
         assertEquals(saved, f.store.read())
         assertEquals(1, f.port.count("start"))
     }
 
-    @Test fun disconnectedStartCannotBeAdoptedAfterReconnectEvenWithTheSameRing() {
+    @Test fun queuedStartAcrossAReconnectIsProtectedButNeverClaimedByThisSession() {
         val f = Fixture()
         f.beginStart()
-        val original = f.file.readBytes()
+        assertNotNull(f.store.read()!!.startCommandDispatch?.acceptedAtMs)
         f.coordinator.onDisconnected(1)
         f.connect(2)
+        assertEquals(CaptureControlPhase.STARTING, f.coordinator.state.phase)
         f.coordinator.reconcile()
         f.observe(collecting(), listOf(record()), connection = 1)
         assertEquals(CaptureControlPhase.CHECKING, f.coordinator.state.phase)
         f.observe(collecting(), listOf(record()), connection = 2)
-        assertEquals(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, f.coordinator.state.issue)
-        assertArrayEquals(original, f.file.readBytes())
+        assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
+        assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+        assertNull(f.store.read()!!.startConfirmedAtMs)
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun crashBeforeStartAcceptancePersistenceNeverClaimsACrossProcessRecord() {
+        val f = Fixture()
+        f.port.accept = { command ->
+            if (command == "start") f.failCommits = true
+            true
+        }
+        f.beginStart()
+        assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
+        val dispatch = requireNotNull(f.store.read()!!.startCommandDispatch)
+        assertNull(dispatch.acceptedAtMs)
+        assertEquals(1, f.port.count("start"))
+
+        f.failCommits = false
+        val reopened = f.newCoordinator()
+        reopened.restore()
+        assertEquals(CaptureControlPhase.STARTING, reopened.state.phase)
+        reopened.onConnected(address, 2)
+        reopened.reconcile()
+        deliver(reopened, 2, collecting(), listOf(record()))
+
+        assertEquals(CaptureControlPhase.NEEDS_REVIEW, reopened.state.phase)
+        assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, reopened.state.issue)
+        assertNotNull(reopened.state.unconfirmedStartStopCandidate)
+        assertNull(f.store.read()!!.startConfirmedAtMs)
         assertEquals(1, f.port.count("start"))
     }
 
@@ -390,6 +450,127 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(1, f.port.count("stop"))
     }
 
+    @Test fun aLocallyRejectedStopRollsBackAndTheNextStopCanSucceed() {
+        val f = Fixture()
+        f.beginCollecting()
+        val collecting = requireNotNull(f.store.read())
+        var rejectStop = true
+        f.port.accept = { command ->
+            if (command == "stop" && rejectStop) {
+                rejectStop = false
+                false
+            } else true
+        }
+
+        f.coordinator.requestStop()
+
+        assertEquals(1, f.port.count("stop"))
+        assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.COMMAND_NOT_ACCEPTED, f.coordinator.state.issue)
+        assertEquals(collecting, f.store.read())
+
+        f.coordinator.requestStop()
+        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
+
+        assertEquals(2, f.port.count("stop"))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertNotNull(f.store.read()!!.stopConfirmedAtMs)
+    }
+
+    @Test fun aRejectedStopWhoseRollbackCannotPersistReportsStorageError() {
+        val f = Fixture()
+        f.beginCollecting()
+        f.port.accept = { command ->
+            if (command == "stop") {
+                f.failCommits = true
+                false
+            } else true
+        }
+
+        f.coordinator.requestStop()
+
+        assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.STORAGE_FAILURE, f.coordinator.state.issue)
+        assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, f.store.read()!!.phase)
+        assertNotNull(f.store.read()!!.stopRequestedAtMs)
+        assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun aRejectedStopRemainsCollectingAfterProcessRestartAndCanStop() {
+        val f = Fixture()
+        f.beginCollecting()
+        val collecting = requireNotNull(f.store.read())
+        f.port.accept = { command -> command != "stop" }
+        f.coordinator.requestStop()
+        assertEquals(collecting, f.store.read())
+
+        val reopened = f.newCoordinator()
+        f.port.accept = { true }
+        reopened.onConnected(address, 2)
+        reopened.reconcile()
+        deliver(reopened, 2, collecting(), listOf(record()))
+        assertEquals(CaptureControlPhase.COLLECTING, reopened.state.phase)
+
+        reopened.requestStop()
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+
+        assertEquals(2, f.port.count("stop"))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, reopened.state.phase)
+        assertNotNull(f.store.read()!!.stopConfirmedAtMs)
+    }
+
+    @Test fun crashAfterStopIntentButBeforeBleRetriesOnceAfterAProvingQuery() {
+        val f = Fixture()
+        f.beginCollecting()
+        val collecting = requireNotNull(f.store.read())
+        val requested = f.store.requestStop(collecting.sessionId, f.clock.now,
+            "11111111-1111-1111-1111-111111111111", 1)
+        assertNull(requested.stopCommandDispatch?.acceptedAtMs)
+        assertEquals(0, f.port.count("stop"))
+
+        val reopened = f.newCoordinator()
+        reopened.onConnected(address, 2)
+        reopened.reconcile()
+        deliver(reopened, 2, collecting(), listOf(record()))
+
+        val dispatched = requireNotNull(f.store.read()!!.stopCommandDispatch)
+        assertEquals(2L, dispatched.connectionGeneration)
+        assertNotEquals("11111111-1111-1111-1111-111111111111", dispatched.ownerId)
+        assertNotNull(dispatched.acceptedAtMs)
+        assertEquals(1, f.port.count("stop"))
+
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, reopened.state.phase)
+        assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun crashAfterAcceptedStopKeepsPollingWithoutSendingAnotherStop() {
+        val f = Fixture()
+        f.beginCollecting()
+        f.coordinator.requestStop()
+        val requested = requireNotNull(f.store.read())
+        assertNotNull(requested.stopCommandDispatch?.acceptedAtMs)
+        assertEquals(1, f.port.count("stop"))
+
+        val reopened = f.newCoordinator()
+        reopened.onConnected(address, 2)
+        reopened.reconcile()
+        deliver(reopened, 2, collecting().copy(bytes = 40, records = 3),
+            listOf(record(bytes = 48, records = 3)))
+
+        assertEquals(CaptureControlPhase.STOPPING, reopened.state.phase)
+        assertNull(reopened.state.issue)
+        assertFalse(requireNotNull(f.store.read()).deviceAssociationInvalidated)
+        assertEquals(1, f.port.count("stop"))
+
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        deliver(reopened, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, reopened.state.phase)
+        assertEquals(1, f.port.count("stop"))
+    }
+
     @Test fun stopStatusAloneAndDifferentRecordAnchorsCannotCompleteTheSession() {
         val f = Fixture()
         f.beginCollecting()
@@ -437,7 +618,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(1, f.port.count("stop"))
     }
 
-    @Test fun stopConfirmationDirectorySyncFailureDoesNotReportSuccessOrRewriteFirstEvidence() {
+    @Test fun aRenamedFinalStopSurvivesDirectorySyncFailureAndRestoresAsComplete() {
         val f = Fixture()
         f.beginCollecting()
         f.coordinator.requestStop()
@@ -447,14 +628,14 @@ class FreeLivingCaptureCoordinatorTest {
         f.health(HealthMessage.ListEnd(1))
         assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)
         f.failSyncAfterCommit = false
-        val firstSaved = requireNotNull(f.store.read())
-        assertEquals(FreeLivingSessionPhase.AWAITING_REFERENCE, firstSaved.phase)
-        f.clock.now += 5_000
-        f.coordinator.reconcile()
-        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
-        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
-        assertEquals(firstSaved, f.coordinator.state.session)
-        assertEquals(firstSaved, f.store.read())
+        val saved = requireNotNull(f.store.read())
+        assertEquals(FreeLivingSessionPhase.AWAITING_REFERENCE, saved.phase)
+        assertNotNull(saved.stopConfirmedAtMs)
+        assertEquals(stopped(), saved.deviceRecordEvidence!!.status)
+        val reopened = f.newCoordinator()
+        reopened.restore()
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, reopened.state.phase)
+        assertEquals(saved.startRequestedAtMs, f.store.read()!!.startRequestedAtMs)
         assertEquals(1, f.port.count("stop"))
     }
 
@@ -615,22 +796,42 @@ class FreeLivingCaptureCoordinatorTest {
         restored.onConnected(address, 2)
         restored.reconcile()
         deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.STOPPING, restored.state.phase)
+        deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, restored.state.phase)
         assertEquals(1, f.port.count("stop"))
         assertEquals(stopped(), f.store.read()!!.deviceRecordEvidence!!.status)
         assertNull(f.store.read()!!.endedAtMs)
     }
 
-    @Test fun recoveredUnexpectedIdleDoesNotInventAUserStopOrNormalEnd() {
+    @Test fun recoveredOwnedCollectionThatAlreadyStoppedCompletesFlashFinalizationWithoutAnotherStop() {
         val f = Fixture()
         f.beginCollecting()
         val restored = f.newCoordinator()
         restored.onConnected(address, 2)
         restored.reconcile()
         deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
-        assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, restored.state.issue)
+        assertEquals(CaptureControlPhase.STOPPING, restored.state.phase)
         assertNull(f.store.read()!!.stopRequestedAtMs)
+        assertNotNull(f.store.read()!!.stopObservedAtMs)
+        assertEquals(StopOrigin.DEVICE_OBSERVED, f.store.read()!!.stopOrigin)
         assertNull(f.store.read()!!.stopConfirmedAtMs)
+        deliver(restored, 2, stopped(), listOf(record(bytes = 64, records = 4)))
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, restored.state.phase)
+        assertNotNull(f.store.read()!!.stopConfirmedAtMs)
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun unsolicitedStoppedStatusTriggersACompleteReadOnlyFinalizationRound() {
+        val f = Fixture()
+        f.beginCollecting()
+
+        f.health(stopped())
+        assertEquals(CaptureControlPhase.CHECKING, f.coordinator.state.phase)
+        f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
+
+        assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertNotNull(f.store.read()!!.stopConfirmedAtMs)
         assertEquals(0, f.port.count("stop"))
     }
 
@@ -752,7 +953,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertNull(f.store.read()!!.endedAtMs)
     }
 
-    @Test fun reusedIdWithUnchangedOrMissingAnchorCannotAcquireStopAuthority() {
+    @Test fun reusedIdWithUnchangedOrMissingAnchorGetsOnlyProtectiveStopAuthority() {
         val old = record(id = 9)
         val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
         val candidates = listOf(old, old.copy(unixMs = epoch + 1), old.copy(uptimeMs = 2000),
@@ -765,7 +966,10 @@ class FreeLivingCaptureCoordinatorTest {
             f.observe(collecting(id = 9), listOf(candidate))
             assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
             assertNull(f.store.read()!!.startConfirmedAtMs)
+            assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
             f.coordinator.requestStop()
+            // Research STOP remains unavailable; the owner uses the separate audited
+            // unconfirmed-start STOP and preservation path.
             assertEquals(0, f.port.count("stop"))
         }
     }
@@ -877,7 +1081,7 @@ class FreeLivingCaptureCoordinatorTest {
     private fun record(id: Int = 42, bytes: Long = 32, records: Long = 2) =
         HealthMessage.ListItem(id, bytes, records, 1000, epoch)
 
-    private inner class Fixture {
+    private inner class Fixture(private val immediateSchedule: Boolean = true) {
         val file = File(temporary.newFolder(), "session.json")
         var failCommits = false
         var failSyncAfterCommit = false
@@ -894,11 +1098,20 @@ class FreeLivingCaptureCoordinatorTest {
         })
         val clock = TestClock(epoch)
         val port = RecordingPort()
+        private val scheduled = mutableListOf<Pair<Long, () -> Unit>>()
         var observer: (CaptureControlState) -> Unit = {}
         val coordinator = newCoordinator()
 
         // These cases check state/evidence rules; monotonic delays have dedicated timing tests.
-        fun newCoordinator() = FreeLivingCaptureCoordinator(store, port, clock, { _, action -> action() }) { observer(it) }
+        fun newCoordinator() = FreeLivingCaptureCoordinator(store, port, clock, { delay, action ->
+            if (immediateSchedule) action() else scheduled += delay to action
+        }) { observer(it) }
+        fun pendingDelays() = scheduled.map { it.first }
+        fun runDelay(delay: Long) {
+            val index = scheduled.indexOfFirst { it.first == delay }
+            check(index >= 0) { "Expected delay $delay in ${scheduled.map { it.first }}" }
+            scheduled.removeAt(index).second()
+        }
         fun connect(connection: Long = 1) = coordinator.onConnected(address, connection)
         fun health(message: HealthMessage, connection: Long = 1) =
             coordinator.onHealth(connection, SensorPacket.Health(message, clock.now))
@@ -906,6 +1119,14 @@ class FreeLivingCaptureCoordinatorTest {
             health(status, connection)
             records.forEach { health(it, connection) }
             health(HealthMessage.ListEnd(records.size), connection)
+            // The production flow performs one final STATUS/LIST round after the five-second
+            // Flash settle interval. This fixture executes scheduled waits immediately.
+            if (!status.collecting && coordinator.state.phase == CaptureControlPhase.STOPPING &&
+                coordinator.state.timeoutOperationId != null) {
+                health(status, connection)
+                records.forEach { health(it, connection) }
+                health(HealthMessage.ListEnd(records.size), connection)
+            }
         }
         fun beginStart() {
             connect()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import datetime as dt
 from uuid import UUID
 
 MAX_LONG = (1 << 63) - 1
@@ -206,7 +207,7 @@ def validate_unknown_time_start(baseline, manifest, record):
 def validate_manifest(value):
     m = object_value(value, "manifest")
     version = integer(m.get("version"), "version")
-    require(version in (2, 3, 4, 5), "unsupported version")
+    require(version in (2, 3, 4, 5, 6, 7), "unsupported version")
     required = {
         "version", "step_schema_version", "rfbin_version", "simulated", "session_id",
         "participant_id", "participant_name", "installation_id", "ring_placement",
@@ -221,7 +222,11 @@ def validate_manifest(value):
         "start_boundary_evidence", "end_boundary_evidence", "start_baseline",
         "device_record_evidence", "device_association_invalidated", "files",
     }
-    has_activity_selection = version == 4 or (version == 5 and m.get("activity_schema") == "daily_activity_v3")
+    if version >= 6:
+        required.update({"ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at"})
+    if version == 7:
+        required.update({"stop_origin", "stop_observed_at_ms"})
+    has_activity_selection = version == 4 or (version in (5, 6, 7) and m.get("activity_schema") == "daily_activity_v3")
     if has_activity_selection:
         required.add("activity_selection_source")
     require(set(m) == required, "manifest fields do not match activity schema")
@@ -247,6 +252,20 @@ def validate_manifest(value):
     require(type(m["ring_placement"]) is str and m["ring_placement"] in {"left_index", "left_middle", "left_ring",
                                     "right_index", "right_middle", "right_ring"},
             "invalid ring placement")
+    if version >= 6:
+        hand, finger = m["ring_placement"].split("_", 1)
+        require(m["ring_placement_schema"] == "hand_finger_v1", "invalid ring placement schema")
+        require(m["ring_hand"] == hand and m["ring_finger"] == finger,
+                "ring placement components disagree")
+        text(m["app_version"], "app_version", 128)
+        created_at = text(m["created_at"], "created_at", 64)
+        require(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z", created_at) is not None,
+                "invalid created_at")
+        try:
+            parsed_created_at = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValidationError("invalid created_at") from error
+        require(parsed_created_at.tzinfo == dt.timezone.utc, "invalid created_at")
     require(type(m["ring_address"]) is str and
             re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", m["ring_address"]) is not None,
             "invalid ring address")
@@ -261,8 +280,25 @@ def validate_manifest(value):
                 "started_at_ms", "ended_at_ms", "ground_truth_recorded_at_ms"):
         integer(m[key], key, 1, nullable=True)
     require(m["start_confirmed_at_ms"] is not None, "record has no start confirmation")
-    require(m["stop_requested_at_ms"] is not None and m["stop_confirmed_at_ms"] is not None,
-            "complete upload requires a requested and confirmed stop")
+    require(m["stop_confirmed_at_ms"] is not None, "complete upload requires a confirmed stop")
+    stop_event = m["stop_requested_at_ms"]
+    if version == 7:
+        stop_observed = integer(m["stop_observed_at_ms"], "stop_observed_at_ms", 1, nullable=True)
+        stop_origin = m["stop_origin"]
+        require(stop_origin in ("user_request", "device_observed", "legacy_unspecified"), "invalid stop_origin")
+        if stop_origin == "user_request":
+            require(m["stop_requested_at_ms"] is not None and stop_observed is None,
+                    "user stop requires a request and no device-only observation")
+        elif stop_origin == "device_observed":
+            require(m["stop_requested_at_ms"] is None and stop_observed is not None,
+                    "device-observed stop requires its observation time")
+        else:
+            require(m["stop_requested_at_ms"] is not None and stop_observed is None,
+                    "legacy stop requires its historical request-shaped timestamp")
+        stop_event = m["stop_requested_at_ms"] or stop_observed
+    else:
+        require(m["stop_requested_at_ms"] is not None,
+                "legacy complete upload requires a requested stop")
     steps = integer(m["ground_truth_steps"], "ground_truth_steps", nullable=True)
     status = m["ground_truth_status"]
     require(status in ("valid", "missing", "unreliable"), "invalid reference status")
@@ -275,6 +311,8 @@ def validate_manifest(value):
                 "abnormal reference requires a reason")
         if status == "missing":
             require(steps is None, "missing reference must have null steps")
+        else:
+            require(steps is not None, "unreliable reference needs a value")
     require((m["ground_truth_recorded_at_ms"] is None) == (steps is None),
             "reference value and confirmation time disagree")
     if steps is not None:
@@ -287,9 +325,10 @@ def validate_manifest(value):
     require(type(m["timing_warnings"]) is list and
             all(type(x) is str and 0 < len(x) <= 256 for x in m["timing_warnings"]),
             "invalid timing warnings")
-    phone_times = [m[k] for k in ("start_requested_at_ms", "start_confirmed_at_ms",
-                                "stop_requested_at_ms", "stop_confirmed_at_ms") if m[k] is not None]
-    reference_min = m["stop_confirmed_at_ms"] if status == "valid" else m["stop_requested_at_ms"]
+    phone_times = [m["start_requested_at_ms"], m["start_confirmed_at_ms"], stop_event,
+                   m["stop_confirmed_at_ms"]]
+    phone_times = [value for value in phone_times if value is not None]
+    reference_min = m["stop_confirmed_at_ms"] if status == "valid" else stop_event
     clock_reversed = any(b < a for a, b in zip(phone_times, phone_times[1:]))
     clock_reversed |= reference_min is not None and m["reference_saved_at_ms"] < reference_min
     clock_reversed |= any(m["download_completed_at_ms"] < v for v in
@@ -339,7 +378,7 @@ def validate_manifest(value):
     require(all(m["start_status_evidence"][counter] <= m["stop_status_evidence"][counter]
                 for counter in ("bytes", "records")), "STOP counters moved backwards from START")
     baseline = object_value(m["start_baseline"], "start_baseline")
-    has_charging_recovery = version == 3 or (version in (4, 5) and "charging_recovery_evidence" in baseline)
+    has_charging_recovery = version == 3 or (version in (4, 5, 6, 7) and "charging_recovery_evidence" in baseline)
     baseline_status = validate_status(baseline.get("status"), "baseline status",
                                       allow_charging_error=has_charging_recovery)
     require(baseline_status["collecting"] is False and baseline_status["error_code"] == (-16 if has_charging_recovery else 0),
@@ -349,7 +388,7 @@ def validate_manifest(value):
         validate_charging_recovery(baseline)
     else:
         require("charging_recovery_evidence" not in baseline,
-                "charging recovery evidence requires manifest version 3, 4 or 5")
+                "charging recovery evidence requires manifest version 3 through 7")
     require(type(baseline.get("records")) is list and len(baseline["records"]) <= 255, "invalid baseline records")
     for item in baseline["records"]:
         validate_record(item, "baseline record")
@@ -361,15 +400,17 @@ def validate_manifest(value):
         require(any(all(item[key] == baseline_status[key] for key in ("device_session_id", "bytes", "records"))
                     for item in baseline["records"]), "baseline STATUS and LIST disagree")
     previous = next((item for item in baseline["records"] if item["device_session_id"] == device_id), None)
-    if version == 5:
+    has_unknown_time_start = version == 5 or (version in (6, 7) and "unknown_time_start_evidence" in baseline)
+    if has_unknown_time_start:
         preserved_unknown = validate_unknown_time_start(baseline, m, record)
     else:
-        require("unknown_time_start_evidence" not in baseline, "unknown time start evidence requires manifest version 5")
+        require("unknown_time_start_evidence" not in baseline,
+                "unknown time start evidence requires manifest version 5 through 7")
         preserved_unknown = None
     baseline_fields = {"status", "records", "observed_at_ms"}
     if has_charging_recovery:
         baseline_fields.add("charging_recovery_evidence")
-    if version == 5:
+    if has_unknown_time_start:
         baseline_fields.add("unknown_time_start_evidence")
     object_fields(baseline, "start_baseline", baseline_fields)
     if previous is None:

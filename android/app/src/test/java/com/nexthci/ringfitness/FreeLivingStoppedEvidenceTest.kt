@@ -43,6 +43,13 @@ class FreeLivingStoppedEvidenceTest {
             f.health(coordinator, finalRecord, connection)
             assertNull(f.store.readPending()!!.stopConfirmedAtMs)
             f.health(coordinator, HealthMessage.ListEnd(1), connection)
+            assertEquals(CaptureControlPhase.STOPPING, coordinator.state.phase)
+            assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+            // Reopening leaves the closed coordinator's cancelled wait in this simple FIFO fixture.
+            repeat(if (reopen) 2 else 1) { f.nextDelay() }
+            f.health(coordinator, stopped, connection)
+            f.health(coordinator, finalRecord, connection)
+            f.health(coordinator, HealthMessage.ListEnd(1), connection)
             assertEquals(CaptureControlPhase.AWAITING_REFERENCE, coordinator.state.phase)
             assertEquals(stopped, f.store.readPending()!!.stopStatusEvidence)
             assertEquals(finalRecord, f.store.readPending()!!.deviceRecordEvidence!!.record)

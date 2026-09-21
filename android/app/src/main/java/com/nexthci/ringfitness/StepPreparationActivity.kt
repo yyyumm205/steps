@@ -24,78 +24,90 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
+import android.widget.RadioButton
+import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import java.io.File
 import java.util.concurrent.Executors
 
-/** Preparation stays separate from capture requests, downloads and uploads. */
+/** Collects durable setup choices; the foreground collection service owns every ring connection. */
 class StepPreparationActivity : Activity() {
-    private enum class Page { REGISTER, HOME, DEVICES }
-    private enum class HomeAction { PLACEMENT, CONNECT, SETTINGS, DETAILS, CAPTURE, NONE }
-    private data class HomeUi(
-        val status: String,
-        val actionText: String,
-        val action: HomeAction,
-        val explanation: String = "",
-        val waiting: Boolean = false,
-    )
+    private enum class Page { REGISTER, DEVICES, SETTINGS }
+    private class CollectionOwnerBusyException : IllegalStateException("当前任务已开始，正在返回")
+
     private val main = Handler(Looper.getMainLooper())
     private val ui by lazy { QuietUi(this) }
     private lateinit var store: PreparationStore
-    private lateinit var controller: RingPreparationController
+    private lateinit var collectionJournal: File
     private var snapshot: PreparationSnapshot? = null
     private var page = Page.REGISTER
     private var restoredPage: Page? = null
+    private var settingsRequested = false
+    private var returnToSettings = false
     private var placementDraft = 0
+    private var identityTypeDraft = PreparationIdentityType.RESEARCH_ID
     private var loaded = false
     private var busy = false
-    private var storageProblem: String? = null
-    private var feedback: String? = null
     private var visible = false
+    private var routeStarted = false
+    private var storageProblem: String? = null
+    private var profileUnreadable = false
+    private var feedback: String? = null
     private var permissionDenied = false
-    private var autoConnectPending = false
     private var pendingBluetoothAction: (() -> Unit)? = null
     private var scanner: RingBleClient? = null
     private var scanning = false
     private var scanGeneration = 0L
     private var scanMessage: String? = null
-    private var timedAttempt = -1L
-    private lateinit var collectionJournal: File
     private var collectionLoaded = false
     private var collectionPending = false
-    private var collectionHistory = false
+    private var collectionOwnerBusy = false
     private var collectionProblem: String? = null
     private var collectionReadGeneration = 0L
     private var collectionSubscription: AutoCloseable? = null
-    private var collectionOwnerSnapshot: Triple<Boolean, String?, Boolean>? = null
+    private var collectionOwnerSnapshot: Triple<String?, Boolean, Boolean>? = null
     private var placementDialog: AlertDialog? = null
+    private var identityDialog: AlertDialog? = null
+    private var clearDialog: AlertDialog? = null
     private var moreMenu: PopupMenu? = null
+
     private lateinit var back: Button
     private lateinit var heading: TextView
     private lateinit var subtitle: TextView
     private lateinit var details: Button
     private lateinit var scroll: ScrollView
     private lateinit var registration: LinearLayout
+    private lateinit var identityTypePicker: RadioGroup
+    private lateinit var researchIdChoice: RadioButton
+    private lateinit var localNameChoice: RadioButton
+    private lateinit var identityInputLabel: TextView
+    private lateinit var identityHelp: TextView
     private lateinit var participantInput: EditText
     private lateinit var placementPicker: Spinner
     private lateinit var devices: LinearLayout
     private lateinit var scanStatus: TextView
     private lateinit var results: LinearLayout
-    private lateinit var overview: LinearLayout
+    private lateinit var settings: LinearLayout
     private lateinit var participantLabel: TextView
+    private lateinit var placementLabel: TextView
+    private lateinit var ringLabel: TextView
+    private lateinit var changeIdentity: Button
     private lateinit var editPlacement: Button
-    private lateinit var homeStatus: TextView
-    private lateinit var homeExplanation: TextView
-    private lateinit var cancelConnection: Button
+    private lateinit var changeRing: Button
+    private lateinit var clearProfile: Button
     private lateinit var message: TextView
+    private lateinit var progressRow: LinearLayout
+    private lateinit var progressStatus: TextView
     private lateinit var primary: Button
+
     private val bluetoothReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) != BluetoothAdapter.STATE_ON) {
                 stopScan()
-                controller.disconnect("手机蓝牙已关闭")
+                scanMessage = "手机蓝牙已关闭"
             }
             updateViews()
         }
@@ -107,22 +119,29 @@ class StepPreparationActivity : Activity() {
         window.setDecorFitsSystemWindows(false)
         store = PreparationStore(File(filesDir, "preparation/profile.properties"))
         collectionJournal = File(filesDir, "collection-real/session.json")
-        restoredPage = savedInstanceState?.getString("page")?.let { runCatching { Page.valueOf(it) }.getOrNull() }
-        placementDraft = savedInstanceState?.getInt("placement_draft") ?: 0
-        permissionDenied = savedInstanceState?.getBoolean("permission_denied") ?: false
-        autoConnectPending = savedInstanceState == null
-        controller = RingPreparationController(AndroidPreparationTransport(this)) { state ->
-            if (::primary.isInitialized) updateViews()
-            if (state.connecting && state.attemptId != timedAttempt) {
-                timedAttempt = state.attemptId
-                main.postDelayed({ if (visible) controller.timeout(state.attemptId) }, 30_000)
-            }
-        }
-        buildPages(savedInstanceState?.getString("participant_draft").orEmpty())
+        settingsRequested = intent.getBooleanExtra(EXTRA_OPEN_SETTINGS, false)
+        restoredPage = savedInstanceState?.getString(STATE_PAGE)?.let { runCatching { Page.valueOf(it) }.getOrNull() }
+        placementDraft = savedInstanceState?.getInt(STATE_PLACEMENT) ?: 0
+        identityTypeDraft = PreparationIdentityType.fromWireValue(
+            savedInstanceState?.getString(STATE_IDENTITY_TYPE),
+        ) ?: PreparationIdentityType.RESEARCH_ID
+        permissionDenied = savedInstanceState?.getBoolean(STATE_PERMISSION_DENIED) ?: false
+        returnToSettings = savedInstanceState?.getBoolean(STATE_RETURN_TO_SETTINGS) ?: false
+        buildPages(savedInstanceState?.getString(STATE_PARTICIPANT_DRAFT).orEmpty())
         if (Build.VERSION.SDK_INT >= 33) {
-            onBackInvokedDispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { goBack() }
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { goBack() }
         }
         loadProfile()
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent?.getBooleanExtra(EXTRA_OPEN_SETTINGS, false) == true) settingsRequested = true
+        routeStarted = false
+        routeWhenReady()
     }
 
     override fun onStart() {
@@ -133,22 +152,21 @@ class StepPreparationActivity : Activity() {
         else registerReceiver(bluetoothReceiver, filter)
         collectionSubscription = RealCollectionBridge.observe { state ->
             if (!visible || isDestroyed) return@observe
-            val ownership = Triple(RealCollectionBridge.isRunning(), state.session?.sessionId, state.session?.localData != null)
+            val ownership = Triple(state.session?.sessionId, state.session?.isPending == true,
+                RealCollectionBridge.isRunning())
             if (ownership != collectionOwnerSnapshot) {
                 collectionOwnerSnapshot = ownership
-                if (ownership.first) {
-                    stopScan()
-                    controller.disconnect("未连接")
-                    placementDialog?.dismiss()
-                }
                 refreshCollectionState()
             }
         }
     }
+
     override fun onResume() {
         super.onResume()
+        routeStarted = false
         refreshCollectionState()
     }
+
     override fun onStop() {
         visible = false
         collectionSubscription?.close()
@@ -156,33 +174,43 @@ class StepPreparationActivity : Activity() {
         moreMenu?.dismiss()
         pendingBluetoothAction = null
         stopScan()
-        controller.disconnect("未连接")
         unregisterReceiver(bluetoothReceiver)
         super.onStop()
     }
-    override fun onDestroy() { placementDialog?.dismiss(); main.removeCallbacksAndMessages(null); super.onDestroy() }
+
+    override fun onDestroy() {
+        placementDialog?.dismiss()
+        identityDialog?.dismiss()
+        clearDialog?.dismiss()
+        main.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
     override fun onSaveInstanceState(outState: Bundle) {
-        outState.putString("page", page.name)
-        outState.putString("participant_draft", participantInput.text.toString())
-        outState.putInt("placement_draft", placementDraft)
-        outState.putBoolean("permission_denied", permissionDenied)
+        outState.putString(STATE_PAGE, page.name)
+        outState.putString(STATE_PARTICIPANT_DRAFT, participantInput.text.toString())
+        outState.putString(STATE_IDENTITY_TYPE, identityTypeDraft.wireValue)
+        outState.putInt(STATE_PLACEMENT, placementDraft)
+        outState.putBoolean(STATE_PERMISSION_DENIED, permissionDenied)
+        outState.putBoolean(STATE_RETURN_TO_SETTINGS, returnToSettings)
         super.onSaveInstanceState(outState)
     }
+
     @Deprecated("Legacy Android back callback")
     override fun onBackPressed() = goBack()
 
     private fun goBack() {
-        if (busy) return
-        if (page == Page.DEVICES) navigate(Page.HOME) else finish()
-    }
-    private fun navigate(next: Page) {
-        if (busy) return
-        if (page == Page.DEVICES && next != Page.DEVICES) stopScan()
-        page = next
-        feedback = null
-        getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(participantInput.windowToken, 0)
-        updateViews()
-        scroll.scrollTo(0, 0)
+        when (page) {
+            Page.DEVICES -> {
+                stopScan()
+                page = if (returnToSettings && snapshot != null) Page.SETTINGS else Page.REGISTER
+                feedback = null
+                updateViews()
+            }
+            Page.SETTINGS -> openCollectionAndFinish()
+            // An underlying collection page may still hold the previous profile after a switch.
+            Page.REGISTER -> finishAffinity()
+        }
     }
 
     private fun buildPages(draft: String) {
@@ -197,38 +225,72 @@ class StepPreparationActivity : Activity() {
         }
         setContentView(frame)
         val header = section(frame, 20)
-        back = link(header, "返回") { goBack() }.apply {
+        back = link(header, "关闭") { goBack() }.apply {
             tag = "back"
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
-        val titleRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = android.view.Gravity.CENTER_VERTICAL }
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
         header.addView(titleRow, LinearLayout.LayoutParams(-1, -2))
-        heading = label(titleRow, "步数采集", 28f).apply {
-            tag = "heading"; setTypeface(null, Typeface.BOLD)
+        heading = label(titleRow, "开始使用", 28f).apply {
+            tag = "heading"
+            setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
-        details = link(titleRow, if (BuildConfig.DEBUG) "更多" else "设备详情") {
-            if (BuildConfig.DEBUG) showMore() else showDetails()
-        }.apply {
-            tag = "details"; textSize = 14f
+        details = link(titleRow, "更多") { showMore() }.apply {
+            tag = "details"
+            textSize = 14f
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
         subtitle = label(header, "", 14f).apply { setTextColor(ui.secondary) }
         scroll = ScrollView(this).apply { isFillViewport = true }
         frame.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
-        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(12), dp(20), dp(12)) }
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+        }
         scroll.addView(body)
+
         registration = ui.card(body)
-        label(registration, "被试编号", 16f)
+        label(registration, "身份类型", 16f)
+        identityTypePicker = RadioGroup(this).apply {
+            tag = "identity_type_picker"
+            orientation = RadioGroup.HORIZONTAL
+        }
+        researchIdChoice = identityChoice("研究编号", "identity_type_research")
+        localNameChoice = identityChoice("本地姓名", "identity_type_local")
+        identityTypePicker.addView(researchIdChoice, LinearLayout.LayoutParams(0, dp(48), 1f))
+        identityTypePicker.addView(localNameChoice, LinearLayout.LayoutParams(0, dp(48), 1f))
+        registration.addView(identityTypePicker, LinearLayout.LayoutParams(-1, -2))
+        identityInputLabel = label(registration, "", 16f).apply { setPadding(0, dp(16), 0, dp(4)) }
         participantInput = EditText(this).apply {
             tag = "participant_input"
-            hint = "研究者提供的编号"
             setSingleLine(true)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setText(draft)
             ui.styleInput(this)
         }
-        registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2))
+        identityHelp = label(registration, "", 14f).apply {
+            tag = "identity_help"
+            setTextColor(ui.secondary)
+            setPadding(0, dp(8), 0, 0)
+        }
+        setIdentityTypeDraft(identityTypeDraft)
+        identityTypePicker.setOnCheckedChangeListener { _, checkedId ->
+            val selected = when (checkedId) {
+                researchIdChoice.id -> PreparationIdentityType.RESEARCH_ID
+                localNameChoice.id -> PreparationIdentityType.LOCAL_NAME
+                else -> return@setOnCheckedChangeListener
+            }
+            if (selected != identityTypeDraft) {
+                setIdentityTypeDraft(selected)
+                feedback = null
+                updateViews()
+            }
+        }
         label(registration, "戒指佩戴位置", 16f).setPadding(0, dp(24), 0, dp(4))
         placementPicker = Spinner(this).apply {
             tag = "placement_picker"
@@ -238,32 +300,56 @@ class StepPreparationActivity : Activity() {
                 override fun onNothingSelected(parent: AdapterView<*>?) = Unit
                 override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                     placementDraft = position
+                    feedback = null
                     updateViews()
                 }
             }
         }
         placementPicker.minimumHeight = dp(56)
         registration.addView(placementPicker, LinearLayout.LayoutParams(-1, -2))
-        overview = section(body)
-        val profileCard = ui.card(overview)
-        participantLabel = label(profileCard, "", 16f).apply { tag = "participant_summary" }
-        editPlacement = link(profileCard, "") { showPlacementPicker() }.apply { tag = "edit_placement" }
-        val connectionCard = ui.card(overview, ui.statusSurface)
-        homeStatus = label(connectionCard, "", 28f).apply {
-            tag = "device_status"; setTypeface(null, Typeface.BOLD)
-            setPadding(0, 0, 0, dp(8))
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        homeExplanation = label(connectionCard, "", 16f)
-        cancelConnection = link(connectionCard, "取消连接") {
-            controller.disconnect("已取消连接")
-        }.apply { tag = "connection_cancel"; setTextColor(ui.ink) }
+
         devices = section(body)
         val scanCard = ui.card(devices)
-        scanStatus = label(scanCard, "", 16f)
+        scanStatus = label(scanCard, "", 16f).apply { tag = "scan_status" }
         results = section(devices)
+
+        settings = section(body)
+        val profileCard = ui.card(settings)
+        participantLabel = label(profileCard, "", 18f).apply {
+            tag = "participant_summary"
+            setTypeface(null, Typeface.BOLD)
+        }
+        placementLabel = label(profileCard, "", 16f).apply { tag = "placement_summary" }
+        ringLabel = label(profileCard, "", 16f).apply { tag = "ring_summary" }
+        changeIdentity = link(profileCard, "更换身份") { showIdentityPicker() }.apply { tag = "change_identity" }
+        editPlacement = link(profileCard, "修改佩戴位置") { showPlacementPicker() }.apply { tag = "edit_placement" }
+        changeRing = link(profileCard, "更换戒指") { openDeviceSelection(fromSettings = true) }.apply { tag = "change_ring" }
+        clearProfile = link(profileCard, "清除当前身份") { confirmClearProfile() }.apply {
+            tag = "clear_profile"
+        }
+
         val footer = section(frame, 20)
-        message = label(footer, "", 14f).apply { tag = "feedback"; accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE }
+        message = label(footer, "", 14f).apply {
+            tag = "feedback"
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        progressRow = LinearLayout(this).apply {
+            tag = "loading_state"
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+        footer.addView(progressRow, LinearLayout.LayoutParams(-1, dp(48)))
+        progressRow.addView(ProgressBar(this).apply {
+            tag = "loading_indicator"
+            isIndeterminate = true
+        }, LinearLayout.LayoutParams(dp(24), dp(24)))
+        progressStatus = label(progressRow, "", 14f).apply {
+            tag = "loading_status"
+            setTextColor(ui.secondary)
+            setPadding(dp(12), 0, 0, 0)
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
         primary = button(footer, "", true) { primaryAction() }.apply { tag = "primary" }
         updateViews()
     }
@@ -277,44 +363,133 @@ class StepPreparationActivity : Activity() {
                 if (isDestroyed) return@post
                 busy = false
                 loaded = true
-                result.onSuccess {
-                    snapshot = it
+                result.onSuccess { loadedSnapshot ->
+                    snapshot = loadedSnapshot
                     storageProblem = null
-                    page = if (it == null) Page.REGISTER else restoredPage?.takeUnless { p -> p == Page.REGISTER } ?: Page.HOME
-                }.onFailure { storageProblem = "准备信息读取失败，请联系研究者。原信息已保留。" }
+                    profileUnreadable = false
+                    loadedSnapshot?.let {
+                        setIdentityTypeDraft(it.identityType)
+                        participantInput.setText(it.displayLabel)
+                        placementDraft = it.placement?.ordinal?.plus(1) ?: 0
+                        placementPicker.setSelection(placementDraft)
+                    }
+                    restoredPage?.let { page = it }
+                }.onFailure { error ->
+                    profileUnreadable = error is PreparationProfileUnreadableException
+                    storageProblem = if (profileUnreadable) {
+                        error.message ?: "身份资料需要重新登记，已有采集记录仍保留"
+                    } else {
+                        "身份资料暂时无法读取，请重新打开 App"
+                    }
+                }
                 restoredPage = null
                 updateViews()
-                prepareOnOpen()
+                routeWhenReady()
             }
         }
     }
 
-    /** Pending work locks preparation; completed history keeps only its navigation entry. */
     private fun refreshCollectionState() {
         val generation = ++collectionReadGeneration
-        val journal = collectionJournal
         collectionLoaded = false
         updateViews()
         disk.execute {
-            val result = runCatching { FreeLivingSessionStore(journal).read() }
+            val result = runCatching { FreeLivingSessionStore(collectionJournal).read() }
             main.post {
                 if (isDestroyed || generation != collectionReadGeneration) return@post
                 collectionLoaded = true
                 result.onSuccess { session ->
                     collectionPending = session?.isPending == true
-                    collectionHistory = session != null
-                    collectionProblem = null
+                    collectionOwnerBusy = RealCollectionBridge.isRunning()
+                    collectionProblem = if (!collectionPending && collectionOwnerBusy) "正在关闭戒指连接" else null
                 }.onFailure {
                     collectionPending = true
-                    collectionHistory = true
-                    collectionProblem = "采集记录读取失败，请联系研究者。"
+                    collectionOwnerBusy = RealCollectionBridge.isRunning()
+                    collectionProblem = "当前记录需要恢复，请返回记录继续"
                 }
                 updateViews()
-                prepareOnOpen()
+                routeWhenReady()
             }
         }
     }
-    private fun persist(afterSave: (PreparationSnapshot) -> Unit, onFailure: (() -> Unit)? = null, write: () -> PreparationSnapshot) {
+
+    private fun routeWhenReady() {
+        if (!visible || !loaded || !collectionLoaded || busy || routeStarted) return
+        if (collectionPending && !settingsRequested) {
+            openCollectionAndFinish()
+            return
+        }
+        if (settingsRequested && collectionPending) {
+            page = Page.SETTINGS
+            updateViews()
+            return
+        }
+        if (storageProblem != null) {
+            page = Page.REGISTER
+            updateViews()
+            return
+        }
+        val current = snapshot
+        when {
+            current == null || current.placement == null -> page = Page.REGISTER
+            current.ring == null -> openDeviceSelection(fromSettings = false)
+            settingsRequested -> page = Page.SETTINGS
+            else -> {
+                openCollectionAndFinish()
+                return
+            }
+        }
+        updateViews()
+    }
+
+    private fun primaryAction() {
+        if (busy || !loaded) return
+        if (page == Page.SETTINGS && collectionPending) {
+            openCollectionAndFinish()
+            return
+        }
+        if (storageProblem != null) {
+            if (profileUnreadable) clearUnreadableProfile() else loadProfile()
+            return
+        }
+        feedback = null
+        when (page) {
+            Page.REGISTER -> saveRegistration()
+            Page.DEVICES -> if (scanning) {
+                stopScan()
+                scanMessage = "搜索已停止"
+                updateViews()
+            } else withBluetooth(::scan)
+            Page.SETTINGS -> openCollectionAndFinish()
+        }
+    }
+
+    private fun saveRegistration() {
+        val raw = participantInput.text.toString().trim()
+        val selected = RingPlacement.entries.getOrNull(placementDraft - 1)
+        when {
+            raw.isEmpty() -> {
+                feedback = when (identityTypeDraft) {
+                    PreparationIdentityType.RESEARCH_ID -> "请输入研究编号"
+                    PreparationIdentityType.LOCAL_NAME -> "请输入本地姓名"
+                }
+                updateViews()
+            }
+            selected == null -> {
+                feedback = "请选择戒指佩戴位置"
+                updateViews()
+            }
+            snapshot == null -> persist(afterSave = { openDeviceSelection(fromSettings = false) }) {
+                store.register(raw, selected, identityTypeDraft)
+            }
+            snapshot?.placement != selected -> persist(afterSave = { openDeviceSelection(fromSettings = false) }) {
+                store.savePlacement(selected)
+            }
+            else -> openDeviceSelection(fromSettings = false)
+        }
+    }
+
+    private fun persist(afterSave: (PreparationSnapshot) -> Unit, write: () -> PreparationSnapshot) {
         if (busy || storageProblem != null) return
         busy = true
         feedback = null
@@ -324,141 +499,109 @@ class StepPreparationActivity : Activity() {
             main.post {
                 if (isDestroyed) return@post
                 busy = false
-                result.onSuccess { snapshot = it; afterSave(it) }.onFailure {
-                    feedback = if (it is IllegalArgumentException) it.message else "保存失败，请检查手机空间后重试。"
-                    onFailure?.invoke()
+                result.onSuccess {
+                    snapshot = it
+                    afterSave(it)
+                }.onFailure {
+                    if (it is CollectionOwnerBusyException) {
+                        placementDialog?.dismiss()
+                        stopScan()
+                        feedback = it.message
+                        openCollectionAndFinish()
+                        return@onFailure
+                    }
+                    feedback = when (it) {
+                        is IllegalArgumentException, is IllegalStateException -> it.message
+                        else -> "保存失败，请检查手机空间后重试"
+                    }
                 }
                 updateViews()
             }
         }
     }
-    private fun checking(): Boolean = controller.state.let {
-        it.connecting || (it.connected && !it.queryTimedOut &&
-            (it.healthStatus == null || it.batteryPercent == null || it.firmwareVersion == null))
-    }
-    private fun homeUi(): HomeUi {
-        val state = controller.state
-        val disconnected = state.message in setOf("未连接", "手机蓝牙已关闭", "尚未允许蓝牙权限")
-        return when {
-            snapshot?.placement == null -> HomeUi("补充佩戴位置", "选择佩戴位置", HomeAction.PLACEMENT)
-            requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED } -> {
-                val permission = if (Build.VERSION.SDK_INT >= 31) "蓝牙" else "定位"
-                HomeUi("需要${permission}权限", if (permissionDenied) "打开权限设置" else "允许${permission}权限",
-                    if (permissionDenied) HomeAction.SETTINGS else HomeAction.CONNECT)
-            }
-            !bluetoothEnabled() -> HomeUi("手机蓝牙已关闭", "打开蓝牙", HomeAction.SETTINGS)
-            !locationEnabled() -> HomeUi("手机定位已关闭", "打开定位", HomeAction.SETTINGS)
-            !collectionLoaded -> HomeUi("正在读取记录", "正在读取…", HomeAction.NONE, waiting = true)
-            collectionOwnsDevice() || collectionHistory -> HomeUi("采集记录", "进入采集", HomeAction.CAPTURE,
-                collectionProblem.orEmpty())
-            state.connecting -> HomeUi("正在连接戒指", "正在连接…", HomeAction.NONE, waiting = true)
-            checking() -> HomeUi("正在检查戒指", "正在检查…", HomeAction.NONE, waiting = true)
-            state.queryTimedOut -> HomeUi("连接检查未完成", "重试连接", HomeAction.CONNECT, state.message)
-            state.connected && !state.canPrepare -> HomeUi(
-                "戒指已连接", "进入采集", HomeAction.CAPTURE, state.message,
-            )
-            state.canPrepare -> HomeUi("准备完成", "进入采集", HomeAction.CAPTURE)
-            else -> HomeUi(
-                if (disconnected) "戒指未连接" else state.message,
-                if (disconnected || state.message == "已取消连接") "连接戒指" else "重试连接",
-                HomeAction.CONNECT,
-            )
-        }
-    }
 
-    private fun primaryAction() {
-        if (busy || !loaded || storageProblem != null) return
+    private fun openDeviceSelection(fromSettings: Boolean) {
+        if (collectionPending || collectionOwnerBusy) return
+        returnToSettings = fromSettings
+        page = Page.DEVICES
         feedback = null
-        when (page) {
-            Page.REGISTER -> {
-                val selected = RingPlacement.entries.getOrNull(placementDraft - 1) ?: return
-                val raw = participantInput.text.toString()
-                persist(afterSave = {
-                    navigate(Page.HOME)
-                    if (visible) connectPreparedRing()
-                }) { store.register(raw, selected) }
-            }
-            Page.HOME -> when (homeUi().action) {
-                HomeAction.PLACEMENT -> showPlacementPicker()
-                HomeAction.CONNECT -> connectPreparedRing()
-                HomeAction.SETTINGS -> openNeededSettings()
-                HomeAction.DETAILS -> showDetails()
-                HomeAction.CAPTURE -> openCollection()
-                HomeAction.NONE -> Unit
-            }
-            Page.DEVICES -> if (scanning) {
-                stopScan()
-                scanMessage = "已停止搜索"
-                updateViews()
-            } else withBluetooth(::scan)
-        }
-    }
-
-    private fun connectPreparedRing() {
-        autoConnectPending = false
-        withBluetooth {
-            snapshot?.ring?.let(::connect) ?: run { navigate(Page.DEVICES); scan() }
-        }
-    }
-
-    private fun prepareOnOpen() {
-        if (!autoConnectPending || !visible || !loaded || busy || !collectionLoaded) return
-        autoConnectPending = false
-        if (collectionOwnsDevice() || collectionHistory) return
-        if (storageProblem != null || snapshot?.placement == null) return
-        val ring = snapshot?.ring ?: return
-        if (requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) return
-        if (bluetoothEnabled() && locationEnabled()) connect(ring)
+        updateViews()
+        if (visible && collectionLoaded) withBluetooth(::scan)
     }
 
     private fun updateViews() {
         if (!::primary.isInitialized) return
-        val usable = loaded && storageProblem == null
-        val ui = homeUi()
-        registration.visibility = if (usable && page == Page.REGISTER) View.VISIBLE else View.GONE
-        overview.visibility = if (usable && page == Page.HOME) View.VISIBLE else View.GONE
-        devices.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
-        back.visibility = if (usable && page == Page.DEVICES) View.VISIBLE else View.GONE
-        back.isEnabled = !busy
-        details.visibility = if (BuildConfig.DEBUG || (usable && page == Page.HOME && ui.action != HomeAction.DETAILS)) View.VISIBLE else View.GONE
-        details.isEnabled = !busy && (BuildConfig.DEBUG || !ui.waiting)
-        heading.text = when (page) { Page.REGISTER -> "填写准备信息"; Page.HOME -> "步数采集"; Page.DEVICES -> "选择戒指" }
-        subtitle.text = when (page) {
-            Page.REGISTER -> "第 1 步 · 填写信息"
-            Page.HOME -> when {
-                snapshot?.placement == null -> "补充准备信息"
-                ui.action in setOf(HomeAction.DETAILS, HomeAction.CAPTURE) || (ui.action == HomeAction.NONE && !ui.waiting) -> "采集准备"
-                else -> "第 2 步 · 连接戒指"
-            }
-            Page.DEVICES -> "点击你的戒指即可连接"
+        val locked = collectionPending || collectionOwnerBusy || !collectionLoaded
+        val pendingSettings = page == Page.SETTINGS && collectionPending
+        val retiringSettings = page == Page.SETTINGS && !collectionPending && collectionOwnerBusy
+        val hasStorageProblem = storageProblem != null && !pendingSettings
+        val progressText = when {
+            !loaded || !collectionLoaded -> "正在读取本机信息"
+            busy -> "正在保存"
+            retiringSettings -> "正在关闭戒指连接"
+            else -> null
         }
-        participantInput.isEnabled = !busy
+        registration.visibility = if (!hasStorageProblem && page == Page.REGISTER) View.VISIBLE else View.GONE
+        devices.visibility = if (!hasStorageProblem && page == Page.DEVICES) View.VISIBLE else View.GONE
+        settings.visibility = if (!hasStorageProblem && page == Page.SETTINGS) View.VISIBLE else View.GONE
+        back.visibility = View.VISIBLE
+        back.text = if (page == Page.DEVICES) "返回" else "关闭"
+        back.isEnabled = true
+        details.visibility = if (BuildConfig.DEBUG && !hasStorageProblem && progressText == null) View.VISIBLE else View.GONE
+        details.isEnabled = progressText == null
+        heading.text = when {
+            pendingSettings -> "设置"
+            hasStorageProblem && profileUnreadable -> "重新登记"
+            hasStorageProblem -> "身份资料"
+            page == Page.REGISTER -> "开始使用"
+            page == Page.DEVICES -> "选择戒指"
+            else -> "设置"
+        }
+        subtitle.text = when {
+            pendingSettings -> "当前记录完成后可修改设置"
+            retiringSettings -> "正在关闭戒指连接"
+            hasStorageProblem -> "已有采集记录会保留"
+            page == Page.REGISTER -> "填写身份和佩戴位置"
+            page == Page.DEVICES -> "点击正在使用的戒指"
+            locked -> "当前记录完成后可修改设置"
+            else -> "身份与设备"
+        }
+        participantInput.isEnabled = !busy && snapshot == null
+        researchIdChoice.isEnabled = !busy && snapshot == null
+        localNameChoice.isEnabled = !busy && snapshot == null
         placementPicker.isEnabled = !busy
-        participantLabel.text = "编号：${snapshot?.participantId.orEmpty()}"
-        editPlacement.text = snapshot?.placement?.let { "${it.displayName} · 修改" } ?: "选择佩戴位置"
-        editPlacement.isEnabled = !busy && !ui.waiting && !collectionOwnsDevice()
-        homeStatus.text = ui.status
-        homeExplanation.text = ui.explanation
-        homeExplanation.visibility = if (ui.explanation.isEmpty()) View.GONE else View.VISIBLE
-        cancelConnection.visibility = if (ui.waiting && checking()) View.VISIBLE else View.GONE
-        cancelConnection.isEnabled = !busy
-        scanStatus.text = scanMessage ?: "将戒指放在手机附近，点击重新搜索。"
+        participantLabel.text = snapshot?.displayLabel ?: "当前身份资料暂时不可用"
+        placementLabel.text = "佩戴位置：${snapshot?.placement?.displayName ?: "待选择"}"
+        ringLabel.text = "戒指：${snapshot?.ring?.name ?: "待选择"}"
+        listOf(changeIdentity, editPlacement, changeRing, clearProfile).forEach {
+            it.visibility = if (locked) View.GONE else View.VISIBLE
+            it.isEnabled = !busy && !locked
+        }
+        scanStatus.text = scanMessage ?: when {
+            permissionDenied -> "允许蓝牙权限后即可搜索"
+            !bluetoothEnabled() -> "打开手机蓝牙后即可搜索"
+            else -> "将戒指放在手机附近"
+        }
         primary.text = when {
-            !loaded -> "正在读取…"
-            busy -> "正在保存…"
-            storageProblem != null -> "准备信息需要处理"
-            page == Page.REGISTER -> "保存并连接戒指"
-            page == Page.HOME -> ui.actionText
-            scanning -> "停止搜索"
-            else -> "重新搜索"
+            pendingSettings -> "返回当前记录"
+            hasStorageProblem && profileUnreadable -> "重新登记"
+            hasStorageProblem -> "重新读取"
+            page == Page.REGISTER -> "下一步"
+            page == Page.DEVICES && scanning -> "停止搜索"
+            page == Page.DEVICES -> "重新搜索"
+            else -> "返回采集"
         }
-        primary.isEnabled = usable && !busy && when (page) {
-            Page.REGISTER -> placementDraft > 0
-            Page.HOME -> ui.action != HomeAction.NONE
-            Page.DEVICES -> collectionLoaded
+        progressStatus.text = progressText.orEmpty()
+        progressRow.visibility = if (progressText == null) View.GONE else View.VISIBLE
+        primary.visibility = if (progressText == null) View.VISIBLE else View.GONE
+        primary.isEnabled = progressText == null
+        val statusMessage = when {
+            pendingSettings -> collectionProblem ?: "请先完成当前记录"
+            hasStorageProblem -> storageProblem.orEmpty()
+            else -> feedback.orEmpty()
         }
-        message.text = storageProblem ?: feedback.orEmpty()
-        message.visibility = if (message.text.isEmpty()) View.GONE else View.VISIBLE
+        message.text = statusMessage
+        message.visibility = if (statusMessage.isEmpty()) View.GONE else View.VISIBLE
         placementDialog?.let { dialog ->
             dialog.setCancelable(!busy)
             dialog.setCanceledOnTouchOutside(!busy)
@@ -467,47 +610,113 @@ class StepPreparationActivity : Activity() {
         }
     }
 
-    private fun showMore() {
-        if (!BuildConfig.DEBUG || busy) return
-        moreMenu?.dismiss()
-        moreMenu = PopupMenu(this, details).apply {
-            if (snapshot != null && page == Page.HOME) menu.add(0, 1, 0, "设备详情").isEnabled = !checking()
-            menu.add(0, 2, 1, "流程演示（模拟）")
-            setOnMenuItemClickListener { item ->
-                when (item.itemId) {
-                    1 -> showDetails()
-                    2 -> startActivity(Intent().setClassName(packageName, "com.nexthci.ringfitness.DemoCollectionActivity"))
-                }
-                true
-            }
-            setOnDismissListener { moreMenu = null }
-            show()
+    private fun showIdentityPicker() {
+        if (busy || collectionPending || collectionOwnerBusy || snapshot == null || identityDialog?.isShowing == true) return
+        var selectedType = snapshot?.identityType ?: PreparationIdentityType.RESEARCH_ID
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), 0, dp(24), 0)
         }
+        val types = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+        }
+        val research = identityChoice("研究编号", "identity_dialog_type_research")
+        val local = identityChoice("本地姓名", "identity_dialog_type_local")
+        types.addView(research, LinearLayout.LayoutParams(0, dp(48), 1f))
+        types.addView(local, LinearLayout.LayoutParams(0, dp(48), 1f))
+        content.addView(types, LinearLayout.LayoutParams(-1, -2))
+        val input = EditText(this).apply {
+            tag = "identity_dialog_input"
+            setSingleLine(true)
+            setText(snapshot?.displayLabel.orEmpty())
+            setSelection(text.length)
+            ui.styleInput(this)
+        }
+        content.addView(input, LinearLayout.LayoutParams(-1, -2))
+        val help = label(content, "", 14f).apply {
+            tag = "identity_dialog_help"
+            setTextColor(ui.secondary)
+            setPadding(0, dp(8), 0, 0)
+        }
+        fun updateDialogIdentity(type: PreparationIdentityType) {
+            selectedType = type
+            input.hint = identityHintText(type)
+            help.text = identityHelpText(type)
+        }
+        when (selectedType) {
+            PreparationIdentityType.RESEARCH_ID -> research.isChecked = true
+            PreparationIdentityType.LOCAL_NAME -> local.isChecked = true
+        }
+        updateDialogIdentity(selectedType)
+        types.setOnCheckedChangeListener { _, checkedId ->
+            updateDialogIdentity(
+                if (checkedId == local.id) PreparationIdentityType.LOCAL_NAME
+                else PreparationIdentityType.RESEARCH_ID,
+            )
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("更换身份")
+            .setView(content)
+            .setPositiveButton("继续", null)
+            .setNegativeButton("取消", null)
+            .create()
+        identityDialog = dialog
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val raw = input.text.toString().trim()
+                if (raw.isEmpty()) {
+                    input.error = when (selectedType) {
+                        PreparationIdentityType.RESEARCH_ID -> "请输入研究编号"
+                        PreparationIdentityType.LOCAL_NAME -> "请输入本地姓名"
+                    }
+                    return@setOnClickListener
+                }
+                val previous = snapshot
+                dialog.dismiss()
+                persist(afterSave = { saved ->
+                    if (saved == previous) {
+                        page = Page.SETTINGS
+                        feedback = "身份未更改"
+                    } else {
+                        setIdentityTypeDraft(saved.identityType)
+                        participantInput.setText(saved.displayLabel)
+                        placementDraft = 0
+                        placementPicker.setSelection(0)
+                        page = Page.REGISTER
+                        feedback = null
+                    }
+                }) {
+                    store.replaceCurrentProfile(raw, collectionIsIdle = profileChangeIsIdle(), identityType = selectedType)
+                }
+            }
+        }
+        dialog.setOnDismissListener { if (identityDialog === dialog) identityDialog = null }
+        dialog.show()
     }
 
     private fun showPlacementPicker() {
-        if (busy || collectionOwnsDevice() || snapshot == null || storageProblem != null || placementDialog?.isShowing == true) return
+        if (busy || collectionPending || collectionOwnerBusy || snapshot == null || placementDialog?.isShowing == true) return
         feedback = null
         val dialog = AlertDialog.Builder(this)
             .setTitle("佩戴位置")
-            .setSingleChoiceItems(RingPlacement.entries.map { it.displayName }.toTypedArray(), snapshot?.placement?.ordinal ?: -1) { _, index ->
-                if (busy || collectionOwnsDevice()) return@setSingleChoiceItems
+            .setSingleChoiceItems(
+                RingPlacement.entries.map { it.displayName }.toTypedArray(),
+                snapshot?.placement?.ordinal ?: -1,
+            ) { _, index ->
+                if (busy || collectionPending || collectionOwnerBusy || RealCollectionBridge.isRunning()) {
+                    placementDialog?.dismiss()
+                    openCollectionAndFinish()
+                    return@setSingleChoiceItems
+                }
                 val chosen = RingPlacement.entries[index]
                 if (chosen == snapshot?.placement) placementDialog?.dismiss()
-                else persist(
-                    afterSave = {
-                        placementDialog?.dismiss()
-                        feedback = "佩戴位置已保存"
-                    },
-                    onFailure = {
-                        placementDialog?.setTitle("保存失败，请重新选择")
-                        placementDialog?.listView?.apply {
-                            clearChoices()
-                            snapshot?.placement?.ordinal?.let { setItemChecked(it, true) }
-                            requestLayout()
-                        }
-                    },
-                ) { store.savePlacement(chosen) }
+                else persist(afterSave = {
+                    placementDraft = chosen.ordinal + 1
+                    placementPicker.setSelection(placementDraft)
+                    placementDialog?.dismiss()
+                    page = Page.SETTINGS
+                    feedback = "佩戴位置已保存"
+                }) { withIdleCollectionOwner { store.savePlacement(chosen) } }
             }
             .setNegativeButton("取消", null)
             .create()
@@ -517,138 +726,292 @@ class StepPreparationActivity : Activity() {
         updateViews()
     }
 
+    private fun confirmClearProfile() {
+        if (busy || collectionPending || collectionOwnerBusy || clearDialog?.isShowing == true) return
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("清除当前身份？")
+            .setMessage("当前身份和已选戒指将从本机清除。已有采集记录会保留。")
+            .setPositiveButton("清除") { _, _ -> clearCurrentProfile() }
+            .setNegativeButton("取消", null)
+            .create()
+        clearDialog = dialog
+        dialog.setOnDismissListener { if (clearDialog === dialog) clearDialog = null }
+        dialog.show()
+    }
+
+    private fun clearCurrentProfile() {
+        if (busy || collectionPending || collectionOwnerBusy) return
+        busy = true
+        feedback = null
+        updateViews()
+        disk.execute {
+            val result = runCatching { store.clearCurrentProfile(collectionIsIdle = profileChangeIsIdle()) }
+            main.post {
+                if (isDestroyed) return@post
+                busy = false
+                result.onSuccess {
+                    snapshot = null
+                    setIdentityTypeDraft(PreparationIdentityType.RESEARCH_ID)
+                    participantInput.setText("")
+                    placementDraft = 0
+                    placementPicker.setSelection(0)
+                    settingsRequested = false
+                    page = Page.REGISTER
+                    feedback = null
+                }.onFailure {
+                    feedback = it.message ?: "清除失败，请重试"
+                }
+                updateViews()
+            }
+        }
+    }
+
+    private fun clearUnreadableProfile() {
+        if (busy || collectionPending || collectionOwnerBusy) return
+        busy = true
+        feedback = null
+        updateViews()
+        disk.execute {
+            val result = runCatching { store.clearCurrentProfile(collectionIsIdle = profileChangeIsIdle()) }
+            main.post {
+                if (isDestroyed) return@post
+                busy = false
+                result.onSuccess {
+                    snapshot = null
+                    storageProblem = null
+                    profileUnreadable = false
+                    setIdentityTypeDraft(PreparationIdentityType.RESEARCH_ID)
+                    participantInput.setText("")
+                    placementDraft = 0
+                    placementPicker.setSelection(0)
+                    page = Page.REGISTER
+                }.onFailure {
+                    storageProblem = it.message ?: "身份资料暂时无法清除，请重试"
+                }
+                updateViews()
+            }
+        }
+    }
+
+    private fun profileChangeIsIdle(): Boolean = runCatching {
+        !RealCollectionBridge.isRunning() && FreeLivingSessionStore(collectionJournal).read()?.isPending != true
+    }.getOrDefault(false)
+
     private fun bluetoothEnabled() = getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
-    private fun locationEnabled() = Build.VERSION.SDK_INT > 30 || getSystemService(android.location.LocationManager::class.java).isLocationEnabled
+    private fun locationEnabled() = Build.VERSION.SDK_INT > 30 ||
+        getSystemService(android.location.LocationManager::class.java).isLocationEnabled
+
     private fun withBluetooth(action: () -> Unit) {
         val missing = requiredPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) {
             pendingBluetoothAction = action
-            requestPermissions(missing.toTypedArray(), 10)
+            requestPermissions(missing.toTypedArray(), REQUEST_BLUETOOTH)
             return
         }
-        if (!bluetoothEnabled() || !locationEnabled()) { openNeededSettings(); return }
+        if (!bluetoothEnabled() || !locationEnabled()) {
+            openNeededSettings()
+            return
+        }
         action()
     }
+
     private fun openNeededSettings() {
-        val intent = when {
+        val settingsIntent = when {
             requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED } ->
                 Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
             !bluetoothEnabled() -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
             !locationEnabled() -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
             else -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
         }
-        startActivity(intent)
+        startActivity(settingsIntent)
     }
+
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != 10) return
+        if (requestCode != REQUEST_BLUETOOTH) return
         val action = pendingBluetoothAction
         pendingBluetoothAction = null
         permissionDenied = requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (!permissionDenied) {
-            if (visible && action != null) withBluetooth(action)
-        } else controller.disconnect("尚未允许蓝牙权限")
+        if (!permissionDenied && visible && action != null) withBluetooth(action)
+        else scanMessage = "允许蓝牙权限后即可搜索"
         updateViews()
     }
+
     private fun requiredPermissions() = if (Build.VERSION.SDK_INT >= 31) {
         listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-    } else listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    } else {
+        listOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    }
+
     private fun scan() {
-        if (!collectionLoaded) return
-        if (collectionOwnsDevice()) { openCollection(); return }
+        if (!collectionLoaded || collectionPending) return
         stopScan()
-        controller.disconnect("未连接")
         scanMessage = "正在搜索附近的戒指…"
         results.removeAllViews()
         scanning = true
         val generation = scanGeneration
         val client = RingBleClient(this, object : RingBleClient.Listener {
-            private fun deliver(action: () -> Unit) { main.post { if (visible && generation == scanGeneration) action() } }
+            private fun deliver(action: () -> Unit) {
+                main.post { if (visible && generation == scanGeneration) action() }
+            }
+
             override fun onBleState(message: String, ready: Boolean) = deliver {
-                scanMessage = message
+                scanMessage = when {
+                    message.startsWith("搜索完成") -> "选择正在使用的戒指"
+                    message.startsWith("没有发现") -> "没有发现戒指，请靠近后重新搜索"
+                    else -> message
+                }
                 if (message.startsWith("搜索完成") || message.startsWith("没有发现")) scanning = false
                 updateViews()
             }
-            override fun onBleError(message: String) = deliver { scanning = false; scanMessage = message; updateViews() }
+
+            override fun onBleError(message: String) = deliver {
+                scanning = false
+                scanMessage = "搜索失败，请检查蓝牙后重试"
+                updateViews()
+            }
+
             override fun onSensorPacket(packet: SensorPacket) = Unit
+
             override fun onRingsFound(rings: List<ScannedRing>) = deliver {
                 results.removeAllViews()
                 rings.forEach { ring ->
                     button(results, "${ring.name} · ${ring.address.takeLast(5)}", false) {
-                        if (!busy && !checking() && !collectionOwnsDevice()) {
+                        if (!busy && !collectionPending && !collectionOwnerBusy && !RealCollectionBridge.isRunning()) {
                             stopScan()
-                            controller.disconnect("未连接")
-                            persist(afterSave = { saved ->
-                                navigate(Page.HOME)
-                                if (visible) withBluetooth { connect(requireNotNull(saved.ring)) }
-                            }) {
-                                store.selectRing(PreparedRing(ring.address, ring.name))
-                            }
+                            persist(afterSave = {
+                                openCollectionAndFinish()
+                            }) { withIdleCollectionOwner { store.selectRing(PreparedRing(ring.address, ring.name)) } }
+                        } else if (collectionPending || collectionOwnerBusy || RealCollectionBridge.isRunning()) {
+                            stopScan()
+                            openCollectionAndFinish()
                         }
                     }
                 }
             }
         })
         scanner = client
-        runCatching { client.scanForRings() }.onFailure { stopScan(); scanMessage = "搜索失败，请检查蓝牙和权限后重试。" }
+        runCatching { client.scanForRings() }.onFailure {
+            stopScan()
+            scanMessage = "搜索失败，请检查蓝牙后重试"
+        }
         updateViews()
     }
-    private fun connect(ring: PreparedRing) {
-        if (collectionOwnsDevice()) return
-        stopScan(); controller.connect(ring)
-    }
-    private fun collectionOwnsDevice() = RealCollectionBridge.isRunning() || !collectionLoaded || collectionPending
-    private fun openCollection() {
-        stopScan()
-        controller.disconnect("未连接")
-        autoConnectPending = false
-        startActivity(Intent(this, RealCollectionActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-    }
+
     private fun stopScan() {
         ++scanGeneration
         scanning = false
-        scanMessage = null
         runCatching { scanner?.stop() }
         scanner = null
         if (::results.isInitialized) results.removeAllViews()
     }
-    private fun showDetails() {
-        if (busy || checking()) return
-        val state = controller.state
-        AlertDialog.Builder(this).setTitle("设备详情").setMessage(
-            "戒指：${snapshot?.ring?.name ?: "尚未选择"}\n" +
-                "地址：${snapshot?.ring?.address ?: "—"}\n" +
-                "电量：${state.batteryPercent?.let { "$it%" } ?: "待查询"}\n" +
-                "固件：${state.firmwareVersion ?: "待查询"}\n" +
-                "记录量：${state.healthStatus?.bytes?.let { "$it bytes" } ?: "待查询"}\n" +
-                "记录数：${state.healthStatus?.records ?: "待查询"}\n" +
-                "设备记录编号：${state.healthStatus?.sessionId ?: "待查询"}\n" +
-                "状态码：${state.healthStatus?.errorCode ?: "待查询"}"
-        ).setPositiveButton("关闭", null)
-            .setNeutralButton("更换戒指") { _, _ -> if (!collectionOwnsDevice()) withBluetooth { navigate(Page.DEVICES); scan() } }
-            .setNegativeButton("系统设置") { _, _ -> openNeededSettings() }
-            .show()
-            .getButton(AlertDialog.BUTTON_NEUTRAL).isEnabled = !collectionOwnsDevice()
+
+    private fun openCollectionAndFinish() {
+        if (routeStarted) return
+        routeStarted = true
+        stopScan()
+        startActivity(
+            Intent(this, RealCollectionActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+        )
+        finish()
     }
+
+    /** Recheck durable work and the live owner immediately before changing profile routing. */
+    private fun <T> withIdleCollectionOwner(write: () -> T): T {
+        if (RealCollectionBridge.isRunning()) throw CollectionOwnerBusyException()
+        val pending = FreeLivingSessionStore(collectionJournal).read()?.isPending == true
+        if (pending || RealCollectionBridge.isRunning()) throw CollectionOwnerBusyException()
+        return write()
+    }
+
+    private fun showMore() {
+        if (!BuildConfig.DEBUG || busy) return
+        moreMenu?.dismiss()
+        moreMenu = PopupMenu(this, details).apply {
+            menu.add(0, 1, 0, "流程演示（模拟）")
+            setOnMenuItemClickListener {
+                if (it.itemId == 1) {
+                    startActivity(Intent().setClassName(packageName, "com.nexthci.ringfitness.DemoCollectionActivity"))
+                }
+                true
+            }
+            setOnDismissListener { moreMenu = null }
+            show()
+        }
+    }
+
     private fun section(parent: LinearLayout, padding: Int = 0) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
         setPadding(dp(padding), dp(if (padding > 0) 8 else 0), dp(padding), dp(if (padding > 0) 8 else 0))
         parent.addView(this, LinearLayout.LayoutParams(-1, -2))
     }
+
     private fun label(parent: LinearLayout, value: String, size: Float) = ui.text(parent, value, size).apply {
         setPadding(0, dp(4), 0, dp(4))
     }
+
+    private fun identityChoice(value: String, viewTag: String) = RadioButton(this).apply {
+        id = View.generateViewId()
+        tag = viewTag
+        text = value
+        textSize = 16f
+        setTextColor(ui.ink)
+        buttonTintList = android.content.res.ColorStateList.valueOf(ui.accent)
+        gravity = android.view.Gravity.CENTER_VERTICAL
+        setPadding(dp(4), 0, dp(4), 0)
+    }
+
+    private fun setIdentityTypeDraft(type: PreparationIdentityType) {
+        identityTypeDraft = type
+        if (!::identityTypePicker.isInitialized) return
+        val choice = when (type) {
+            PreparationIdentityType.RESEARCH_ID -> researchIdChoice
+            PreparationIdentityType.LOCAL_NAME -> localNameChoice
+        }
+        if (!choice.isChecked) choice.isChecked = true
+        identityInputLabel.text = when (type) {
+            PreparationIdentityType.RESEARCH_ID -> "研究编号"
+            PreparationIdentityType.LOCAL_NAME -> "本地姓名"
+        }
+        participantInput.hint = identityHintText(type)
+        identityHelp.text = identityHelpText(type)
+    }
+
+    private fun identityHintText(type: PreparationIdentityType) = when (type) {
+        PreparationIdentityType.RESEARCH_ID -> "例如 P001"
+        PreparationIdentityType.LOCAL_NAME -> "例如 张三"
+    }
+
+    private fun identityHelpText(type: PreparationIdentityType) = when (type) {
+        PreparationIdentityType.RESEARCH_ID -> "研究者分配的 3–24 位字母或数字"
+        PreparationIdentityType.LOCAL_NAME -> "仅保存在本机，研究数据使用匿名编号"
+    }
+
     private fun button(parent: LinearLayout, value: String, prominent: Boolean, action: () -> Unit) =
         ui.button(parent, value, primary = prominent, action = action)
-    private fun link(parent: LinearLayout, value: String, action: () -> Unit) = ui.button(parent, value, action = action).apply {
-        background = ui.linkBackground()
-        minHeight = dp(48)
-        minimumHeight = dp(48)
-        gravity = android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
-        setPadding(0, dp(12), 0, dp(12))
-        (layoutParams as LinearLayout.LayoutParams).topMargin = 0
-    }
+
+    private fun link(parent: LinearLayout, value: String, action: () -> Unit) =
+        ui.button(parent, value, action = action).apply {
+            background = ui.linkBackground()
+            minHeight = dp(48)
+            minimumHeight = dp(48)
+            gravity = android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, dp(12))
+            (layoutParams as LinearLayout.LayoutParams).topMargin = 0
+        }
+
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
-    companion object { private val disk = Executors.newSingleThreadExecutor() }
+
+    companion object {
+        const val EXTRA_OPEN_SETTINGS = "com.nexthci.ringfitness.extra.OPEN_PREPARATION_SETTINGS"
+        private const val STATE_PAGE = "page"
+        private const val STATE_PARTICIPANT_DRAFT = "participant_draft"
+        private const val STATE_IDENTITY_TYPE = "identity_type"
+        private const val STATE_PLACEMENT = "placement_draft"
+        private const val STATE_PERMISSION_DENIED = "permission_denied"
+        private const val STATE_RETURN_TO_SETTINGS = "return_to_settings"
+        private const val REQUEST_BLUETOOTH = 10
+        private val disk = Executors.newSingleThreadExecutor()
+    }
 }

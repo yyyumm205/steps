@@ -9,7 +9,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** Cancellation must close the socket while an upload is blocked inside network I/O. */
 internal class CancellableUploadCall(private val client: OkHttpClient = standardClient()) {
-    fun <T> execute(request: Request, deadlineMs: Long, cancelled: () -> Boolean, consume: (Response) -> T): T {
+    fun <T> execute(request: Request, deadlineMs: Long, cancelled: () -> Boolean,
+        onDispatch: () -> Unit = {}, consume: (Response) -> T): T {
         require(deadlineMs > 0)
         val caller = Thread.currentThread()
         checkCancelled(cancelled, caller)
@@ -23,6 +24,8 @@ internal class CancellableUploadCall(private val client: OkHttpClient = standard
             }
         }, 0, 100, TimeUnit.MILLISECONDS)
         try {
+            checkCancelled(cancelled, caller)
+            onDispatch()
             return call.execute().use { response ->
                 checkCancelled(cancelled, caller)
                 consume(response).also { checkCancelled(cancelled, caller) }
