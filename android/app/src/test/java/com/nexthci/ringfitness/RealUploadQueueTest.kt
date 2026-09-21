@@ -236,6 +236,28 @@ class RealUploadQueueTest {
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
     }
 
+    @Test fun mismatchedPersistedReceiptFailsForReviewWithoutRepeatedUpload() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.failAfterResponse = true
+        assertTrue(f.queue.run(f.id))
+        f.failJournal = false
+        f.failAfterResponse = false
+        val taskFile = File(f.directory, "upload-tasks/${f.id}.json")
+        val task = JsonParser.parseString(taskFile.readText()).asJsonObject
+        task.getAsJsonObject("receipt").addProperty("fileName", "ringfitness-session-${"0".repeat(36)}.zip")
+        taskFile.writeText(task.toString())
+
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals("failed", f.queue.task(f.id)?.state)
+        assertEquals("receipt", f.queue.task(f.id)?.failureStage)
+        assertTrue(f.queue.needsLocalReview(f.id))
+        assertEquals(SessionTransferStatus.FAILED, f.store.read(f.id)?.transfer?.status)
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+    }
+
     @Test fun changedFrozenPackageIsRejectedBeforeHttpRetry() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
@@ -398,6 +420,29 @@ class RealUploadQueueTest {
         assertEquals(1, f.requests)
     }
 
+    @Test fun walkingAndRunningUseIndependentArchivesAndUploadReceipts() {
+        val f = Fixture()
+        val walking = f.createSavedSession(SessionActivity.WALKING)
+        val running = f.createSavedSession(SessionActivity.RUNNING)
+
+        assertTrue(f.queue.enqueue(walking, link, false))
+        assertTrue(f.queue.enqueue(running, link, false))
+        assertFalse(f.queue.run(walking))
+        assertFalse(f.queue.run(running))
+
+        assertEquals(
+            listOf(
+                "ringfitness-session-walking-$walking.zip",
+                "ringfitness-session-running-$running.zip",
+            ),
+            f.uploadedNames,
+        )
+        assertEquals(f.uploadedNames[0], f.queue.task(walking)?.receipt?.fileName)
+        assertEquals(f.uploadedNames[1], f.queue.task(running)?.receipt?.fileName)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read(walking)?.transfer?.status)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read(running)?.transfer?.status)
+    }
+
     private inner class Fixture {
         val directory = temporary.newFolder().canonicalFile
         var failJournal = false
@@ -419,12 +464,13 @@ class RealUploadQueueTest {
         var duringFreeze: (() -> Unit)? = null
         val destinations = mutableListOf<String>()
         val uploadedHashes = mutableListOf<String>()
+        val uploadedNames = mutableListOf<String>()
         init {
             id = createSavedSession()
             archive = archiveFor(id)
         }
-        fun createSavedSession(): String {
-            val s = store.requestStart(profile, time, "Asia/Shanghai")
+        fun createSavedSession(activity: SessionActivity = SessionActivity.FREE_LIVING): String {
+            val s = store.requestStart(profile, time, "Asia/Shanghai", activity = activity)
             val id = s.sessionId
             store.confirmStart(id, profile.ring!!.address, HealthMessage.Status(true, 20, 1, 0, 7), time + 1)
             store.requestStop(id, time + 2)
@@ -434,8 +480,16 @@ class RealUploadQueueTest {
             store.completeLocalData(id, listOf(SessionRawFile(raw.name, 7, raw.length(), sha(raw))), time + 5)
             return id
         }
-        private fun archiveFor(id: String) = File(directory, "ringfitness-session-$id.zip").apply {
+        private fun archiveFor(id: String): File {
+            val activity = requireNotNull(store.read(id)).activity
+            val name = if (activity == SessionActivity.FREE_LIVING) {
+                "ringfitness-session-$id.zip"
+            } else {
+                "ringfitness-session-${activity.wireValue}-$id.zip"
+            }
+            return File(directory, name).apply {
             if (!exists()) writeText("Frozen package transport fixture")
+            }
         }
         val queue get() = openQueue()
         fun openQueue() = RealUploadQueue(directory, store, freeze = { session ->
@@ -446,7 +500,7 @@ class RealUploadQueueTest {
         }, transport = SessionUploadTransport { destination, file, cancelled, onDispatch ->
             if (checkCancellationBeforeDispatch && cancelled()) throw InterruptedException()
             onDispatch()
-            requests++; destinations += destination; uploadedHashes += sha(file)
+            requests++; destinations += destination; uploadedHashes += sha(file); uploadedNames += file.name
             if (interruptUpload) throw InterruptedException()
             if (failUpload) throw IOException("Injected lost response")
             if (failAfterResponse) failJournal = true

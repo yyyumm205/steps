@@ -32,11 +32,19 @@ internal object DiscardedSessionFiles {
         val packages = child(root, "packages")
         if (packages.exists()) {
             require(packages.isDirectory)
-            val targets = packages.listFiles()?.filter { it.name == id || it.name.startsWith(".$id-") }.orEmpty()
+            val targets = packages.listFiles()?.filter {
+                it.name == id || it.name.startsWith(".$id-") || it.name.startsWith(".obsolete-$id-")
+            }.orEmpty()
             targets.forEach { target ->
                 val folder = child(packages, target.name)
                 require(folder.isDirectory)
-                listOf("ringfitness-session-$id.zip", "manifest.snapshot.json", "package.json").forEach {
+                listOf(
+                    "ringfitness-session-$id.zip",
+                    "ringfitness-session-walking-$id.zip",
+                    "ringfitness-session-running-$id.zip",
+                    "manifest.snapshot.json",
+                    "package.json",
+                ).forEach {
                     deleteFile(child(folder, it))
                 }
                 syncDirectory(folder)

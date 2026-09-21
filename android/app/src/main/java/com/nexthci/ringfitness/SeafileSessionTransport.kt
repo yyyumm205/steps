@@ -35,7 +35,7 @@ class SeafileSessionTransport : SessionUploadTransport {
             cancelled, onDispatch)).asJsonObject
         val upload = trustedUri(metadata.get("upload_link").asString)
         val destination = URI(upload.toString() + if (upload.rawQuery == null) "?ret-json=1" else "&ret-json=1")
-        require(archive.name.matches(Regex("ringfitness-session-[a-f0-9-]+\\.zip")))
+        validateArchiveName(archive.name)
         val content = object : RequestBody() {
             override fun contentType() = MediaType.parse("application/zip")
             override fun contentLength() = archive.length()
@@ -68,7 +68,7 @@ class SeafileSessionTransport : SessionUploadTransport {
         return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()),
             cancelled, onDispatch) { response ->
             check(response.isSuccessful) { "上传暂未完成（HTTP ${response.code()}）" }
-            parseReceipt(readLimited(response, cancelled), archive.length())
+            parseReceipt(readLimited(response, cancelled), archive.name, archive.length())
         }
     }
 
@@ -113,7 +113,11 @@ class SeafileSessionTransport : SessionUploadTransport {
             require(it.scheme == "https" && it.host == HOST && (it.port == -1 || it.port == 443) &&
                 it.userInfo == null && it.fragment == null) { "请检查实验上传配置" }
         }
-        internal fun parseReceipt(response: String, expectedBytes: Long): RemoteSessionReceipt {
+        internal fun validateArchiveName(value: String): String = value.also {
+            require(ARCHIVE_NAME.matches(it)) { "上传包文件名无效" }
+        }
+        internal fun parseReceipt(response: String, expectedName: String, expectedBytes: Long): RemoteSessionReceipt {
+            validateArchiveName(expectedName)
             val array = JsonParser.parseString(response).asJsonArray
             require(array.size() == 1) { "云盘回执不完整，请重试" }
             val row = array.single().asJsonObject
@@ -121,11 +125,14 @@ class SeafileSessionTransport : SessionUploadTransport {
             val id = row.get("id").asString
             val size = row.get("size")
             require(size.isJsonPrimitive && size.asJsonPrimitive.isNumber && size.asString.matches(Regex("[0-9]+")))
-            require(name.isNotBlank() && '/' !in name && '\\' !in name && id.matches(Regex("[a-fA-F0-9]{40,64}")) && size.asLong == expectedBytes) {
+            require(name == expectedName && id.matches(Regex("[a-fA-F0-9]{40,64}")) && size.asLong == expectedBytes) {
                 "云盘回执与本次文件不一致，请重试"
             }
             return RemoteSessionReceipt(name, id, size.asLong)
         }
+        private val ARCHIVE_NAME = Regex(
+            "ringfitness-session-(?:(?:walking|running)-)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.zip",
+        )
         private fun checkCancelled(cancelled: () -> Boolean) {
             if (cancelled() || Thread.currentThread().isInterrupted) throw InterruptedException("Upload interrupted")
         }

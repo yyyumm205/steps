@@ -68,6 +68,21 @@ class FreeLivingSessionPackageTest {
         }
     }
 
+    @Test fun walkingAndRunningFreezeAsTwoActivityQualifiedArchives() {
+        listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEach { activity ->
+            val f = fixture(activity = activity)
+            val frozen = f.packager.freeze(f.session)
+            assertEquals(
+                "ringfitness-session-${activity.wireValue}-${f.session.sessionId}.zip",
+                frozen.file.name,
+            )
+            assertEquals(activity.wireValue, manifest(frozen)["activity_code"].asString)
+            val metadata = JsonParser.parseString(File(frozen.file.parentFile, "package.json").readText()).asJsonObject
+            assertEquals(2, metadata["package_version"].asInt)
+            assertEquals(frozen.file.name, metadata["file_name"].asString)
+        }
+    }
+
     @Test fun missingAndUnreliableReadingsRemainDistinctAndLongMaxIsExact() {
         val values = listOf(
             SessionReference(ReferenceStatus.MISSING, null, t + 3000, "无法读取"),
@@ -212,13 +227,37 @@ class FreeLivingSessionPackageTest {
             val f = fixture(recoveryEvidence = legacy.recovery, activity = legacy.activity,
                 unknownTime = legacy.unknownTime)
             val frozen = f.packager.freeze(f.session)
-            rewriteAsLegacy(frozen, legacy.version)
-            val original = frozen.file.readBytes()
+            val legacyArchive = rewriteAsLegacy(frozen, legacy.version)
+            val original = legacyArchive.readBytes()
 
             val reopened = packager(f.directory, openStore(f.directory)).freeze(f.session)
 
             assertArrayEquals(original, reopened.file.readBytes())
+            assertEquals(legacyArchive.name, reopened.file.name)
             assertEquals(legacy.version, manifest(reopened)["version"].asInt)
+        }
+    }
+
+    @Test fun versionSevenActivityPackagesFromVersion081KeepTheirLegacyNameAndBytes() {
+        listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEach { activity ->
+            val f = fixture(activity = activity)
+            val current = f.packager.freeze(f.session)
+            val legacyArchive = rewriteAsPackageVersionOne(current)
+            val original = legacyArchive.readBytes()
+            val originalHash = sha(original)
+
+            val reopened = packager(f.directory, openStore(f.directory)).freeze(f.session)
+
+            assertEquals("ringfitness-session-${f.session.sessionId}.zip", reopened.file.name)
+            assertEquals(originalHash, reopened.sha256)
+            assertArrayEquals(original, reopened.file.readBytes())
+            assertEquals(7, manifest(reopened)["version"].asInt)
+            assertEquals(activity.wireValue, manifest(reopened)["activity_code"].asString)
+            assertFalse(File(reopened.file.parentFile,
+                "ringfitness-session-${activity.wireValue}-${f.session.sessionId}.zip").exists())
+            val packageDirectory = requireNotNull(reopened.file.parentFile)
+            assertEquals(listOf(legacyArchive.name),
+                packageDirectory.listFiles()!!.filter { it.extension == "zip" }.map { it.name })
         }
     }
 
@@ -405,7 +444,7 @@ class FreeLivingSessionPackageTest {
         JsonParser.parseString(zip.getInputStream(zip.getEntry("manifest.json")).reader(Charsets.UTF_8).readText()).asJsonObject
     }
 
-    private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int) {
+    private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int): File {
         val target = frozen.file.parentFile
         val legacy = manifest(frozen).apply {
             listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at",
@@ -426,16 +465,35 @@ class FreeLivingSessionPackageTest {
                 zip.closeEntry()
             }
         }
-        Files.move(replacement.toPath(), frozen.file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        val legacyArchive = File(target, "ringfitness-session-${frozen.sessionId}.zip")
+        Files.move(replacement.toPath(), legacyArchive.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        if (frozen.file != legacyArchive) assertTrue(frozen.file.delete())
         File(target, "manifest.snapshot.json").writeText(legacy.toString(), Charsets.UTF_8)
         File(target, "package.json").writeText(JsonObject().apply {
             addProperty("package_version", 1)
             addProperty("session_id", frozen.sessionId)
-            addProperty("file_name", frozen.file.name)
-            addProperty("bytes", frozen.file.length())
-            addProperty("sha256", sha(frozen.file.readBytes()))
+            addProperty("file_name", legacyArchive.name)
+            addProperty("bytes", legacyArchive.length())
+            addProperty("sha256", sha(legacyArchive.readBytes()))
             addProperty("manifest_sha256", sha(legacy.toString().toByteArray(Charsets.UTF_8)))
         }.toString(), Charsets.UTF_8)
+        return legacyArchive
+    }
+
+    private fun rewriteAsPackageVersionOne(frozen: FrozenSessionPackage): File {
+        val target = frozen.file.parentFile
+        val legacyArchive = File(target, "ringfitness-session-${frozen.sessionId}.zip")
+        Files.move(frozen.file.toPath(), legacyArchive.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        File(target, "package.json").writeText(JsonObject().apply {
+            addProperty("package_version", 1)
+            addProperty("session_id", frozen.sessionId)
+            addProperty("file_name", legacyArchive.name)
+            addProperty("bytes", legacyArchive.length())
+            addProperty("sha256", sha(legacyArchive.readBytes()))
+            val snapshot = File(target, "manifest.snapshot.json").readBytes()
+            addProperty("manifest_sha256", sha(snapshot))
+        }.toString(), Charsets.UTF_8)
+        return legacyArchive
     }
 
     private fun imu(uptime: Long) = ByteArrayOutputStream().apply {

@@ -24,13 +24,36 @@ class SeafileSessionTransportTest {
         }
     }
 
+    @Test fun onlyLegacyOrActivityQualifiedSessionArchiveNamesAreAccepted() {
+        val id = "11111111-1111-4111-8111-111111111111"
+        listOf(
+            "ringfitness-session-$id.zip",
+            "ringfitness-session-walking-$id.zip",
+            "ringfitness-session-running-$id.zip",
+        ).forEach { assertEquals(it, SeafileSessionTransport.validateArchiveName(it)) }
+        listOf(
+            "session-$id.zip",
+            "ringfitness-session-cycling-$id.zip",
+            "ringfitness-session-walking-$id.zip.part",
+            "ringfitness-session-walking-../../$id.zip",
+        ).forEach { name ->
+            assertThrows(IllegalArgumentException::class.java) {
+                SeafileSessionTransport.validateArchiveName(name)
+            }
+        }
+    }
+
     @Test fun successRequiresASingleReceiptWithMatchingLengthAndAFileId() {
-        val good = """[{"name":"session.zip","id":"${"a".repeat(40)}","size":120}]"""
-        assertEquals(120L, SeafileSessionTransport.parseReceipt(good, 120).bytes)
-        assertThrows(IllegalArgumentException::class.java) { SeafileSessionTransport.parseReceipt(good, 121) }
+        val name = "ringfitness-session-walking-11111111-1111-4111-8111-111111111111.zip"
+        val good = """[{"name":"$name","id":"${"a".repeat(40)}","size":120}]"""
+        assertEquals(120L, SeafileSessionTransport.parseReceipt(good, name, 120).bytes)
+        assertThrows(IllegalArgumentException::class.java) { SeafileSessionTransport.parseReceipt(good, name, 121) }
+        assertThrows(IllegalArgumentException::class.java) {
+            SeafileSessionTransport.parseReceipt(good, name.replace("walking", "running"), 120)
+        }
         for (bad in listOf(good.replace("120", "true"), good.replace("120", "120.0"),
-            good.replace("session.zip", "../session.zip"), good.replace("a".repeat(40), ""), "[]")) {
-            assertThrows(RuntimeException::class.java) { SeafileSessionTransport.parseReceipt(bad, 120) }
+            good.replace(name, "../$name"), good.replace("a".repeat(40), ""), "[]")) {
+            assertThrows(RuntimeException::class.java) { SeafileSessionTransport.parseReceipt(bad, name, 120) }
         }
     }
 }

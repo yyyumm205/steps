@@ -64,6 +64,7 @@ class FreeLivingSessionPackage internal constructor(
         val packageCreatedAt = savedManifest?.get("created_at")?.takeUnless { it.isJsonNull }?.asString
             ?.let(Instant::parse) ?: now()
         val initial = snapshot(session.sessionId, packageCreatedAt)
+        val archiveName = archiveName(session.sessionId, initial.manifest.get("activity_code").asString)
         if (target.exists()) {
             val savedVersion = savedManifest?.get("version")?.asInt
             val expected = snapshotForVersion(initial, requireNotNull(savedVersion) { "冻结上传包缺少版本" })
@@ -72,7 +73,7 @@ class FreeLivingSessionPackage internal constructor(
 
         val staging = Files.createTempDirectory(packages.toPath(), ".${session.sessionId}-").toFile()
         try {
-            val archive = child(staging, archiveName(session.sessionId))
+            val archive = child(staging, archiveName)
             writeArchive(archive, initial)
             val frozen = FrozenSessionPackage(archive, digest(archive), archive.length(), session.sessionId)
             // A file or metadata change during packaging must not become a frozen snapshot.
@@ -81,7 +82,7 @@ class FreeLivingSessionPackage internal constructor(
             verifyZip(archive, initial)
             writeSynced(child(staging, SNAPSHOT), initial.manifest.toString().toByteArray(Charsets.UTF_8))
             writeSynced(child(staging, METADATA), JsonObject().apply {
-                addProperty("package_version", 1)
+                addProperty("package_version", packageVersion(initial.manifest.get("activity_code").asString))
                 addProperty("session_id", session.sessionId)
                 addProperty("file_name", archive.name)
                 addProperty("bytes", frozen.bytes)
@@ -96,7 +97,7 @@ class FreeLivingSessionPackage internal constructor(
         } finally {
             // Only files generated in this attempt are removed; committed packages stay intact.
             if (staging.exists()) {
-                listOf(archiveName(session.sessionId), SNAPSHOT, METADATA).forEach { child(staging, it).delete() }
+                listOf(archiveName, SNAPSHOT, METADATA).forEach { child(staging, it).delete() }
                 staging.delete()
             }
         }
@@ -121,11 +122,11 @@ class FreeLivingSessionPackage internal constructor(
         } else {
             Instant.ofEpochMilli(session.startRequestedAtMs)
         }
-        verifyFrozen(target, sessionId, snapshotForVersion(snapshot(sessionId, createdAt), savedVersion))
+        val frozen = verifyFrozen(target, sessionId, snapshotForVersion(snapshot(sessionId, createdAt), savedVersion))
         val obsolete = child(packages, ".obsolete-$sessionId-${UUID.randomUUID()}")
         Files.move(target.toPath(), obsolete.toPath(), StandardCopyOption.ATOMIC_MOVE)
         syncDirectory(packages)
-        listOf(archiveName(sessionId), SNAPSHOT, METADATA).forEach { child(obsolete, it).delete() }
+        listOf(frozen.file.name, SNAPSHOT, METADATA).forEach { child(obsolete, it).delete() }
         obsolete.delete()
         true
     }
@@ -238,9 +239,17 @@ class FreeLivingSessionPackage internal constructor(
         val savedManifest = readJson(child(target, SNAPSHOT))
         require(savedManifest == snapshot.manifest) { "采集信息与冻结上传包不同，已保留原包" }
         val metadata = readJson(child(target, METADATA))
-        val archive = child(target, archiveName(sessionId))
-        require(metadata.get("package_version")?.asInt == 1 && metadata.get("session_id")?.asString == sessionId &&
-            metadata.get("file_name")?.asString == archive.name && archive.isFile &&
+        val activityCode = snapshot.manifest.get("activity_code").asString
+        val metadataVersion = metadata.get("package_version")?.asInt
+        val fileName = metadata.get("file_name")?.asString ?: throw IOException("冻结上传包缺少文件名")
+        val expectedName = archiveName(sessionId, activityCode)
+        val legacyName = legacyArchiveName(sessionId)
+        require((metadataVersion == 1 && fileName == legacyName) ||
+            (metadataVersion == 2 && activityCode in ACTIVITY_CODES && fileName == expectedName)) {
+            "冻结上传包文件名与活动不一致"
+        }
+        val archive = child(target, fileName)
+        require(metadata.get("session_id")?.asString == sessionId && archive.isFile &&
             metadata.get("bytes")?.asLong == archive.length() &&
             metadata.get("manifest_sha256")?.asString == digest(savedManifest.toString().toByteArray(Charsets.UTF_8))) {
             "冻结上传包信息校验失败"
@@ -349,7 +358,14 @@ class FreeLivingSessionPackage internal constructor(
         private const val BUFFER_SIZE = 64 * 1024
         private const val ZIP_TIME = 315_532_800_000L
         private val SIMPLE_NAME = Regex("^[a-zA-Z0-9._-]+$")
-        private fun archiveName(sessionId: String) = "ringfitness-session-$sessionId.zip"
+        private val ACTIVITY_CODES = setOf("walking", "running")
+        private fun legacyArchiveName(sessionId: String) = "ringfitness-session-$sessionId.zip"
+        private fun archiveName(sessionId: String, activityCode: String) = when (activityCode) {
+            in ACTIVITY_CODES -> "ringfitness-session-$activityCode-$sessionId.zip"
+            "free_living" -> legacyArchiveName(sessionId)
+            else -> throw IllegalArgumentException("活动类型不受支持")
+        }
+        private fun packageVersion(activityCode: String) = if (activityCode in ACTIVITY_CODES) 2 else 1
         private fun child(parent: File, name: String): File = File(parent, name).canonicalFile.also {
             require(it.parentFile == parent.canonicalFile && it.name == name) { "上传包文件路径无效" }
         }

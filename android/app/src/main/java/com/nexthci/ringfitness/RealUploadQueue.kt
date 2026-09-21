@@ -98,6 +98,7 @@ class RealUploadQueue(
         var transferClaimed = false
         var claimedAttempt: Int? = null
         var transportInvoked = false
+        var receiptVerified = false
         try {
             if (cancelled()) return true
             val session = requireNotNull(store.read(sessionId))
@@ -147,26 +148,31 @@ class RealUploadQueue(
                     }
                 }
                 require(transportInvoked) { "上传传输未报告网络请求" }
-                require(receipt.bytes == archive.bytes && receipt.fileId.isNotBlank())
+                require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes && receipt.fileId.isNotBlank())
                 task = task.copy(receipt = receipt, receivedAtMs = now())
                 failureStage = "receipt"
                 synchronized(taskLock) { save(task) }
             }
             failureStage = "receipt"
             val receipt = requireNotNull(task.receipt)
+            require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes) {
+                "上传回执与冻结包不一致，已保留本地数据"
+            }
+            receiptVerified = true
             store.completeTransfer(sessionId, SessionTransferReceipt(receipt.fileId, requireNotNull(task.receivedAtMs), false, sessionId))
             synchronized(taskLock) { save(task.copy(state = "complete", failureStage = null)) }
             changed()
             false
         } catch (error: Exception) {
             if (store.read(sessionId)?.uploadAllowed == false) return false
-            // A received-but-not-committed receipt stays queued and will be reconciled without resending.
-            val paused = cancelled() || error is InterruptedException || task.receipt != null
+            // A verified receipt can finish locally after a crash. An unverified receipt needs review.
+            val recoverableReceipt = task.receipt != null && receiptVerified
+            val paused = cancelled() || error is InterruptedException || recoverableReceipt
             val attempts = store.read(sessionId)?.transfer?.attempts ?: MAX_AUTOMATIC_ATTEMPTS
             val automaticRetry = !paused && failureStage == "transport" &&
                 attempts < MAX_AUTOMATIC_ATTEMPTS
             val nextState = when {
-                task.receipt != null -> "queued"
+                recoverableReceipt -> "queued"
                 transportInvoked && (paused || automaticRetry) -> "sending"
                 paused || automaticRetry -> "queued"
                 else -> "failed"
@@ -209,7 +215,8 @@ class RealUploadQueue(
         if (store.read(sessionId)?.uploadAllowed == false) return false
         try {
             val task = read(sessionId)
-            if (task != null) task.failureStage == "preparation"
+            if (task != null) task.failureStage == "preparation" ||
+                (task.state == "failed" && task.failureStage == "receipt")
             else store.read(sessionId)?.let { session ->
                 session.localData != null && session.transfer.status != SessionTransferStatus.COMPLETE &&
                     (session.transfer.status != SessionTransferStatus.PENDING || session.transfer.attempts != 0)

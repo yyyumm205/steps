@@ -1,12 +1,14 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.8.1-local-recovery（versionCode 43）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
+当前开发版：**步数采集 0.8.2-activity-packages（versionCode 44）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
 
 ## 当前可运行范围
 
 正常入口已接通：首次登记编号与佩戴位置、选择/连接戒指、等待真实开始确认、后台采集、停止确认、整段计步器读数保存、原始文件下载校验、冻结ZIP和清华云盘上传。准备档案与采集记录使用独立App私有目录；单一前台采集服务管理BLE，独立上传服务管理网络任务。页面依据真实保存、设备证据和回执呈现结果。
 
 0.8.0增加每段必选的走路/跑步，以及停止确认后的“保存并上传”“保存，稍后上传”“放弃本段”。保存先可靠记录参考步数，再下载并校验原始文件；稍后上传保持暂停，直到用户主动上传。放弃经二次确认后清理本段手机任务和文件，保留排除标记；戒指Flash的单段物理删除尚无已核实协议支持。已有充电错误恢复与未知日期旧记录保全继续按证据校验，时间异常的未确认开始提供单次保护停止及独立备份出口。
+
+0.8.2将新走路、跑步session分别冻结为`ringfitness-session-walking-<session_id>.zip`和`ringfitness-session-running-<session_id>.zip`，每包使用独立上传任务和严格匹配的云盘回执。旧冻结包保持原名和原字节，可继续重试。
 
 0.8.0的软件与模拟器基线见[验证记录E26](../specs/independent-step-collection/validation.md#e26连续使用兼容与分段收尾2026-09-20)，后续真机短采和0.8.1恢复修复见E27。停止确认后可离线填写读数，重连保留输入焦点；后台下载完成后释放准备页操作，网络上传独立执行。真实三种收尾、完整异常和长时仍按计划验收。研究端入口见[活动导入器](../backend/ringo_data/README.md)。
 

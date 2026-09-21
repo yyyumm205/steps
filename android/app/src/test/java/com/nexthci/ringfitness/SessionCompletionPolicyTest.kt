@@ -104,13 +104,24 @@ class SessionCompletionPolicyTest {
         val backups = File(f.directory, "device-backups").apply { mkdir() }
         val backup = File(backups, "fixture.json").apply { writeText("preserve") }
         val packageDir = File(f.directory, "packages/${f.id}").apply { mkdirs() }
-        listOf("ringfitness-session-${f.id}.zip", "manifest.snapshot.json", "package.json")
+        listOf(
+            "ringfitness-session-${f.id}.zip",
+            "ringfitness-session-walking-${f.id}.zip",
+            "ringfitness-session-running-${f.id}.zip",
+            "manifest.snapshot.json",
+            "package.json",
+        )
             .forEach { File(packageDir, it).writeText("fixture") }
+        val obsoleteDir = File(packageDir.parentFile, ".obsolete-${f.id}-11111111-1111-4111-8111-111111111111")
+            .apply { mkdirs() }
+        listOf("ringfitness-session-walking-${f.id}.zip", "manifest.snapshot.json", "package.json")
+            .forEach { File(obsoleteDir, it).writeText("fixture") }
         f.queue().discardSession(f.id, f.time + 9)
         f.store.cleanupDiscardedSession(f.id)
         assertTrue(related.none { it.exists() })
         assertFalse(f.raw.exists())
         assertFalse(packageDir.exists())
+        assertFalse(obsoleteDir.exists())
         assertNull(f.queue().task(f.id))
         assertEquals("preserve", other.readText())
         assertEquals("preserve", backup.readText())

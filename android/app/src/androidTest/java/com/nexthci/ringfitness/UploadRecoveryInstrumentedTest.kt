@@ -174,7 +174,15 @@ class UploadRecoveryInstrumentedTest {
             assertEquals(source.expectedSteps, reference.steps)
             assertTrue("Only complete real source files belong to this case",
                 requireNotNull(session.localData).files.let { it.isNotEmpty() && it.none { file -> file.simulated } })
-            val archive = File(directory, "packages/${source.sessionId}/ringfitness-session-${source.sessionId}.zip")
+            val packageDirectory = File(directory, "packages/${source.sessionId}")
+            val metadata = JsonParser.parseString(
+                File(packageDirectory, "package.json").readText(Charsets.UTF_8),
+            ).asJsonObject
+            assertEquals(source.sessionId, metadata.get("session_id")?.asString)
+            val archiveName = requireNotNull(metadata.get("file_name")?.asString)
+            require(archiveName.isNotBlank() && '/' !in archiveName && '\\' !in archiveName)
+            val archive = File(packageDirectory, archiveName).canonicalFile
+            require(archive.parentFile == packageDirectory.canonicalFile)
             assertTrue("The source package must already be frozen", archive.isFile)
             assertEquals("The ZIP must match the original package", source.archiveSha256, sha256(archive))
             // freeze verifies an existing package against the journal, all raw hashes, CRCs,
