@@ -313,7 +313,7 @@ def test_missing_scope_marker_after_download_refuses_to_reclaim_existing_package
     assert source.read_bytes() == before and not output.exists()
 
 
-def test_bound_inbox_imports_only_registered_hash_packages_and_leaves_unrelated_files(tmp_path):
+def test_bound_inbox_reports_unregistered_hash_packages_and_leaves_them_unimported(tmp_path):
     data = data_at(tmp_path)
     config = config_at(tmp_path)
     http = FakeHttp([listing_for("one.zip", data)], {"one.zip": data})
@@ -324,7 +324,13 @@ def test_bound_inbox_imports_only_registered_hash_packages_and_leaves_unrelated_
     rendered_as_hash = config.local_inbox / ("cloud-" + sha256(foreign) + ".zip")
     foreign.rename(rendered_as_hash)
     result = service.once()
-    assert not result["failed"] and result["local"]["index"]["sessions"] == 1
+    assert result["failed"] and result["local"]["index"]["sessions"] == 1
+    assert result["cloud"]["files"][-1] == {
+        "status": "unregistered_download",
+        "sha256": sha256(rendered_as_hash),
+        "bytes": rendered_as_hash.stat().st_size,
+        "reason": "verified cloud download has no local receipt; original retained for review",
+    }
     assert rendered_as_hash.exists()
     assert not (config.research_output / "sessions" / foreign_manifest["session_id"]).exists()
     assert all(row["file"] != rendered_as_hash.name for row in result["local"]["files"])
@@ -486,10 +492,25 @@ def test_published_zip_without_receipt_waits_until_the_same_cloud_file_is_read_b
     monkeypatch.setattr(service.downloader, "_save", fail_receipt)
     result = service.once()
     assert result["failed"] and len(list(config.local_inbox.glob("*.zip"))) == 1
+    orphan = next(config.local_inbox.glob("*.zip"))
+    assert result["cloud"]["files"][-1] == {
+        "status": "unregistered_download",
+        "sha256": sha256(orphan),
+        "bytes": orphan.stat().st_size,
+        "reason": "verified cloud download has no local receipt; original retained for review",
+    }
     assert result["local"]["index"]["sessions"] == 0
     http.listing = []
     restarted = reader(config, http)
-    assert restarted.once()["local"]["index"]["sessions"] == 0
+    missing_remote = restarted.once()
+    assert missing_remote["failed"] and missing_remote["local"]["index"]["sessions"] == 0
+    assert missing_remote["cloud"]["files"] == [{
+        "status": "unregistered_download",
+        "sha256": sha256(orphan),
+        "bytes": orphan.stat().st_size,
+        "reason": "verified cloud download has no local receipt; original retained for review",
+    }]
+    assert orphan.read_bytes() == data
     http.listing = [listing_for("one.zip", data)]
     resumed = restarted.once()
     assert not resumed["failed"] and resumed["local"]["index"]["sessions"] == 1

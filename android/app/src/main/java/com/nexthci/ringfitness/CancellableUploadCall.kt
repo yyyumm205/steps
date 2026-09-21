@@ -28,9 +28,11 @@ internal class CancellableUploadCall(private val client: OkHttpClient = standard
             onDispatch()
             return call.execute().use { response ->
                 checkCancelled(cancelled, caller)
-                consume(response).also { checkCancelled(cancelled, caller) }
+                consume(response)
             }
         } catch (error: Exception) {
+            if (error is UploadOutcomeUncertainException || error is PermanentUploadException ||
+                error is RetryableUploadException) throw error
             if (interrupted.get() || cancelled() || caller.isInterrupted) {
                 throw InterruptedException("Upload interrupted").also { it.initCause(error) }
             }

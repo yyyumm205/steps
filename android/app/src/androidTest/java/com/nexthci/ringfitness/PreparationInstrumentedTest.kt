@@ -28,7 +28,7 @@ class PreparationInstrumentedTest {
 
     @Test
     fun independentLauncherOpensAndRecreatesWithoutStartingCapture() = withIsolatedFiles {
-        assertEquals("com.nexthci.ringfitness.steps", context.packageName)
+        assertEquals(BuildConfig.APPLICATION_ID, context.packageName)
         val launch = requireNotNull(context.packageManager.getLaunchIntentForPackage(context.packageName))
         assertEquals(StepPreparationActivity::class.java.name, launch.component?.className)
         ActivityScenario.launch<StepPreparationActivity>(launch).use { scenario ->

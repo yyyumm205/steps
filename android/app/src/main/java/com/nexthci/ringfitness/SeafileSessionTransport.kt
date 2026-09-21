@@ -9,13 +9,24 @@ import okhttp3.Response
 import okio.BufferedSink
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.net.URI
 
 data class RemoteSessionReceipt(val fileName: String, val fileId: String, val bytes: Long)
 
+/** The server may have committed the POST, so replaying it could create a false duplicate. */
+internal class UploadOutcomeUncertainException(message: String, cause: Throwable? = null) :
+    IOException(message, cause)
+
+/** Retrying unchanged credentials or a rejected destination cannot repair the request. */
+internal class PermanentUploadException(message: String) : IOException(message)
+
+/** A response explicitly says that this request can be attempted again later. */
+internal class RetryableUploadException(message: String) : IOException(message)
+
 fun interface SessionUploadTransport {
     fun upload(link: String, archive: File, cancelled: () -> Boolean,
-        onDispatch: () -> Unit): RemoteSessionReceipt
+        onDispatch: () -> Unit, onPayloadStart: () -> Unit): RemoteSessionReceipt
 }
 
 /** Upload-link transport shared in shape with the legacy worker; no participant account required. */
@@ -23,7 +34,7 @@ class SeafileSessionTransport : SessionUploadTransport {
     private val calls = CancellableUploadCall()
 
     override fun upload(link: String, archive: File, cancelled: () -> Boolean,
-        onDispatch: () -> Unit): RemoteSessionReceipt {
+        onDispatch: () -> Unit, onPayloadStart: () -> Unit): RemoteSessionReceipt {
         val page = validateLink(link)
         checkCancelled(cancelled)
         val html = get(page, cancelled, onDispatch)
@@ -36,6 +47,7 @@ class SeafileSessionTransport : SessionUploadTransport {
         val upload = trustedUri(metadata.get("upload_link").asString)
         val destination = URI(upload.toString() + if (upload.rawQuery == null) "?ret-json=1" else "&ret-json=1")
         validateArchiveName(archive.name)
+        var payloadDispatched = false
         val content = object : RequestBody() {
             override fun contentType() = MediaType.parse("application/zip")
             override fun contentLength() = archive.length()
@@ -63,26 +75,46 @@ class SeafileSessionTransport : SessionUploadTransport {
             override fun contentType() = multipart.contentType()
             override fun contentLength() = multipart.contentLength()
             override fun isOneShot() = true
-            override fun writeTo(sink: BufferedSink) = multipart.writeTo(sink)
+            override fun writeTo(sink: BufferedSink) {
+                // OkHttp reaches writeTo only after a connection is ready. From this point, a lost
+                // response is ambiguous. Persist that boundary before the first body byte is sent.
+                onPayloadStart()
+                payloadDispatched = true
+                multipart.writeTo(sink)
+            }
         }
-        return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()),
-            cancelled, onDispatch) { response ->
-            check(response.isSuccessful) { "上传暂未完成（HTTP ${response.code()}）" }
-            parseReceipt(readLimited(response, cancelled), archive.name, archive.length())
+        try {
+            return calls.execute(request(destination).post(body).build(), uploadDeadlineMillis(archive.length()),
+                cancelled, onDispatch) { response ->
+                if (!response.isSuccessful) throw responseFailure("上传暂未完成", response.code())
+                try {
+                    parseReceipt(readLimited(response, cancelled), archive.name, archive.length())
+                } catch (error: Exception) {
+                    if (error is UploadOutcomeUncertainException) throw error
+                    throw UploadOutcomeUncertainException("云盘可能已收到文件，但成功回执无法确认", error)
+                }
+            }
+        } catch (error: Exception) {
+            if (error is UploadOutcomeUncertainException || error is PermanentUploadException ||
+                error is RetryableUploadException) throw error
+            if (payloadDispatched) {
+                throw UploadOutcomeUncertainException("云盘可能已收到文件，但成功回执未返回", error)
+            }
+            throw error
         }
     }
 
     private fun get(uri: URI, cancelled: () -> Boolean, onDispatch: () -> Unit): String {
         checkCancelled(cancelled)
         return calls.execute(request(uri).get().build(), 60_000, cancelled, onDispatch) { response ->
-            check(response.isSuccessful) { "云盘暂时无法连接（HTTP ${response.code()}）" }
+            if (!response.isSuccessful) throw responseFailure("云盘暂时无法连接", response.code())
             readLimited(response, cancelled)
         }
     }
 
     private fun request(uri: URI) = Request.Builder().url(trustedUri(uri.toString()).toString())
         .header("Accept", "application/json,text/html")
-        .header("User-Agent", "RingFitnessSteps/0.7")
+        .header("User-Agent", userAgent())
 
     private fun readLimited(response: Response, cancelled: () -> Boolean): String = requireNotNull(response.body()).byteStream().use { input ->
         val bytes = ByteArrayOutputStream()
@@ -116,6 +148,13 @@ class SeafileSessionTransport : SessionUploadTransport {
         internal fun validateArchiveName(value: String): String = value.also {
             require(ARCHIVE_NAME.matches(it)) { "上传包文件名无效" }
         }
+        internal fun responseFailure(action: String, code: Int): IOException =
+            if (code in setOf(408, 429) || code in 500..599) {
+                RetryableUploadException("$action（HTTP $code）")
+            } else {
+                PermanentUploadException("$action（HTTP $code）")
+            }
+        internal fun userAgent(): String = "RingFitnessSteps/${BuildConfig.VERSION_NAME}"
         internal fun parseReceipt(response: String, expectedName: String, expectedBytes: Long): RemoteSessionReceipt {
             validateArchiveName(expectedName)
             val array = JsonParser.parseString(response).asJsonArray

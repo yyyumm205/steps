@@ -7,6 +7,8 @@
 /android/dist/
 *.rfbin
 *.csv
+*.zip
+*.tar
 
 # Machine configuration and credentials; keep the shareable templates.
 .env

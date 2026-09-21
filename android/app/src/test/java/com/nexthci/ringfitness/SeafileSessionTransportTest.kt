@@ -4,6 +4,10 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SeafileSessionTransportTest {
+    @Test fun requestIdentityTracksTheInstalledAppVersion() {
+        assertEquals("RingFitnessSteps/${BuildConfig.VERSION_NAME}", SeafileSessionTransport.userAgent())
+    }
+
     @Test fun attemptDeadlineScalesWithBytesWithoutSettingACaptureDurationLimit() {
         assertEquals(120_000L, SeafileSessionTransport.uploadDeadlineMillis(0))
         assertEquals(121_000L, SeafileSessionTransport.uploadDeadlineMillis(16_384))
@@ -12,6 +16,15 @@ class SeafileSessionTransportTest {
             SeafileSessionTransport.uploadDeadlineMillis(1024L * 1024))
         assertTrue(SeafileSessionTransport.uploadDeadlineMillis(Long.MAX_VALUE) > 0)
         assertThrows(IllegalArgumentException::class.java) { SeafileSessionTransport.uploadDeadlineMillis(-1) }
+    }
+
+    @Test fun responseCodesSeparatePermanentDestinationFailuresFromRetryableOutages() {
+        listOf(300, 301, 302, 307, 308, 400, 401, 403, 404, 409, 410).forEach {
+            assertTrue(SeafileSessionTransport.responseFailure("test", it) is PermanentUploadException)
+        }
+        listOf(408, 429, 500, 503).forEach {
+            assertTrue(SeafileSessionTransport.responseFailure("test", it) is RetryableUploadException)
+        }
     }
 
     @Test fun onlyTheExplicitHttpsUploadLinkIsAccepted() {

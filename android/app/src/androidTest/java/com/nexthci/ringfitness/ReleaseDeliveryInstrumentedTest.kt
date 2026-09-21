@@ -34,12 +34,17 @@ class ReleaseDeliveryInstrumentedTest {
         val context = instrumentation.targetContext
         assertEquals(0, context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE)
         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-        assertEquals("0.8.8-ring-defer", packageInfo.versionName)
-        assertEquals(50L, packageInfo.longVersionCode)
+        assertEquals("0.8.9-upload-guard", packageInfo.versionName)
+        assertEquals(51L, packageInfo.longVersionCode)
         assertNotNull(context.packageManager.getLaunchIntentForPackage(context.packageName))
         assertThrows(android.content.pm.PackageManager.NameNotFoundException::class.java) {
             context.packageManager.getActivityInfo(ComponentName(context.packageName,
                 "com.nexthci.ringfitness.DemoCollectionActivity"), 0)
+        }
+        listOf(RingCaptureService::class.java.name, UploadJobService::class.java.name).forEach { legacy ->
+            assertThrows(android.content.pm.PackageManager.NameNotFoundException::class.java) {
+                context.packageManager.getServiceInfo(ComponentName(context.packageName, legacy), 0)
+            }
         }
         val before = JSONObject(snapshot.readText())
         val after = snapshotHashes()

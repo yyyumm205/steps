@@ -946,14 +946,14 @@ class CollectionFlowInstrumentedTest {
             openRecords(scenario)
             scenario.onActivity { activity ->
                 assertEquals("17 步", tagged<TextView>(activity, "record_steps_${session.sessionId}").text.toString())
-                assertEquals("上传校验未通过", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("上传记录需要研究者核对", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
                 assertNull(taggedOrNull<Button>(activity, "retry_upload_${session.sessionId}"))
             }
             assertTrue(fixture.uploadRetries.isEmpty())
             fixture.state = fixture.state.copy(page = CollectionPage.HOME)
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("上传校验未通过", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("上传记录需要研究者核对", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
                 assertNull(taggedOrNull<Button>(activity, "retry_upload_${session.sessionId}"))
             }
             assertTrue(fixture.uploadRetries.isEmpty())

@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前版本：**步数采集 0.8.8-ring-defer（versionCode 50）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，实际通过范围见[验证记录E35](../specs/independent-step-collection/validation.md#e35原版戒指暂存收尾2026-09-21)。
+当前版本：**步数采集 0.8.9-upload-guard（versionCode 51）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，实际通过范围见[验证记录E36](../specs/independent-step-collection/validation.md#e36上传结果边界与研究库加固2026-09-21)。
 
 ## 当前流程
 
@@ -61,7 +61,7 @@ Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`。`assembleRelease`�
 
 ## 后台任务
 
-`RealCollectionService`负责BLE采集与下载，`RealUploadService`负责持久网络任务。上传队列绑定session、冻结ZIP、长度和SHA；普通网络错误按既有上限重试，永久错误保留人工入口。戒指暂存任务在手机备份完成前不得进入上传队列。
+`RealCollectionService`负责BLE采集与下载，`RealUploadService`负责持久网络任务；旧`RingCaptureService`和`UploadJobService`不在正式Manifest中注册。上传队列绑定session、冻结ZIP、长度和SHA；DNS、建连失败、408、429及5xx等明确可恢复错误按既有上限重试。任务v3在POST正文写入前先持久保存边界；随后若成功回执丢失，或目标明确永久拒绝，任务停止重发并保留本地ZIP，页面提示研究者核对。戒指暂存任务在手机备份完成前不得进入上传队列。
 
 原版上传任务在执行期间使用可观察的前台通知。当前独立服务已接入`dataSync`前台保护，系统停止、销毁和超时路径保留持久任务。API33+首次进入采集询问通知权限，拒绝后仍可继续；设置页根据实际状态提供通知和电池设置入口。自动检查与实际设备范围见E35，锁屏、网络切换、整机重启和长文件继续按设备矩阵取证。
 

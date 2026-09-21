@@ -12,7 +12,7 @@ import zipfile
 from dataclasses import asdict
 from pathlib import Path
 
-from .importer import ArchiveRejected, Limits, import_archive, local_path, summarize
+from .importer import ArchiveRejected, Limits, import_archive, is_link_like, local_path, summarize
 from .schema import ValidationError, require
 
 
@@ -79,7 +79,7 @@ class DirectorySync:
             self.observed.pop(name, None)
             self.processed.pop(name, None)
         try:
-            rows = summarize(self.output, self.output / "session-index.csv")
+            rows = summarize(self.output, self.output / "session-index.csv", self.limits)
             summary = dict(status="indexed", sessions=len(rows), daily_total_generated=False)
         except (OSError, ValidationError) as error:
             summary = dict(status="index_error", reason=str(error), daily_total_generated=False)
@@ -92,6 +92,8 @@ class DirectorySync:
             return dict(file=source.name, status="waiting", reason="incomplete_zip")
         require(expected[2] <= self.limits.archive_bytes, "archive size quota exceeded")
         staging = self.output / ".sync-staging"
+        require(not is_link_like(staging) and (not staging.exists() or staging.is_dir()),
+                "sync staging is not a regular directory")
         staging.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix="snapshot-", suffix=".zip", dir=staging)
         snapshot = Path(name)

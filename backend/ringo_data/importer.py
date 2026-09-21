@@ -68,8 +68,52 @@ def sha256(path: Path):
     return digest.hexdigest()
 
 
+def is_link_like(path: Path):
+    """Reject symlinks and Windows junctions before following a research-store path."""
+    if path.is_symlink():
+        return True
+    junction = getattr(path, "is_junction", None)
+    if junction is not None and junction():
+        return True
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def regular_tree_entries(directory: Path, limits: Limits):
+    require(directory.is_dir() and not is_link_like(directory),
+            "session entry is not a regular directory")
+    entries, scanners, total_bytes = [], [os.scandir(directory)], 0
+    maximum_entries = limits.entries * 4 + 32
+    maximum_bytes = limits.archive_bytes + limits.expanded_bytes + limits.decoded_bytes + limits.json_bytes * 4
+    try:
+        while scanners:
+            try:
+                item = next(scanners[-1])
+            except StopIteration:
+                scanners.pop().close()
+                continue
+            path = Path(item.path)
+            require(not is_link_like(path) and (path.is_file() or path.is_dir()),
+                    "existing import artifact is not a regular file")
+            entries.append(path)
+            require(len(entries) <= maximum_entries, "existing import tree entry quota exceeded")
+            if path.is_dir():
+                scanners.append(os.scandir(path))
+            else:
+                total_bytes += path.stat().st_size
+                require(total_bytes <= maximum_bytes, "existing import tree size quota exceeded")
+    finally:
+        for scanner in scanners:
+            scanner.close()
+    return entries
+
+
 def bounded_file_bytes(path, maximum, label):
-    require(path.is_file() and not path.is_symlink(), f"{label} is not a regular file")
+    require(path.is_file() and not is_link_like(path), f"{label} is not a regular file")
     with path.open("rb") as stream:
         data = stream.read(maximum + 1)
     require(0 < len(data) <= maximum, f"{label} size exceeds quota")
@@ -78,7 +122,7 @@ def bounded_file_bytes(path, maximum, label):
 
 @contextmanager
 def verified_archive_snapshot(path, maximum, expected_digest, label):
-    require(path.is_file() and not path.is_symlink(), f"{label} is not a regular file")
+    require(path.is_file() and not is_link_like(path), f"{label} is not a regular file")
     with tempfile.TemporaryDirectory(prefix="ringfitness-owner-") as temporary:
         snapshot = Path(temporary) / "source.zip"
         digest, count = hashlib.sha256(), 0
@@ -126,6 +170,8 @@ def sync_tree(directory):
 def import_lock(root):
     root.mkdir(parents=True, exist_ok=True)
     lock = root / ".import.lock"
+    require(not is_link_like(lock) and (not lock.exists() or lock.is_file()),
+            "import lock is not a regular file")
     # Keep one stable inode: unlinking a released lock can split concurrent owners across files.
     # The OS releases this lock on process exit, including an unexpected termination.
     with lock.open("a+b") as stream:
@@ -299,11 +345,9 @@ def decode_archive(stage, manifest, limits):
     return quality
 
 
-def read_import_receipt(destination, maximum_bytes=None):
+def read_import_receipt(destination, maximum_bytes=Limits().json_bytes):
     path = destination / "import.json"
-    data = path.read_bytes() if maximum_bytes is None else bounded_file_bytes(
-        path, maximum_bytes, "existing import receipt"
-    )
+    data = bounded_file_bytes(path, maximum_bytes, "existing import receipt")
     receipt = object_value(strict_json(data), "existing import receipt")
     require({"session_id", "zip_sha256", "artifacts"} <= set(receipt), "existing import receipt fields missing")
     require(type(receipt["session_id"]) is str and receipt["session_id"], "existing import identity is invalid")
@@ -315,16 +359,26 @@ def read_import_receipt(destination, maximum_bytes=None):
     return receipt
 
 
-def existing_result(destination, session_id, digest):
-    receipt = read_import_receipt(destination)
+def existing_result(destination, session_id, digest, limits=None):
+    limits = limits or Limits()
+    require(destination.is_dir() and not is_link_like(destination),
+            "session entry is not a regular directory")
+    receipt = read_import_receipt(destination, limits.json_bytes)
     require(receipt.get("session_id") == session_id, "existing import identity is inconsistent")
-    require(sha256(destination / "source.zip") == receipt.get("zip_sha256"), "existing archive checksum mismatch")
+    source = destination / "source.zip"
+    require(source.is_file() and not is_link_like(source), "existing archive is not a regular file")
+    require(source.stat().st_size <= limits.archive_bytes, "existing archive size exceeds quota")
+    require(sha256(source) == receipt.get("zip_sha256"), "existing archive checksum mismatch")
     artifacts = object_value(receipt.get("artifacts"), "existing artifact hashes")
-    actual = {p.relative_to(destination).as_posix() for p in destination.rglob("*")
+    entries = regular_tree_entries(destination, limits)
+    actual = {p.relative_to(destination).as_posix() for p in entries
               if p.is_file() and p != destination / "import.json"}
     require(actual == set(artifacts), "existing import file inventory changed")
     for name, expected in artifacts.items():
-        require(sha256(destination / name) == expected, "existing import artifact checksum mismatch")
+        artifact = destination / name
+        require(artifact.is_file() and not is_link_like(artifact),
+                "existing import artifact is not a regular file")
+        require(sha256(artifact) == expected, "existing import artifact checksum mismatch")
     return receipt.get("zip_sha256") == digest
 
 
@@ -353,13 +407,13 @@ def canonical_raw_duplicate(root, session_id, raw_entries, limits):
     incoming = {entry["sha256"] for entry in raw_entries}
     sessions = root / "sessions"
     try:
-        require(not sessions.is_symlink() and (not sessions.exists() or sessions.is_dir()),
+        require(not is_link_like(sessions) and (not sessions.exists() or sessions.is_dir()),
                 "session storage is not a regular directory")
     except (OSError, ValidationError) as error:
         raise ResearchStoreIntegrityError(f"existing research store integrity error: {error}") from error
     for directory in sorted(sessions.glob("*")):
         try:
-            require(directory.is_dir() and not directory.is_symlink(), "session entry is not a regular directory")
+            require(directory.is_dir() and not is_link_like(directory), "session entry is not a regular directory")
             manifest = canonical_ownership_manifest(directory, limits)
         except (OSError, ValidationError, zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, UnicodeError) as error:
             raise ResearchStoreIntegrityError(
@@ -374,6 +428,10 @@ def canonical_raw_duplicate(root, session_id, raw_entries, limits):
 
 
 def publish(stage, destination):
+    require(not is_link_like(destination), "import destination is not a regular path")
+    require(not destination.parent.exists() or
+            (destination.parent.is_dir() and not is_link_like(destination.parent)),
+            "import destination parent is not a regular directory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     require(not destination.exists(), "import destination already exists")
     sync_tree(stage)
@@ -387,6 +445,10 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None, *, ex
     require(source.is_file() and 0 < source.stat().st_size <= limits.archive_bytes, "archive size quota exceeded")
     with import_lock(root):
         staging_root = root / ".staging"
+        for name in (".staging", "sessions", "conflicts", "rejected"):
+            path = root / name
+            require(not is_link_like(path) and (not path.exists() or path.is_dir()),
+                    f"{name} storage is not a regular directory")
         staging_root.mkdir(exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix="import-", dir=staging_root))
         digest = None
@@ -421,9 +483,10 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None, *, ex
             (stage / "manifest.json").write_bytes(manifest_bytes)
             session_id = manifest["session_id"]
             destination = root / "sessions" / session_id
+            require(not is_link_like(destination), "session destination is not a regular path")
             if destination.exists():
                 try:
-                    if existing_result(destination, session_id, digest):
+                    if existing_result(destination, session_id, digest, limits):
                         return ImportResult("already_imported", session_id, digest, str(destination))
                 except (OSError, ValidationError) as error:
                     raise ResearchStoreIntegrityError(
@@ -435,10 +498,15 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None, *, ex
             conflict = destination.exists() or duplicate is not None
             status = "conflict" if conflict else "imported"
             if conflict:
-                destination = root / "conflicts" / session_id / digest
+                conflict_parent = root / "conflicts" / session_id
+                require(not is_link_like(conflict_parent) and
+                        (not conflict_parent.exists() or conflict_parent.is_dir()),
+                        "conflict storage is not a regular directory")
+                destination = conflict_parent / digest
+                require(not is_link_like(destination), "conflict destination is not a regular path")
                 if destination.exists():
                     try:
-                        require(existing_result(destination, session_id, digest),
+                        require(existing_result(destination, session_id, digest, limits),
                                 "existing conflict archive is inconsistent")
                     except (OSError, ValidationError) as error:
                         raise ResearchStoreIntegrityError(
@@ -474,34 +542,44 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None, *, ex
                 shutil.rmtree(stage)
 
 
-def summarize(root: Path, output: Path):
+def summarize(root: Path, output: Path, limits: Limits | None = None):
     """Session index only: unknown coverage never becomes a daily total."""
-    root, output = local_path(root), local_path(output)
+    limits = limits or Limits()
+    lexical_output = Path(output).absolute()
+    require(not is_link_like(lexical_output), "summary output is not a regular file")
+    require(not lexical_output.parent.exists() or
+            (lexical_output.parent.is_dir() and not is_link_like(lexical_output.parent)),
+            "summary output parent is not a regular directory")
+    root, output = local_path(root), local_path(lexical_output)
     reserved = [root / name for name in (".import.lock", "sessions", "conflicts", "rejected", ".staging", ".sync-staging")]
     require(output != root and all(output != path and path not in output.parents for path in reserved),
             "summary output cannot replace the import lock or preserved research artifacts")
     with import_lock(root):
-        return _summarize_locked(root, output)
+        return _summarize_locked(root, output, limits)
 
 
-def _summarize_locked(root: Path, output: Path):
+def _summarize_locked(root: Path, output: Path, limits: Limits):
     rows, raw_owners = [], {}
     root = local_path(root)
     sessions = root / "sessions"
-    require(not sessions.is_symlink() and (not sessions.exists() or sessions.is_dir()),
+    require(not is_link_like(sessions) and (not sessions.exists() or sessions.is_dir()),
             "session storage is not a regular directory")
     for directory in sorted(sessions.glob("*")):
-        require(directory.is_dir() and not directory.is_symlink(), "session entry is not a regular directory")
-        manifest = validate_manifest(strict_json((directory / "manifest.json").read_bytes()))
+        require(directory.is_dir() and not is_link_like(directory), "session entry is not a regular directory")
+        manifest = validate_manifest(strict_json(bounded_file_bytes(
+            directory / "manifest.json", limits.json_bytes, "existing manifest"
+        )))
         require(directory.name == manifest["session_id"], "session directory identity differs from manifest")
-        quality = object_value(strict_json((directory / "quality.json").read_bytes()), "existing quality report")
+        quality = object_value(strict_json(bounded_file_bytes(
+            directory / "quality.json", limits.json_bytes, "existing quality report"
+        )), "existing quality report")
         require({"analysis_status", "analysis_reasons"} <= set(quality), "existing quality report fields missing")
         require(quality["analysis_status"] == "pending_review", "existing analysis status is invalid")
         require(type(quality["analysis_reasons"]) is list and
                 all(type(reason) is str and reason for reason in quality["analysis_reasons"]),
                 "existing analysis reasons are invalid")
-        receipt = read_import_receipt(directory)
-        existing_result(directory, manifest["session_id"], receipt["zip_sha256"])
+        receipt = read_import_receipt(directory, limits.json_bytes)
+        existing_result(directory, manifest["session_id"], receipt["zip_sha256"], limits)
         for entry in manifest["files"]:
             if entry["role"] == "raw":
                 raw_owners.setdefault(entry["sha256"], set()).add(manifest["session_id"])
@@ -519,12 +597,31 @@ def _summarize_locked(root: Path, output: Path):
                all(x is not None for x in (row["started_at_ms"], row["ended_at_ms"],
                                           other["started_at_ms"], other["ended_at_ms"])) and
                max(row["started_at_ms"], other["started_at_ms"]) < min(row["ended_at_ms"], other["ended_at_ms"])
-               for other in rows):
+                for other in rows):
             row["analysis_reasons"] += ";overlapping_session_intervals"
     output = local_path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
     fields = ["session_id", "participant_id", "activity_code", "ground_truth_steps", "ground_truth_status", "started_at_ms",
               "ended_at_ms", "analysis_status", "daily_aggregation_eligible", "analysis_reasons"]
+    if output.exists():
+        require(output.is_file() and not is_link_like(output), "existing summary is not a regular file")
+        require(0 < output.stat().st_size <= limits.decoded_bytes,
+                "existing summary size exceeds quota")
+        current_ids = {row["session_id"] for row in rows}
+        try:
+            with output.open("r", encoding="utf-8", newline="") as stream:
+                previous = csv.DictReader(stream)
+                legacy_fields = [field for field in fields if field != "activity_code"]
+                initial_fields = ["session_id", "participant_id", "ground_truth_steps"]
+                require(previous.fieldnames in (fields, legacy_fields, initial_fields),
+                        "existing summary fields are invalid")
+                preserves_catalog = previous.fieldnames in (fields, legacy_fields)
+                for row in previous:
+                    session_id = row.get("session_id")
+                    require(not preserves_catalog or session_id and session_id in current_ids,
+                            "previously indexed session is missing from research store")
+        except (UnicodeError, csv.Error) as error:
+            raise ValidationError("existing summary is invalid") from error
+    output.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".session-index-", suffix=".tmp", dir=output.parent)
     temporary = Path(name)
     try:

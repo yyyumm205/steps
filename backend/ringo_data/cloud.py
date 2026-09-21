@@ -20,7 +20,7 @@ from pathlib import Path
 from uuid import UUID
 
 from . import __version__
-from .importer import Limits, import_lock, sha256, sync_directory
+from .importer import Limits, import_lock, is_link_like, sha256, sync_directory
 from .schema import ValidationError, object_value, require, strict_json
 from .sync import DirectorySync
 
@@ -223,12 +223,13 @@ class CloudDownloader:
 
     def registered_files(self):
         """Only verified receipts authorize an inbox ZIP to enter this research output."""
-        files, errors = {}, []
+        files, errors, receipt_names = {}, [], set()
         with import_lock(self.config.local_inbox):
             state = self._state()
             for receipt in state["files"].values():
                 digest = receipt["sha256"]
                 name = "cloud-" + digest + ".zip"
+                receipt_names.add(name)
                 path = self.config.local_inbox / name
                 try:
                     require(path.is_file() and not path.is_symlink() and path.stat().st_size == receipt["bytes"] and
@@ -236,6 +237,23 @@ class CloudDownloader:
                     files[name] = (digest, receipt["bytes"])
                 except (ValidationError, OSError):
                     errors.append({"status": "download_error", "reason": "registered local cloud file needs review; original retained"})
+            for path in self.config.local_inbox.iterdir():
+                name = path.name
+                if (name in receipt_names or len(name) != 74 or not name.startswith("cloud-") or
+                        not name.endswith(".zip")):
+                    continue
+                digest = name[6:-4]
+                if not all(c in "0123456789abcdef" for c in digest):
+                    continue
+                try:
+                    size = path.stat().st_size
+                    require(path.is_file() and not is_link_like(path) and 0 < size <= self.config.max_archive_bytes and
+                            sha256(path) == digest, "unregistered local cloud file needs review")
+                    errors.append({"status": "unregistered_download", "sha256": digest, "bytes": size,
+                                   "reason": "verified cloud download has no local receipt; original retained for review"})
+                except (ValidationError, OSError):
+                    errors.append({"status": "unregistered_download", "sha256": digest,
+                                   "reason": "unregistered cloud download needs review; original retained"})
         return files, errors
 
     def _save(self, state):
@@ -355,7 +373,9 @@ class CloudSync:
 
     def _scan_registered(self, cloud):
         self.registered, errors = self.downloader.registered_files()
-        cloud["files"].extend(errors)
+        for error in errors:
+            if error["status"] != "unregistered_download" or error not in cloud["files"]:
+                cloud["files"].append(error)
         cloud["failed"] |= bool(errors)
         return self.scanner.scan()
 

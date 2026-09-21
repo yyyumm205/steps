@@ -454,7 +454,7 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun recordStatus(record: FlowRecordSummary, state: CollectionFlowState): String = when {
         record.ringDeferred -> "已暂存到戒指"
-        record.localReviewRequired -> if (record.transferInFlight) "正在校验上传文件" else "上传校验未通过"
+        record.localReviewRequired -> if (record.transferInFlight) "正在校验上传文件" else "上传记录需要研究者核对"
         record.transferStatus == "complete" -> if (state.isSimulation) "模拟上传完成" else "已上传"
         record.transferInFlight -> "正在上传"
         record.uploadDeferred -> "已保存，稍后上传"

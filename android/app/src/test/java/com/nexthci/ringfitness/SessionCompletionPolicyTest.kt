@@ -365,8 +365,9 @@ class SessionCompletionPolicyTest {
         fun queue(onUpload: () -> Unit = {}) = RealUploadQueue(directory, reopen(), freeze = { session ->
             val archive = File(directory, "fixture-${session.sessionId}.zip").apply { writeText("fixture archive") }
             FrozenSessionPackage(archive, hash(archive.readBytes()), archive.length(), session.sessionId)
-        }, transport = SessionUploadTransport { _, archive, _, onDispatch ->
+        }, transport = SessionUploadTransport { _, archive, _, onDispatch, onPayloadStart ->
             onDispatch()
+            onPayloadStart()
             requests++; onUpload()
             RemoteSessionReceipt(archive.name, "a".repeat(40), archive.length())
         }, now = { time + 10 }, sync = {})

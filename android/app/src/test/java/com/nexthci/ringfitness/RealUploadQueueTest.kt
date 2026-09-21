@@ -10,6 +10,9 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class RealUploadQueueTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -198,7 +201,7 @@ class RealUploadQueueTest {
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
     }
 
-    @Test fun legacyQueuedTaskWithUnknownDispatchKeepsItsConsumedAttempt() {
+    @Test fun legacyQueuedTaskWithUnknownDispatchStopsBeforeReplay() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
         f.failUpload = true
@@ -208,15 +211,18 @@ class RealUploadQueueTest {
         legacy.addProperty("version", 1)
         legacy.addProperty("state", "queued")
         legacy.remove("dispatchStarted")
+        legacy.remove("payloadStarted")
         taskFile.writeText(legacy.toString())
 
         f.failUpload = false
         assertFalse(f.openQueue().run(f.id))
-        assertEquals(2, f.requests)
-        assertEquals(2, f.store.read()!!.transfer.attempts)
-        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
-        assertEquals(2, f.queue.task(f.id)!!.version)
+        assertEquals(1, f.requests)
+        assertEquals(1, f.store.read()!!.transfer.attempts)
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+        assertEquals(3, f.queue.task(f.id)!!.version)
         assertEquals(true, f.queue.task(f.id)!!.dispatchStarted)
+        assertEquals(true, f.queue.task(f.id)!!.payloadStarted)
+        assertEquals("outcome", f.queue.task(f.id)!!.failureStage)
     }
 
     @Test fun persistedReceiptRecoversWithoutASecondHttpUpload() {
@@ -234,6 +240,141 @@ class RealUploadQueueTest {
         assertFalse(f.openQueue().run(f.id))
         assertEquals(1, f.requests)
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun serverCommitWithLostReceiptStopsAutomaticReplayAndRequiresReview() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.uncertainAfterServerCommit = true
+
+        assertFalse(f.queue.run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+        assertEquals("failed", f.queue.task(f.id)!!.state)
+        assertEquals("outcome", f.queue.task(f.id)!!.failureStage)
+        assertTrue(f.queue.needsLocalReview(f.id))
+
+        assertFalse(f.openQueue().restore(link))
+        assertFalse(f.openQueue().enqueue(f.id, link, true))
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+    }
+
+    @Test fun processExitAfterPayloadStartsNeverReplaysThePost() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.exitAfterPayloadStarted = true
+
+        assertThrows(SimulatedProcessExit::class.java) { f.queue.run(f.id) }
+        assertEquals(1, f.requests)
+        assertEquals(true, f.queue.task(f.id)!!.payloadStarted)
+        assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
+
+        f.exitAfterPayloadStarted = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals("failed", f.queue.task(f.id)!!.state)
+        assertEquals("outcome", f.queue.task(f.id)!!.failureStage)
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+        assertTrue(f.queue.needsLocalReview(f.id))
+    }
+
+    @Test fun processExitAfterDispatchButBeforePayloadCanResume() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.exitAfterDispatchBeforePayload = true
+
+        assertThrows(SimulatedProcessExit::class.java) { f.queue.run(f.id) }
+        assertEquals(1, f.requests)
+        assertEquals(false, f.queue.task(f.id)!!.payloadStarted)
+
+        f.exitAfterDispatchBeforePayload = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(2, f.requests)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun explicitRetryableResponseClearsPayloadMarkerAndResumesAfterReopen() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.retryableAfterPayload = true
+
+        assertTrue(f.queue.run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(false, f.queue.task(f.id)!!.payloadStarted)
+        assertEquals("transport", f.queue.task(f.id)!!.failureStage)
+
+        f.retryableAfterPayload = false
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(2, f.requests)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun ambiguousVersionTwoTaskCannotBeReplayedByManualRetry() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        val taskFile = File(f.directory, "upload-tasks/${f.id}.json")
+        val legacy = JsonParser.parseString(taskFile.readText()).asJsonObject
+        legacy.addProperty("version", 2)
+        legacy.addProperty("state", "failed")
+        legacy.addProperty("dispatchStarted", true)
+        legacy.addProperty("failureStage", "transport")
+        legacy.remove("payloadStarted")
+        taskFile.writeText(legacy.toString())
+
+        assertTrue(f.openQueue().needsLocalReview(f.id))
+        assertFalse(f.openQueue().enqueue(f.id, link, true))
+        assertEquals(0, f.requests)
+        assertEquals("outcome", f.queue.task(f.id)!!.failureStage)
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun restoreDuringAnActivePayloadDoesNotMisclassifyOrDuplicateIt() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        val payloadStarted = CountDownLatch(1)
+        val finishPayload = CountDownLatch(1)
+        val failure = AtomicReference<Throwable?>()
+        f.afterPayloadStart = {
+            payloadStarted.countDown()
+            check(finishPayload.await(10, TimeUnit.SECONDS))
+        }
+        val worker = Thread {
+            try {
+                f.queue.run(f.id)
+            } catch (error: Throwable) {
+                failure.set(error)
+            }
+        }
+        worker.start()
+        assertTrue(payloadStarted.await(10, TimeUnit.SECONDS))
+
+        assertTrue(f.openQueue().restore(link))
+        assertEquals("sending", f.queue.task(f.id)!!.state)
+        assertEquals(true, f.queue.task(f.id)!!.payloadStarted)
+        assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
+
+        finishPayload.countDown()
+        worker.join(10_000)
+        assertFalse(worker.isAlive)
+        assertNull(failure.get())
+        assertEquals(1, f.requests)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+    }
+
+    @Test fun permanentlyRejectedDestinationDoesNotConsumeFiveAutomaticAttempts() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        f.permanentDestinationFailure = true
+
+        assertFalse(f.queue.run(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(SessionTransferStatus.FAILED, f.store.read()!!.transfer.status)
+        assertEquals("destination", f.queue.task(f.id)!!.failureStage)
+        assertTrue(f.queue.needsLocalReview(f.id))
+        assertFalse(f.openQueue().restore(link))
+        assertFalse(f.openQueue().enqueue(f.id, link, true))
+        assertEquals(1, f.requests)
     }
 
     @Test fun mismatchedPersistedReceiptFailsForReviewWithoutRepeatedUpload() {
@@ -460,6 +601,12 @@ class RealUploadQueueTest {
         var interruptUpload = false
         var checkCancellationBeforeDispatch = false
         var failAfterResponse = false
+        var uncertainAfterServerCommit = false
+        var permanentDestinationFailure = false
+        var exitAfterPayloadStarted = false
+        var exitAfterDispatchBeforePayload = false
+        var retryableAfterPayload = false
+        var afterPayloadStart: (() -> Unit)? = null
         var failFreeze = false
         var duringFreeze: (() -> Unit)? = null
         val destinations = mutableListOf<String>()
@@ -497,12 +644,19 @@ class RealUploadQueueTest {
             duringFreeze?.invoke()
             val file = archiveFor(session.sessionId)
             FrozenSessionPackage(file, sha(file), file.length(), session.sessionId)
-        }, transport = SessionUploadTransport { destination, file, cancelled, onDispatch ->
+        }, transport = SessionUploadTransport { destination, file, cancelled, onDispatch, onPayloadStart ->
             if (checkCancellationBeforeDispatch && cancelled()) throw InterruptedException()
             onDispatch()
             requests++; destinations += destination; uploadedHashes += sha(file); uploadedNames += file.name
+            if (exitAfterDispatchBeforePayload) throw SimulatedProcessExit()
             if (interruptUpload) throw InterruptedException()
+            if (permanentDestinationFailure) throw PermanentUploadException("Injected rejected destination")
             if (failUpload) throw IOException("Injected lost response")
+            onPayloadStart()
+            afterPayloadStart?.invoke()
+            if (exitAfterPayloadStarted) throw SimulatedProcessExit()
+            if (retryableAfterPayload) throw RetryableUploadException("Injected retryable response")
+            if (uncertainAfterServerCommit) throw UploadOutcomeUncertainException("Injected lost receipt")
             if (failAfterResponse) failJournal = true
             RemoteSessionReceipt(file.name, "a".repeat(40), file.length())
         }, now = { time + 10 }, sync = {})

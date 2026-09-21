@@ -12,7 +12,7 @@ import java.util.UUID
 
 /** Private durable destination binding and server receipt, separate from the frozen research ZIP. */
 data class RealUploadTask(
-    val version: Int = 2,
+    val version: Int = 3,
     val sessionId: String,
     val targetLink: String,
     val targetSha256: String,
@@ -22,6 +22,7 @@ data class RealUploadTask(
     val receivedAtMs: Long? = null,
     val failureStage: String? = null,
     val dispatchStarted: Boolean? = false,
+    val payloadStarted: Boolean? = false,
 )
 
 class RealUploadQueue(
@@ -61,6 +62,15 @@ class RealUploadQueue(
         require(session.localData != null && session.reference != null && session.localData.files.none { it.simulated })
         if (session.transfer.status == SessionTransferStatus.COMPLETE) return false
         var task = read(sessionId)
+        if (task != null && !(task.version == 3 && task.state == "sending") &&
+            requiresOutcomeReview(task, session)) {
+            markFailed(sessionId)
+            task = task.copy(version = 3, state = "failed", failureStage = "outcome",
+                dispatchStarted = true, payloadStarted = true)
+            save(task)
+            changed()
+            return false
+        }
         if (task == null) {
             check(session.transfer.status == SessionTransferStatus.PENDING && session.transfer.attempts == 0) {
                 "上传记录需要检查，已保留本地数据"
@@ -70,7 +80,7 @@ class RealUploadQueue(
             task = RealUploadTask(sessionId = sessionId, targetLink = configuredLink, targetSha256 = digest(configuredLink))
             save(task)
         } else if (task.state == "failed") {
-            if (!retry) return false
+            if (!retry || task.failureStage in setOf("outcome", "destination")) return false
             task = task.copy(state = "queued")
             save(task)
         }
@@ -93,7 +103,21 @@ class RealUploadQueue(
     /** A persisted receipt is replayed locally after a crash; it never causes a second HTTP request. */
     fun run(sessionId: String, cancelled: () -> Boolean = { false }): Boolean = synchronized(deliveryLock) {
         var task = synchronized(taskLock) { read(sessionId) } ?: return false
-        if (task.state !in setOf("queued", "sending")) return false
+        if (task.state !in setOf("queued", "sending")) {
+            if (task.state == "failed") markFailed(sessionId)
+            return false
+        }
+        val initialSession = requireNotNull(store.read(sessionId))
+        if (requiresOutcomeReview(task, initialSession)) {
+            // The body-start marker is durable before RequestBody writes. A legacy sending task
+            // lacks that distinction, so migration chooses duplicate prevention over replay.
+            markFailed(sessionId)
+            task = task.copy(version = 3, state = "failed", failureStage = "outcome",
+                dispatchStarted = true, payloadStarted = true)
+            synchronized(taskLock) { save(task) }
+            changed()
+            return false
+        }
         var failureStage = "preparation"
         var transferClaimed = false
         var claimedAttempt: Int? = null
@@ -118,7 +142,8 @@ class RealUploadQueue(
                             store.markTransferFailed(sessionId)
                         }
                     }
-                    task = task.copy(version = 2, state = "queued", dispatchStarted = false)
+                    task = task.copy(version = 3, state = "queued", dispatchStarted = false,
+                        payloadStarted = false)
                     synchronized(taskLock) { save(task) }
                     claimedAttempt = store.markTransferStarted(sessionId).transfer.attempts
                     transferClaimed = true
@@ -139,14 +164,24 @@ class RealUploadQueue(
                 synchronized(taskLock) { save(task) }
                 failureStage = "transport"
                 if (cancelled()) throw InterruptedException()
-                val receipt = transport.upload(task.targetLink, archive.file, cancelled) {
+                val receipt = transport.upload(task.targetLink, archive.file, cancelled, {
                     if (!transportInvoked) {
-                        task = task.copy(state = "sending", dispatchStarted = true)
-                        synchronized(taskLock) { save(task) }
+                        val dispatched = task.copy(version = 3, state = "sending", dispatchStarted = true,
+                            payloadStarted = false)
+                        synchronized(taskLock) { save(dispatched) }
+                        task = dispatched
                         transportInvoked = true
                         changed()
                     }
-                }
+                }, {
+                    if (task.payloadStarted != true) {
+                        val started = task.copy(version = 3, state = "sending", dispatchStarted = true,
+                            payloadStarted = true)
+                        synchronized(taskLock) { save(started) }
+                        task = started
+                        changed()
+                    }
+                })
                 require(transportInvoked) { "上传传输未报告网络请求" }
                 require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes && receipt.fileId.isNotBlank())
                 task = task.copy(receipt = receipt, receivedAtMs = now())
@@ -167,18 +202,29 @@ class RealUploadQueue(
             if (store.read(sessionId)?.uploadAllowed == false) return false
             // A verified receipt can finish locally after a crash. An unverified receipt needs review.
             val recoverableReceipt = task.receipt != null && receiptVerified
-            val paused = cancelled() || error is InterruptedException || recoverableReceipt
+            val outcomeUncertain = error is UploadOutcomeUncertainException
+            val destinationRejected = error is PermanentUploadException
+            val paused = !outcomeUncertain && !destinationRejected &&
+                (cancelled() || error is InterruptedException || recoverableReceipt)
             val attempts = store.read(sessionId)?.transfer?.attempts ?: MAX_AUTOMATIC_ATTEMPTS
-            val automaticRetry = !paused && failureStage == "transport" &&
+            val automaticRetry = !paused && !outcomeUncertain && !destinationRejected &&
+                failureStage == "transport" &&
                 attempts < MAX_AUTOMATIC_ATTEMPTS
             val nextState = when {
+                outcomeUncertain || destinationRejected -> "failed"
                 recoverableReceipt -> "queued"
                 transportInvoked && (paused || automaticRetry) -> "sending"
                 paused || automaticRetry -> "queued"
                 else -> "failed"
             }
             task = task.copy(state = nextState,
-                failureStage = if (error is InterruptedException) task.failureStage else failureStage)
+                failureStage = when {
+                    outcomeUncertain -> "outcome"
+                    destinationRejected -> "destination"
+                    error is InterruptedException -> task.failureStage
+                    else -> failureStage
+                }, payloadStarted = if (error is RetryableUploadException) false
+                    else task.payloadStarted)
             if (paused && transferClaimed && !transportInvoked && task.receipt == null) {
                 store.releaseTransferClaimBeforeDispatch(sessionId, requireNotNull(claimedAttempt))
             }
@@ -215,7 +261,8 @@ class RealUploadQueue(
         if (store.read(sessionId)?.uploadAllowed == false) return false
         try {
             val task = read(sessionId)
-            if (task != null) task.failureStage == "preparation" ||
+            if (task != null) task.failureStage in setOf("preparation", "outcome", "destination") ||
+                requiresOutcomeReview(task, requireNotNull(store.read(sessionId))) ||
                 (task.state == "failed" && task.failureStage == "receipt")
             else store.read(sessionId)?.let { session ->
                 session.localData != null && session.transfer.status != SessionTransferStatus.COMPLETE &&
@@ -239,20 +286,25 @@ class RealUploadQueue(
         if (!file.exists()) return null
         require(file.length() in 2..32_768) { "上传记录无法读取" }
         val task = requireNotNull(Gson().fromJson(file.readText(), RealUploadTask::class.java))
-        require(task.version in 1..2 && task.sessionId == sessionId &&
+        require(task.version in 1..3 && task.sessionId == sessionId &&
             task.state in setOf("queued", "sending", "failed", "complete"))
         require((task.version == 1 && task.dispatchStarted == null) ||
-            (task.version == 2 && task.dispatchStarted != null))
+            (task.version in 2..3 && task.dispatchStarted != null))
+        require((task.version in 1..2 && task.payloadStarted == null) ||
+            (task.version == 3 && task.payloadStarted != null))
         SeafileSessionTransport.validateLink(task.targetLink)
         require(task.targetSha256 == digest(task.targetLink))
         require(task.archiveSha256 == null || task.archiveSha256.matches(Regex("[a-f0-9]{64}")))
-        require(task.failureStage == null || task.failureStage in setOf("preparation", "transport", "receipt"))
+        require(task.failureStage == null || task.failureStage in
+            setOf("preparation", "transport", "receipt", "outcome", "destination"))
         require((task.receipt == null) == (task.receivedAtMs == null))
         require(task.receipt == null || (task.archiveSha256 != null && task.receivedAtMs!! > 0 && task.receipt.bytes > 0 &&
             task.receipt.fileId.matches(Regex("[a-fA-F0-9]{40,64}")) && task.receipt.fileName.isNotBlank() &&
             '/' !in task.receipt.fileName && '\\' !in task.receipt.fileName))
         require(task.state != "sending" || task.dispatchStarted != false)
         require(task.receipt == null || task.dispatchStarted != false)
+        require(task.payloadStarted != true || task.dispatchStarted == true)
+        require(task.version != 3 || task.receipt == null || task.payloadStarted == true)
         require(task.state != "complete" || task.receipt != null)
         require(task.state != "complete" || task.failureStage == null)
         return task
@@ -265,6 +317,16 @@ class RealUploadQueue(
         FileOutputStream(temporary).use { it.write(Gson().toJson(task).toByteArray(Charsets.UTF_8)); it.fd.sync() }
         Files.move(temporary.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         sync(folder)
+    }
+
+    private fun requiresOutcomeReview(task: RealUploadTask, session: FreeLivingSession): Boolean {
+        if (task.receipt != null || task.failureStage in setOf("outcome", "destination")) return false
+        return when (task.version) {
+            3 -> task.payloadStarted == true
+            2 -> task.dispatchStarted == true
+            else -> !(task.state == "queued" && session.transfer.status == SessionTransferStatus.PENDING &&
+                session.transfer.attempts == 0)
+        }
     }
 
     private fun taskFile(id: String): File { require(UUID.fromString(id).toString() == id); return File(folder, "$id.json") }
