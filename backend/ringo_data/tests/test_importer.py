@@ -322,7 +322,7 @@ def test_multiple_files_share_one_reference_and_require_review(tmp_path):
 def test_two_sessions_and_cross_midnight_remain_separate_with_no_daily_total(tmp_path):
     root = tmp_path / "out"
     for number, steps in [(1, 562), (2, 438)]:
-        raw = raw_bytes()
+        raw = raw_bytes([imu(10020 + number), ppg()])
         m = manifest_for(raw, session_number=number)
         m["ground_truth_steps"] = steps
         # Phone request timestamps may cross midnight; unknown device boundaries remain null.
@@ -441,14 +441,32 @@ def test_zip_compression_and_archive_size_quotas(tmp_path):
         import_archive(source, tmp_path / "other", Limits(archive_bytes=1))
 
 
-def test_same_raw_content_across_sessions_is_flagged(tmp_path):
-    for number in (1, 2):
-        source = tmp_path / f"input{number}.zip"
-        raw = raw_bytes()
-        archive_at(source, raw=raw, manifest=manifest_for(raw, session_number=number))
-        import_archive(source, tmp_path / "out")
-    rows = summarize(tmp_path / "out", tmp_path / "summary.csv")
-    assert all("raw_content_shared_across_sessions" in row["analysis_reasons"] for row in rows)
+def test_same_raw_content_across_sessions_is_quarantined_with_canonical_owner(tmp_path):
+    raw = raw_bytes()
+    first, second = tmp_path / "input1.zip", tmp_path / "input2.zip"
+    first_manifest = archive_at(first, raw=raw, manifest=manifest_for(raw, session_number=1))
+    second_manifest = archive_at(second, raw=raw, manifest=manifest_for(raw, session_number=2))
+    root = tmp_path / "out"
+
+    first_result = import_archive(first, root)
+    assert first_result.status == "imported"
+    assert import_archive(first, root).status == "already_imported"
+
+    second_result = import_archive(second, root)
+    assert second_result.status == "conflict"
+    quarantine = Path(second_result.directory)
+    assert quarantine.parts[-3:] == ("conflicts", second_manifest["session_id"], sha256(second))
+    assert sha256(quarantine / "source.zip") == sha256(second)
+    receipt = json.loads((quarantine / "import.json").read_text())
+    assert receipt["status"] == "conflict"
+    assert receipt["conflict_reason"] == "raw_content_shared_across_sessions"
+    assert receipt["duplicate_of"] == first_manifest["session_id"]
+    assert receipt["duplicate_raw_sha256"] == [second_manifest["files"][0]["sha256"]]
+    assert not (root / "sessions" / second_manifest["session_id"]).exists()
+    assert import_archive(second, root).directory == second_result.directory
+
+    rows = summarize(root, tmp_path / "summary.csv")
+    assert [row["session_id"] for row in rows] == [first_manifest["session_id"]]
 
 
 def test_device_unix_zero_stays_unknown_and_uptime_wrap_is_not_repaired(tmp_path):

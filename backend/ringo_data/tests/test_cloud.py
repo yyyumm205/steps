@@ -79,9 +79,10 @@ def config_at(tmp_path, **overrides):
     return replace(config, **overrides)
 
 
-def data_at(tmp_path, name="source.zip", number=1, steps=0):
+def data_at(tmp_path, name="source.zip", number=1, steps=0, raw=None):
     path = tmp_path / name
-    archive_at(path, manifest=manifest_for(raw_bytes(), number), mutate=lambda m, _: m.update(ground_truth_steps=steps))
+    raw = raw if raw is not None else raw_bytes()
+    archive_at(path, raw=raw, manifest=manifest_for(raw, number), mutate=lambda m, _: m.update(ground_truth_steps=steps))
     return path.read_bytes()
 
 
@@ -129,8 +130,57 @@ def test_same_remote_name_with_new_content_keeps_both_and_reports_session_confli
     assert read_rows(service.config.research_output / "session-index.csv")[0]["ground_truth_steps"] == "2"
 
 
+@pytest.mark.parametrize("changed_field", ["name", "id", "size"])
+def test_remote_object_change_during_download_is_not_published_and_can_be_retried(tmp_path, changed_field):
+    first = data_at(tmp_path, "first.zip", steps=2)
+    replacement = data_at(tmp_path, "replacement.zip", number=2, steps=73)
+    row = listing_for("one.zip", first)
+
+    class ChangingHttp(FakeHttp):
+        changed = False
+
+        @contextmanager
+        def open(self, url, token=None):
+            parts = urllib.parse.urlsplit(url)
+            if not self.changed and not parts.path.endswith(("/dir/", "/file/")):
+                self.changed = True
+                with super().open(url, token) as response:
+                    if changed_field == "name":
+                        row["name"] = "renamed.zip"
+                    elif changed_field == "id":
+                        row["id"] = "b" * 40
+                    else:
+                        row["size"] = len(replacement)
+                    self.payloads[row["name"]] = replacement if changed_field == "size" else first
+                    yield response
+                return
+            with super().open(url, token) as response:
+                yield response
+
+    http = ChangingHttp([row], {"one.zip": first})
+    config = config_at(tmp_path)
+    service = reader(config, http)
+    result = service.once()
+    assert result["failed"]
+    assert result["cloud"]["files"] == [{
+        "status": "download_error",
+        "reason": "cloud file changed during download; retry the current remote object",
+    }]
+    assert not list(config.local_inbox.glob("*.zip"))
+    assert json.loads(config.local_inbox.joinpath(".cloud-downloads.json").read_text())["files"] == {}
+    assert result["local"]["index"]["sessions"] == 0
+
+    resumed = service.once()
+    assert not resumed["failed"]
+    assert resumed["cloud"]["files"][0]["status"] == "downloaded"
+    expected = replacement if changed_field == "size" else first
+    assert next(config.local_inbox.glob("*.zip")).read_bytes() == expected
+    assert resumed["local"]["index"]["sessions"] == 1
+
+
 def test_interrupted_download_stays_out_of_inbox_and_other_good_file_continues(tmp_path):
-    bad, good = data_at(tmp_path, "a.zip"), data_at(tmp_path, "b.zip", number=2)
+    bad = data_at(tmp_path, "a.zip")
+    good = data_at(tmp_path, "b.zip", number=2, raw=raw_bytes(anchor=1_800_000_000_001))
     http = FakeHttp([listing_for("a.zip", bad), listing_for("b.zip", good, "b" * 40)], {"a.zip": bad, "b.zip": good})
     http.fail_files.add("a.zip")
     service = reader(config_at(tmp_path), http)
@@ -163,7 +213,7 @@ def test_temporary_and_subdirectory_entries_are_not_downloaded(tmp_path):
     http = FakeHttp(entries, {"one.zip": data})
     result = reader(config_at(tmp_path), http).once()
     assert not result["failed"] and len(result["cloud"]["files"]) == 1
-    assert len(http.calls) == 3
+    assert len(http.calls) == 4
 
 
 @pytest.mark.parametrize("name", ["../other.zip", "other\\secret.zip", "encoded%2fpath.zip"])

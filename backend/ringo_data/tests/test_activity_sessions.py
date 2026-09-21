@@ -7,7 +7,7 @@ import pytest
 
 from backend.ringo_data.importer import ArchiveRejected, import_archive, sha256, summarize
 from backend.ringo_data.tests.test_charging_recovery import recovery_manifest
-from backend.ringo_data.tests.test_importer import archive_at, manifest_for, raw_bytes, read_rows
+from backend.ringo_data.tests.test_importer import archive_at, imu, manifest_for, ppg, raw_bytes, read_rows
 
 
 def activity_manifest(activity="walking", *, recovery=False, session_number=1):
@@ -149,7 +149,7 @@ def test_mixed_versions_replace_old_index_with_separate_activity_rows(tmp_path):
     for number, manifest in enumerate(inputs, start=1):
         manifest["ground_truth_steps"] = number * 100
         source = tmp_path / f"input{number}.zip"
-        archive_at(source, manifest=manifest)
+        archive_at(source, raw=raw_bytes([imu(10020 + number), ppg()]), manifest=manifest)
         result = import_archive(source, root)
         directory = Path(result.directory)
         snapshots[directory] = artifact_hashes(directory)
@@ -162,7 +162,6 @@ def test_mixed_versions_replace_old_index_with_separate_activity_rows(tmp_path):
         ("free_living", 100), ("free_living", 200), ("walking", 300), ("running", 400)]
     assert [row["activity_code"] for row in read_rows(index)] == [
         "free_living", "free_living", "walking", "running"]
-    assert all("raw_content_shared_across_sessions" in row["analysis_reasons"] for row in rows)
     assert all(row["daily_aggregation_eligible"] is False for row in rows)
     for directory, before in snapshots.items():
         assert artifact_hashes(directory) == before

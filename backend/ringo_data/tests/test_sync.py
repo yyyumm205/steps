@@ -14,7 +14,7 @@ from backend.ringo_data import importer
 from backend.ringo_data.importer import Limits, import_archive, import_lock, sha256, summarize
 from backend.ringo_data.schema import ValidationError
 from backend.ringo_data.sync import DirectorySync
-from backend.ringo_data.tests.test_importer import archive_at, manifest_for, raw_bytes, read_rows
+from backend.ringo_data.tests.test_importer import archive_at, imu, manifest_for, ppg, raw_bytes, read_rows
 
 
 class Clock:
@@ -38,11 +38,15 @@ def settled_scan(scanner, clock):
     return scanner.scan()
 
 
+def distinct_raw(number):
+    return raw_bytes([imu(10020 + number), ppg(10040 + number)])
+
+
 def test_stable_batch_imports_zero_and_distinct_sessions_then_preserves_identity_on_restart(tmp_path):
     scanner, incoming, clock = scanner_at(tmp_path)
     first = archive_at(incoming / "a.zip")
-    raw = raw_bytes()
-    second = archive_at(incoming / "b.zip", manifest=manifest_for(raw, 2),
+    raw = distinct_raw(2)
+    second = archive_at(incoming / "b.zip", raw=raw, manifest=manifest_for(raw, 2),
                         mutate=lambda m, _: m.update(ground_truth_steps=73))
     before = {p.name: sha256(p) for p in incoming.iterdir()}
     observed = scanner.scan()
@@ -76,7 +80,8 @@ def test_partial_names_and_incomplete_zip_wait_until_final_file_is_complete(tmp_
     assert result["index"]["sessions"] == 0
     assert not (scanner.output / "rejected").exists()
     (incoming / "finished.zip.part").rename(incoming / "finished.zip")
-    archive_at(incoming / "growing.zip", manifest=manifest_for(raw_bytes(), 2))
+    raw = distinct_raw(2)
+    archive_at(incoming / "growing.zip", raw=raw, manifest=manifest_for(raw, 2))
     result = settled_scan(scanner, clock)
     assert {e["status"] for e in result["files"] if e["file"] != "empty.zip"} == {"imported"}
     assert result["index"]["sessions"] == 2
@@ -101,7 +106,8 @@ def test_invalid_and_conflicting_archives_do_not_block_a_valid_record(tmp_path):
     archive_at(incoming / "a-first.zip")
     archive_at(incoming / "b-conflict.zip", mutate=lambda m, _: m.update(ground_truth_steps=1))
     archive_at(incoming / "c-rejected.zip", mutate=lambda m, _: m.update(ground_truth_steps=-1))
-    archive_at(incoming / "d-valid.zip", manifest=manifest_for(raw_bytes(), 2))
+    raw = distinct_raw(2)
+    archive_at(incoming / "d-valid.zip", raw=raw, manifest=manifest_for(raw, 2))
     result = settled_scan(scanner, clock)
     assert [e["status"] for e in result["files"]] == ["imported", "conflict", "rejected", "imported"]
     assert result["failed"] and result["index"]["sessions"] == 2
@@ -187,6 +193,46 @@ def test_existing_artifact_damage_is_reported_without_overwriting_last_index(tmp
     assert index.read_bytes() == before
 
 
+def test_tampered_canonical_manifest_cannot_claim_new_raw_and_new_archive_retries(tmp_path, capsys):
+    scanner, incoming, clock = scanner_at(tmp_path)
+    first = archive_at(incoming / "a.zip")
+    settled_scan(scanner, clock)
+
+    second_raw = distinct_raw(2)
+    second = archive_at(incoming / "b.zip", raw=second_raw, manifest=manifest_for(second_raw, 2))
+    canonical_manifest = scanner.output / "sessions" / first["session_id"] / "manifest.json"
+    original = canonical_manifest.read_bytes()
+    tampered = json.loads(original)
+    tampered["files"][0]["sha256"] = second["files"][0]["sha256"]
+    canonical_manifest.write_text(json.dumps(tampered))
+
+    scanner.scan()
+    clock.now += 11
+    failed = scanner.scan()
+    event = next(entry for entry in failed["files"] if entry["file"] == "b.zip")
+    assert event["status"] == "error"
+    assert "existing canonical session integrity error" in event["reason"]
+    assert failed["index"]["status"] == "index_error"
+    assert not (scanner.output / "sessions" / second["session_id"]).exists()
+    assert not (scanner.output / "conflicts" / second["session_id"]).exists()
+    assert not (scanner.output / "rejected").exists()
+
+    assert main(["import", str(incoming / "b.zip"), "--output", str(scanner.output)]) == 2
+    cli_event = json.loads(capsys.readouterr().err)
+    assert cli_event["status"] == "research_store_error"
+    assert cli_event["retryable"] is True
+    assert not (scanner.output / "sessions" / second["session_id"]).exists()
+    assert not (scanner.output / "conflicts" / second["session_id"]).exists()
+    assert not (scanner.output / "rejected").exists()
+
+    canonical_manifest.write_bytes(original)
+    retried = scanner.scan()
+    event = next(entry for entry in retried["files"] if entry["file"] == "b.zip")
+    assert event["status"] == "imported"
+    assert retried["index"]["status"] == "indexed"
+    assert retried["index"]["sessions"] == 2
+
+
 @pytest.mark.parametrize("name,damage", [
     ("import.json", {}), ("import.json", []),
     ("import.json", {"session_id": "missing_hash", "artifacts": {}}),
@@ -207,14 +253,16 @@ def test_structurally_damaged_metadata_keeps_sync_running_and_preserves_new_good
     # A restarted watcher must handle reimport of the damaged record as a rejected/error result.
     scanner = DirectorySync(incoming, scanner.output, monotonic=clock)
     scanner.scan()
-    second = archive_at(incoming / "b.zip", manifest=manifest_for(raw_bytes(), 2))
+    second_raw = distinct_raw(2)
+    second = archive_at(incoming / "b.zip", raw=second_raw, manifest=manifest_for(second_raw, 2))
     result = settled_scan(scanner, clock)
     assert result["index"]["status"] == "index_error"
     assert result["failed"]
     assert any(e["file"] == "b.zip" and e["status"] == "imported" for e in result["files"])
     assert (scanner.output / "sessions" / second["session_id"] / "source.zip").is_file()
     assert index.read_bytes() == before and damaged.read_bytes() == preserved
-    third = archive_at(incoming / "c.zip", manifest=manifest_for(raw_bytes(), 3))
+    third_raw = distinct_raw(3)
+    third = archive_at(incoming / "c.zip", raw=third_raw, manifest=manifest_for(third_raw, 3))
     next_round = settled_scan(scanner, clock)
     assert next_round["index"]["status"] == "index_error"
     assert (scanner.output / "sessions" / third["session_id"] / "source.zip").is_file()

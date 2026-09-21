@@ -48,6 +48,10 @@ class ArchiveRejected(ValidationError):
         self.directory = directory
 
 
+class ResearchStoreIntegrityError(ValidationError):
+    """An admitted research artifact is damaged; incoming archives remain retryable."""
+
+
 def local_path(path):
     path = Path(path).resolve()
     if os.name == "nt" and not str(path).startswith("\\\\?\\"):
@@ -295,6 +299,38 @@ def existing_result(destination, session_id, digest):
     return receipt.get("zip_sha256") == digest
 
 
+def canonical_raw_duplicate(root, session_id, raw_entries):
+    incoming = {entry["sha256"] for entry in raw_entries}
+    sessions = root / "sessions"
+    try:
+        require(not sessions.is_symlink() and (not sessions.exists() or sessions.is_dir()),
+                "session storage is not a regular directory")
+    except (OSError, ValidationError) as error:
+        raise ResearchStoreIntegrityError(f"existing research store integrity error: {error}") from error
+    for directory in sorted(sessions.glob("*")):
+        try:
+            require(directory.is_dir() and not directory.is_symlink(), "session entry is not a regular directory")
+            manifest = validate_manifest(strict_json((directory / "manifest.json").read_bytes()))
+            require(directory.name == manifest["session_id"], "session directory identity differs from manifest")
+        except (OSError, ValidationError) as error:
+            raise ResearchStoreIntegrityError(
+                f"existing canonical session integrity error ({directory.name}): {error}"
+            ) from error
+        if manifest["session_id"] == session_id:
+            continue
+        shared = sorted(incoming & {entry["sha256"] for entry in manifest["files"] if entry["role"] == "raw"})
+        if shared:
+            try:
+                receipt = read_import_receipt(directory)
+                existing_result(directory, manifest["session_id"], receipt["zip_sha256"])
+            except (OSError, ValidationError) as error:
+                raise ResearchStoreIntegrityError(
+                    f"existing canonical session integrity error ({directory.name}): {error}"
+                ) from error
+            return {"session_id": manifest["session_id"], "raw_sha256": shared}
+    return None
+
+
 def publish(stage, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     require(not destination.exists(), "import destination already exists")
@@ -335,8 +371,10 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
             destination = root / "sessions" / session_id
             if destination.exists() and existing_result(destination, session_id, digest):
                 return ImportResult("already_imported", session_id, digest, str(destination))
+            raw_entries = [entry for entry in manifest["files"] if entry["role"] == "raw"]
+            duplicate = canonical_raw_duplicate(root, session_id, raw_entries)
             quality = decode_archive(stage, manifest, limits)
-            conflict = destination.exists()
+            conflict = destination.exists() or duplicate is not None
             status = "conflict" if conflict else "imported"
             if conflict:
                 destination = root / "conflicts" / session_id / digest
@@ -344,11 +382,18 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
                     require(existing_result(destination, session_id, digest), "existing conflict archive is inconsistent")
                     return ImportResult("conflict", session_id, digest, str(destination))
             artifacts = {p.relative_to(stage).as_posix(): sha256(p) for p in stage.rglob("*") if p.is_file()}
-            write_json(stage / "import.json", {"importer_version": __version__, "session_id": session_id,
+            receipt = {"importer_version": __version__, "session_id": session_id,
                        "zip_sha256": digest, "status": status, "analysis_status": quality["analysis_status"],
-                       "artifacts": artifacts})
+                       "artifacts": artifacts}
+            if duplicate is not None:
+                receipt.update(conflict_reason="raw_content_shared_across_sessions",
+                               duplicate_of=duplicate["session_id"],
+                               duplicate_raw_sha256=duplicate["raw_sha256"])
+            write_json(stage / "import.json", receipt)
             publish(stage, destination)
             return ImportResult(status, session_id, digest, str(destination))
+        except ResearchStoreIntegrityError:
+            raise
         except (ValidationError, zipfile.BadZipFile, zlib.error, EOFError, RuntimeError, UnicodeError) as error:
             rejected = None
             if digest is not None:

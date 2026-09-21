@@ -2,7 +2,7 @@
 
 本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录及 IMU/PPG CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)及[功能规格](../../specs/independent-step-collection/requirements.md)。
 
-当前导入器版本为 **0.2.1**，可用 `python -m backend.ringo_data --version` 查询。该版本统一公开版本与导入回执，补齐 START→STOP→最终记录的计数顺序及恢复证据同连接校验；拒绝未知嵌套字段和非法时区。ZIP 目录在完整加载前按流检查条目配额，异常云端文件名或地址按文件报告并继续后续条目。索引遇到记录目录损坏、复制导致的身份不符或产物校验失败时保留上一次完整文件。
+当前导入器版本为 **0.2.2**，可用 `python -m backend.ringo_data --version` 查询。该版本在0.2.1契约上增加云端对象下载前后身份复核，并将跨session复用相同原始文件的后到包隔离到冲突目录，避免重复进入研究索引。重复归属只采用已经核对回执、原ZIP和全部产物的既有session；相关既有session损坏时报告研究库完整性错误，新包保持可重试。既有计数顺序、恢复证据、ZIP配额和损坏索引保护继续生效。
 
 本轮证据与适用范围见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
 
@@ -46,7 +46,7 @@ python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.
 
 ## 输入与输出
 
-新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。当前新冻结包采用 `version=7`：v6在v4/v5的活动和恢复语义上补齐原版的佩戴拆分字段、App版本和包创建时间，v7继续增加停止来源和停止观察时间。走跑包使用 `activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
+新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。新云端包分别命名为`ringfitness-session-walking-<session_id>.zip`和`ringfitness-session-running-<session_id>.zip`；名称便于人工辨认，导入器仍以包内经校验的`manifest.activity_code`为权威。历史无活动前缀的`ringfitness-session-<session_id>.zip`继续兼容且不改名。当前新冻结包采用 `version=7`：v6在v4/v5的活动和恢复语义上补齐原版的佩戴拆分字段、App版本和包创建时间，v7继续增加停止来源和停止观察时间。走跑包使用 `activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
 
 历史 `version=2/3` 包继续采用 `daily_activity_v2/free_living`，v4保留走跑任务声明，v5保留未知日期兼容证据；这些已冻结包保持原有字段与含义。所有版本均要求 `step_schema_version=1`、`rfbin_version=2`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
 
@@ -76,7 +76,7 @@ python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.
   rejected/<zip_sha256>/
 ```
 
-校验与派生在同卷暂存目录执行，文件同步后一次重命名发布。相同 ID、相同 ZIP 返回既有结果，并复核原包及派生产物；相同 ID、不同 ZIP 保留双方并报告冲突。拒收包保存在独立目录，原输入保持不变。Windows 使用文件同步与同卷目录重命名；整机断电后的目录持久性仍需系统级验证。
+校验与派生在同卷暂存目录执行，文件同步后一次重命名发布。相同 ID、相同 ZIP 返回既有结果，并复核原包及派生产物；相同 ID、不同 ZIP 保留双方并报告冲突。不同 session 若与 canonical session 共享原始文件 SHA-256，后到包完整保留在冲突目录，回执以 `duplicate_of` 指向 canonical session，且不进入 session 索引。拒收包保存在独立目录，原输入保持不变。Windows 使用文件同步与同卷目录重命名；整机断电后的目录持久性仍需系统级验证。
 
 ## 时间、活动标签与质量边界
 

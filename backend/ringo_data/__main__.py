@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
-from .importer import ArchiveRejected, Limits, import_archive, summarize
+from .importer import ArchiveRejected, Limits, ResearchStoreIntegrityError, import_archive, summarize
 from .schema import ValidationError
 from .sync import DirectorySync
 from .cloud import CloudConfig, CloudSync
@@ -98,6 +98,10 @@ def main(argv=None):
             result = import_archive(archive, args.output, limits)
             print(json.dumps(asdict(result), ensure_ascii=False))
             failed |= result.status == "conflict"
+        except ResearchStoreIntegrityError as error:
+            failed = True
+            print(json.dumps({"status": "research_store_error", "reason": str(error),
+                              "retryable": True}, ensure_ascii=False), file=sys.stderr)
         except (ValidationError, OSError) as error:
             failed = True
             print(json.dumps({"status": "rejected", "reason": str(error),

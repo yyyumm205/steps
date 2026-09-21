@@ -181,6 +181,21 @@ class CloudDownloader:
         except ValidationError:
             raise CloudSyncError("cloud metadata response is invalid") from None
 
+    def _listing(self, token):
+        query = urllib.parse.urlencode({"p": self.config.remote_path})
+        listing = self._json(f"{self.config.base_url}/api2/repos/{self.config.repo_id}/dir/?{query}", token)
+        require(type(listing) is list and len(listing) <= self.config.max_files,
+                "cloud directory listing exceeds quota or has an invalid shape")
+        return listing
+
+    def _confirm_remote_file(self, token, expected):
+        matches = []
+        for candidate in self._listing(token):
+            candidate = object_value(candidate, "cloud directory entry")
+            if candidate.get("type") == "file" and candidate.get("name") == expected[0]:
+                matches.append((candidate.get("name"), candidate.get("id"), candidate.get("size")))
+        require(matches == [expected], "cloud file changed during download; retry the current remote object")
+
     def _state(self):
         try:
             if not self.state_path.exists():
@@ -243,9 +258,7 @@ class CloudDownloader:
     def _poll_locked(self):
         state = self._state()
         token = self.token_reader(self.config.account_db, self.config.base_url)
-        query = urllib.parse.urlencode({"p": self.config.remote_path})
-        listing = self._json(f"{self.config.base_url}/api2/repos/{self.config.repo_id}/dir/?{query}", token)
-        require(type(listing) is list and len(listing) <= self.config.max_files, "cloud directory listing exceeds quota or has an invalid shape")
+        listing = self._listing(token)
         events = []
         for row in listing:
             try:
@@ -275,7 +288,8 @@ class CloudDownloader:
                 path_query = urllib.parse.urlencode({"p": remote})
                 address = self._json(f"{self.config.base_url}/api2/repos/{self.config.repo_id}/file/?{path_query}", token)
                 trusted_url(address)
-                digest = self._download(address, size)
+                expected = (name, remote_id, size)
+                digest = self._download(address, size, lambda: self._confirm_remote_file(token, expected))
                 state["files"][identity] = {"sha256": digest, "bytes": size}
                 self._save(state)
                 events.append({"status": "downloaded", "sha256": digest, "bytes": size})
@@ -285,7 +299,7 @@ class CloudDownloader:
                 events.append({"status": "download_error", "reason": reason})
         return {"files": events, "failed": any(e["status"] == "download_error" for e in events)}
 
-    def _download(self, address, size):
+    def _download(self, address, size, before_publish=None):
         fd, name = tempfile.mkstemp(prefix=".cloud-download-", suffix=".part", dir=self.config.local_inbox)
         temporary = Path(name)
         try:
@@ -308,6 +322,8 @@ class CloudDownloader:
                 os.fsync(target.fileno())
             require(zipfile.is_zipfile(temporary), "download is not a complete ZIP; source retained")
             checksum = digest.hexdigest()
+            if before_publish is not None:
+                before_publish()
             final = self.config.local_inbox / ("cloud-" + checksum + ".zip")
             if final.exists():
                 require(final.is_file() and not final.is_symlink() and sha256(final) == checksum, "existing local cloud file is damaged; retained for review")
