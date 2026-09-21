@@ -817,6 +817,31 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun savedFinishReferenceContinuesWithoutReplacingItsValueOrUploadChoice() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            for (policy in listOf(CompletionPolicy.SAVE_UPLOAD, CompletionPolicy.SAVE_LATER)) {
+                for (available in listOf(true, false)) {
+                    val session = renderingSession(preparation).copy(
+                        reference = SessionReference(ReferenceStatus.VALID, 0, 4_000), completionPolicy = policy)
+                    val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.FINISH,
+                        isSimulation = false, uploadAvailable = available, hasProfile = true,
+                        participantId = preparation.participantId, placement = preparation.placement, session = session))
+                    renderFixture(scenario, fixture)
+                    scenario.onActivity { activity ->
+                        assertNull(taggedOrNull<EditText>(activity, "flow_steps"))
+                    }
+                    click(scenario, "flow_primary")
+                    assertEquals(1, fixture.retries)
+                    assertNull(fixture.finalizedReference)
+                    assertNull(fixture.savedReference)
+                    assertEquals(session, fixture.state.session)
+                }
+            }
+        }
+    }
+
     @Test fun pendingRecordInformationKeepsReferenceDraftOnTheSamePage() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)
@@ -1114,6 +1139,130 @@ class CollectionFlowInstrumentedTest {
                 }
             }
         } }
+    }
+
+    @Test fun bothEmptySaveActionsExplainTheMissingInputAndZeroStillSaves() {
+        for (saveTag in listOf("flow_primary", "finish_defer")) withFlow { handle ->
+            launch().use { scenario ->
+                register(scenario)
+                val id = reachReference(scenario, handle)
+                val before = session(handle)
+                scenario.onActivity { activity ->
+                    val buttons = listOf("flow_primary", "finish_defer", "finish_discard").map {
+                        tagged<Button>(activity, it)
+                    }
+                    assertTrue(buttons.all { it.parent === buttons.first().parent })
+                    assertEquals(buttons[0].left, buttons[1].left)
+                    assertEquals(buttons[0].width, buttons[1].width)
+                    assertEquals(buttons[0].width, buttons[2].width)
+                    assertTrue(buttons[0].bottom <= buttons[1].top && buttons[1].bottom <= buttons[2].top)
+                    assertTrue(buttons.take(2).all { it.lineCount == 1 })
+                }
+                click(scenario, saveTag)
+                await(scenario, "empty steps explain what to fill") {
+                    tagged<TextView>(it, "finish_input_error").text.toString() == "请先填写计步器总步数" &&
+                        tagged<EditText>(it, "flow_steps").hasFocus() &&
+                        it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+                }
+                assertEquals(before, session(handle))
+                scenario.onActivity { activity ->
+                    val field = tagged<EditText>(activity, "flow_steps")
+                    val error = tagged<TextView>(activity, "finish_input_error")
+                    val rect = android.graphics.Rect()
+                    assertTrue(field.getGlobalVisibleRect(rect))
+                    assertEquals(field.height, rect.height())
+                    assertTrue(error.getGlobalVisibleRect(rect))
+                    assertEquals(error.height, rect.height())
+                }
+                captureReviewScreen(scenario, "finish_empty_steps")
+                type(scenario, "flow_steps", "0")
+                scenario.onActivity { activity ->
+                    assertEquals(View.GONE, tagged<TextView>(activity, "finish_input_error").visibility)
+                    activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
+                        .hideSoftInputFromWindow(tagged<EditText>(activity, "flow_steps").windowToken, 0)
+                }
+                await(scenario, "keyboard hidden before choosing save") {
+                    !it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+                }
+                scenario.onActivity { activity ->
+                    val button = tagged<Button>(activity, "finish_discard")
+                    button.requestRectangleOnScreen(android.graphics.Rect(0, 0, button.width, button.height), true)
+                    for (tag in listOf("flow_primary", "finish_defer", "finish_discard")) {
+                        val action = tagged<Button>(activity, tag)
+                        val rect = android.graphics.Rect()
+                        assertTrue(action.getGlobalVisibleRect(rect))
+                        assertEquals(action.height, rect.height())
+                    }
+                }
+                captureReviewScreen(scenario, "finish_aligned_actions")
+                click(scenario, saveTag)
+                awaitHeading(scenario, "这一段已保存")
+                assertEquals(id, session(handle).sessionId)
+                assertEquals(0L, session(handle).reference!!.steps)
+                assertEquals(if (saveTag == "finish_defer") CompletionPolicy.SAVE_LATER else CompletionPolicy.SAVE_UPLOAD,
+                    session(handle).completionPolicy)
+            }
+        }
+    }
+
+    @Test fun missingReferencePromptsForItsReasonAndCanSaveWithoutSteps() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario); reachReference(scenario, handle)
+            chooseReferenceKind(scenario, "missing")
+            val before = session(handle)
+            click(scenario, "finish_defer")
+            await(scenario, "missing reference focuses required reason") {
+                tagged<TextView>(it, "finish_input_error").text.toString() == "请填写读数异常的原因" &&
+                    tagged<EditText>(it, "flow_reason").hasFocus()
+            }
+            assertEquals(before, session(handle))
+            type(scenario, "flow_reason", "计步器意外归零")
+            click(scenario, "finish_defer")
+            awaitHeading(scenario, "这一段已保存")
+            assertEquals(ReferenceStatus.MISSING, session(handle).reference!!.status)
+            assertNull(session(handle).reference!!.steps)
+            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
+        }
+    }
+
+    @Test fun unreliableReferenceExplainsEachRequiredFieldNextToItsInput() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario); reachReference(scenario, handle)
+            chooseReferenceKind(scenario, "unreliable")
+            val before = session(handle)
+            for ((fieldTag, message) in listOf(
+                "flow_steps" to "请先填写计步器总步数",
+                "flow_reason" to "请填写读数异常的原因",
+            )) {
+                click(scenario, "finish_defer")
+                await(scenario, "the required input and its own explanation are visible") { activity ->
+                    val field = tagged<EditText>(activity, fieldTag)
+                    val error = tagged<TextView>(activity, "finish_input_error")
+                    val visible = android.graphics.Rect()
+                    error.text.toString() == message && field.hasFocus() &&
+                        error.parent === field.parent && error.top == field.bottom &&
+                        field.getGlobalVisibleRect(visible) && visible.height() == field.height &&
+                        error.getGlobalVisibleRect(visible) && visible.height() == error.height &&
+                        activity.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())
+                }
+                assertEquals(before, session(handle))
+                if (fieldTag == "flow_steps") {
+                    type(scenario, "flow_reason", "先写原因")
+                    scenario.onActivity { activity ->
+                        assertEquals(View.VISIBLE, tagged<TextView>(activity, "finish_input_error").visibility)
+                        assertEquals(message, tagged<TextView>(activity, "finish_input_error").text.toString())
+                    }
+                    type(scenario, "flow_reason", "")
+                }
+                type(scenario, fieldTag, if (fieldTag == "flow_steps") "0" else "计步器中途松动")
+            }
+            click(scenario, "finish_defer")
+            awaitHeading(scenario, "这一段已保存")
+            assertEquals(ReferenceStatus.UNRELIABLE, session(handle).reference!!.status)
+            assertEquals(0L, session(handle).reference!!.steps)
+            assertEquals("计步器中途松动", session(handle).reference!!.reason)
+            assertEquals(CompletionPolicy.SAVE_LATER, session(handle).completionPolicy)
+        }
     }
 
     @Test fun failedReferenceCommitKeepsTheInputAndRetriesTheSameSession() = withFlow { handle ->
@@ -1581,13 +1730,13 @@ class CollectionFlowInstrumentedTest {
             scenario.onActivity { activity ->
                 val root = activity.window.decorView
                 val ime = root.rootWindowInsets.getInsets(android.view.WindowInsets.Type.ime()).bottom
-                val button = tagged<Button>(activity, "flow_primary")
+                val input = tagged<EditText>(activity, "flow_steps")
                 val visible = android.graphics.Rect()
-                assertTrue("The save action remains visible above the keyboard", button.getGlobalVisibleRect(visible))
-                assertEquals(button.height, visible.height())
+                assertTrue("The input remains visible above the keyboard", input.getGlobalVisibleRect(visible))
+                assertEquals(input.height, visible.height())
                 assertTrue(visible.bottom <= root.height - ime)
                 activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java)
-                    .hideSoftInputFromWindow(button.windowToken, 0)
+                    .hideSoftInputFromWindow(input.windowToken, 0)
             }
             await(scenario, "reference keyboard hidden") {
                 !it.window.decorView.rootWindowInsets.isVisible(android.view.WindowInsets.Type.ime())

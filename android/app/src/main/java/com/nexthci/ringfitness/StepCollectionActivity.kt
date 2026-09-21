@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
@@ -18,6 +19,7 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.widget.doAfterTextChanged
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,6 +39,8 @@ abstract class StepCollectionActivity : Activity() {
     private var placementPicker: Spinner? = null
     private var elapsedLabel: TextView? = null
     private var pageScroll: ScrollView? = null
+    private var finishInputError: TextView? = null
+    private var finishErrorField: EditText? = null
     private var imeWasVisible = false
     private var stepsDraft = ""
     private var reasonDraft = ""
@@ -156,6 +160,8 @@ abstract class StepCollectionActivity : Activity() {
             return
         }
         stepsInput = null; reasonInput = null; participantInput = null; placementPicker = null; elapsedLabel = null
+        finishInputError = null
+        finishErrorField = null
         val root = ui.column().apply {
             setBackgroundColor(ui.background)
             isFocusableInTouchMode = true
@@ -166,6 +172,11 @@ abstract class StepCollectionActivity : Activity() {
                 val imeVisible = insets.isVisible(WindowInsets.Type.ime())
                 if (imeWasVisible && !imeVisible) pageScroll?.post { pageScroll?.scrollTo(0, 0) }
                 imeWasVisible = imeVisible
+                if (imeVisible && finishInputError?.visibility == View.VISIBLE) {
+                    finishInputError?.post {
+                        (currentFocus as? EditText)?.let(::revealRequiredFinishInput)
+                    }
+                }
                 insets
             }
         }
@@ -601,6 +612,7 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun finishSession(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
+        // Keep the complete form scrollable when the keyboard or larger system text reduces space.
         title(body, "结束本段", "填写计步器显示的本次总数。")
         val summary = ui.card(body, ui.statusSurface)
         detail(summary, "活动", state.session?.activity?.label ?: "—")
@@ -631,6 +643,20 @@ abstract class StepCollectionActivity : Activity() {
                     setSingleLine(false); maxLines = 3; setText(reasonDraft)
                 }
             }
+            finishInputError = ui.text(input, "", 14f).apply {
+                tag = "finish_input_error"
+                setTextColor(ui.error)
+                visibility = View.GONE
+                accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            }
+            listOfNotNull(stepsInput, reasonInput).forEach { field ->
+                field.doAfterTextChanged {
+                    if (field === finishErrorField && !it.isNullOrBlank()) {
+                        finishInputError?.visibility = View.GONE
+                        finishErrorField = null
+                    }
+                }
+            }
             ui.button(input, when (referenceKind) {
                 "missing" -> "改为填写步数"
                 "unreliable" -> "读数有异常 · 修改"
@@ -641,42 +667,73 @@ abstract class StepCollectionActivity : Activity() {
             }
         }
 
+        val actions = ui.column(body)
         val fixedPolicy = state.session?.completionPolicy
         when {
-            !state.uploadAvailable -> action(footer, "保存到手机", !state.busy) {
+            !state.uploadAvailable -> action(actions, "保存到手机", !state.busy) {
                 submitFinish(fixedPolicy == CompletionPolicy.SAVE_UPLOAD)
             }
             fixedPolicy == CompletionPolicy.SAVE_UPLOAD ->
-                action(footer, "保存并上传", !state.busy) { submitFinish(true) }
+                action(actions, "保存并上传", !state.busy) { submitFinish(true) }
             fixedPolicy == CompletionPolicy.SAVE_LATER ->
-                action(footer, "保存，稍后上传", !state.busy) { submitFinish(false) }
+                action(actions, "保存，稍后上传", !state.busy) { submitFinish(false) }
             else -> {
-                action(footer, "保存并上传", !state.busy) { submitFinish(true) }
-                val secondary = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-                footer.addView(secondary, LinearLayout.LayoutParams(-1, -2))
-                ui.button(secondary, "保存，稍后上传", tag = "finish_defer") { submitFinish(false) }.apply {
+                action(actions, "保存并上传", !state.busy) { submitFinish(true) }
+                ui.button(actions, "保存，稍后上传", tag = "finish_defer") { submitFinish(false) }.apply {
                     isEnabled = !state.busy
-                    layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = ui.dp(6) }
-                }
-                ui.button(secondary, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
-                    isEnabled = !state.busy
-                    layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = ui.dp(6) }
                 }
             }
         }
-        if (fixedPolicy != null || !state.uploadAvailable) {
-            ui.button(footer, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
-                isEnabled = !state.busy
-                background = ui.linkBackground()
-            }
+        ui.button(actions, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
+            isEnabled = !state.busy
+            background = ui.linkBackground()
+            minHeight = ui.dp(48); minimumHeight = ui.dp(48)
         }
     }
 
     private fun submitFinish(uploadNow: Boolean) {
         rememberDrafts()
+        if (current?.session?.reference != null) {
+            hideKeyboard()
+            if (current?.session?.completionPolicy != null) flow.retry()
+            else flow.chooseFinish(uploadNow)
+            return
+        }
+        if (referenceKind != "missing" && stepsDraft.isBlank()) {
+            showRequiredFinishInput(stepsInput, "请先填写计步器总步数")
+            return
+        }
+        if (referenceKind != "valid" && reasonDraft.isBlank()) {
+            showRequiredFinishInput(reasonInput, "请填写读数异常的原因")
+            return
+        }
         hideKeyboard()
         flow.finalizeSession(uploadNow, stepsDraft, referenceKind,
             if (referenceKind == "valid") "" else reasonDraft)
+    }
+
+    private fun showRequiredFinishInput(field: EditText?, message: String) {
+        finishErrorField = field
+        finishInputError?.apply {
+            val input = field?.parent as? LinearLayout
+            if (input != null) {
+                (parent as? ViewGroup)?.removeView(this)
+                input.addView(this, input.indexOfChild(field) + 1)
+            }
+            text = message
+            visibility = View.VISIBLE
+        }
+        field?.apply {
+            requestFocus()
+            getSystemService(InputMethodManager::class.java).showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
+            post { revealRequiredFinishInput(this) }
+        }
+    }
+
+    private fun revealRequiredFinishInput(field: EditText) {
+        val errorBottom = finishInputError?.takeIf { it.parent === field.parent }?.bottom ?: field.bottom
+        field.requestRectangleOnScreen(android.graphics.Rect(0, 0, field.width,
+            maxOf(field.height, errorBottom - field.top)), true)
     }
 
     private fun showDiscardConfirmation() {
