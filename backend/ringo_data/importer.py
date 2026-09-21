@@ -339,7 +339,7 @@ def publish(stage, destination):
     sync_directory(destination.parent)
 
 
-def import_archive(source: Path, root: Path, limits: Limits | None = None) -> ImportResult:
+def import_archive(source: Path, root: Path, limits: Limits | None = None, *, expected_archive=None) -> ImportResult:
     limits = limits or Limits()
     source, root = local_path(source), local_path(root)
     require(source.is_file() and 0 < source.stat().st_size <= limits.archive_bytes, "archive size quota exceeded")
@@ -354,12 +354,22 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
             with source.open("rb") as inp, frozen.open("xb") as out:
                 for chunk in iter(lambda: inp.read(1024 * 1024), b""):
                     count += len(chunk)
+                    if expected_archive is not None and count > expected_archive[1]:
+                        raise ResearchStoreIntegrityError(
+                            "registered cloud archive changed before import; restore or download it again"
+                        )
                     require(count <= limits.archive_bytes, "archive grew beyond size quota")
                     h.update(chunk)
                     out.write(chunk)
                 out.flush()
                 os.fsync(out.fileno())
             digest = h.hexdigest()
+            if expected_archive is not None:
+                expected_digest, expected_bytes = expected_archive
+                if count != expected_bytes or digest != expected_digest:
+                    raise ResearchStoreIntegrityError(
+                        "registered cloud archive changed before import; restore or download it again"
+                    )
             check_zip_directory(frozen, limits.entries)
             with zipfile.ZipFile(frozen) as archive:
                 entries = inspect_zip(archive, limits)
@@ -369,8 +379,14 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
             (stage / "manifest.json").write_bytes(manifest_bytes)
             session_id = manifest["session_id"]
             destination = root / "sessions" / session_id
-            if destination.exists() and existing_result(destination, session_id, digest):
-                return ImportResult("already_imported", session_id, digest, str(destination))
+            if destination.exists():
+                try:
+                    if existing_result(destination, session_id, digest):
+                        return ImportResult("already_imported", session_id, digest, str(destination))
+                except (OSError, ValidationError) as error:
+                    raise ResearchStoreIntegrityError(
+                        f"existing canonical session integrity error ({session_id}): {error}"
+                    ) from error
             raw_entries = [entry for entry in manifest["files"] if entry["role"] == "raw"]
             duplicate = canonical_raw_duplicate(root, session_id, raw_entries)
             quality = decode_archive(stage, manifest, limits)
@@ -379,7 +395,13 @@ def import_archive(source: Path, root: Path, limits: Limits | None = None) -> Im
             if conflict:
                 destination = root / "conflicts" / session_id / digest
                 if destination.exists():
-                    require(existing_result(destination, session_id, digest), "existing conflict archive is inconsistent")
+                    try:
+                        require(existing_result(destination, session_id, digest),
+                                "existing conflict archive is inconsistent")
+                    except (OSError, ValidationError) as error:
+                        raise ResearchStoreIntegrityError(
+                            f"existing conflict artifact integrity error ({session_id}/{digest}): {error}"
+                        ) from error
                     return ImportResult("conflict", session_id, digest, str(destination))
             artifacts = {p.relative_to(stage).as_posix(): sha256(p) for p in stage.rglob("*") if p.is_file()}
             receipt = {"importer_version": __version__, "session_id": session_id,

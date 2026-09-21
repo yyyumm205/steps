@@ -1,6 +1,6 @@
 # 独立计步实验 App：分段采集验收与证据
 
-依据：[总纲](../../CONSTITUTION.md)3.6.0、[需求](requirements.md)、[计划](plan.md)。当前开发版为0.8.3-ui-flow（45），界面收敛与离线用户名验证见E30；走路／跑步独立文件包及后端完整性见E29。顶层检查项描述当前走路/跑步分段及三种收尾；历史证据保留原版本的运行结果和适用范围，未执行项保持待执行。
+依据：[总纲](../../CONSTITUTION.md)3.6.0、[需求](requirements.md)、[计划](plan.md)。当前开发版为0.8.4-recovery（46），恢复修复与发布矩阵见E31；界面收敛与离线用户名见E30，走路／跑步独立文件包见E29。顶层检查项描述当前走路/跑步分段及三种收尾；历史证据保留原版本的运行结果和适用范围，未执行项保持待执行。
 
 现行交付口径（2026-09-21用户确认）：以被试可正常使用、研究端正确读回为开发验收终点，取消独立试运行阶段和预设采集天数；真实设备、关键恢复、长时及独立操作检查继续执行，交付公布已验证设备、时长和限制。历史记录中的试用安排保留为当时背景，实际完成状态以对应证据为准。
 
@@ -10,7 +10,7 @@
 
 | 验收项 | 目标行为 | 当前状态 |
 | --- | --- | --- |
-| 首次与日常入口 | 首次为用户名→选戒指；日常冷开直达唯一首页，无“准备完成→进入采集”中转 | 软件和模拟器已验证；真机原位更新待执行 |
+| 首次与日常入口 | 首次为用户名→选戒指；日常冷开直达唯一首页，无“准备完成→进入采集”中转 | 软件和模拟器已验证；E30真机原位更新与首页展示通过，完整首次操作仍待实机验收 |
 | 用户与佩戴 | 单一用户名直接作为数据编号；更换回来、退出重登及跨安装保持同名编号；六种位置首次选后记住；空闲时可更换 | 软件回归通过；模拟器和设备范围见E30 |
 | 设备状态 | 查询超时与取消连接在首页设备行更新；电量/固件缺失不伪装成采集失败 | 实施中 |
 | 采集页 | 开始确认、采集中、停止确认原位切换；用户可离页，服务继续；无内部错误码和技术原因输入 | 模拟器覆盖；真实后台与停止时序继续待验 |
@@ -877,6 +877,29 @@ Controller首轮新增的2项测试在修复前均失败；修复后一次超时
 - 当前上传连接／读写／总期限短于原版，严格回执校验强于原版；回执完整性增强继续保留，网络期限须用真实包和弱网定稿。
 
 UI静态审查发现的连接／ready冲突、忙碌时管理入口、重复设置入口、禁用加载假按钮及冷启动空登记表已完成软件修复和模拟器回归；基础首页与记录展示的真机结果补见E30，完整操作仍待核对。候选列表RSSI、设备详情电量／固件、部分恢复出口、完整记录工具保持未对齐。不可达但仍参与编译的旧MainActivity和RingPreparationController只作原版参考，不计入当前App可操作范围；旧服务从正式包隔离前仍是交付缺口。
+
+## E31：发布核对与在途恢复（2026-09-21）
+
+结论：当前仍为开发验收版本，暂未达到正式被试发放条件。本轮Android 0.8.4-recovery（46）、导入器0.2.3围绕在途恢复和研究端故障隔离，保留既有实验规则与原始数据。下表将已有软件证据与发布前实物证据分开。
+
+| 验收路径 | 本轮已执行／已知结果 | 正式发放前必须补齐 |
+| --- | --- | --- |
+| 页面与操作 | API31基线六类instrumentation运行64项，63通过、按需截图目录导出1项跳过，失败0；0.8.4定向17项全部通过。另在720×1280、320dpi、字体130%运行正常保存／重开、暂缓后手动上传、取消及确认放弃3项，全部通过；截图确认填数键盘上方保存按钮完整可见。涵盖返回、重开、重复点击、用户切换门禁、零步／异常读数、保存失败、下载重试与草稿保留 | 由测试者独立完成真实走路、跑步及三种收尾；更多字号／屏幕、权限拒绝后设置恢复、离线记录入口；状态文案须与当前保存和设备证据一致 |
+| 不同手机与戒指 | 既有华为API31、三星API34和两枚戒指有历史短采／连接记录；本轮尚无多设备组合完整通过结论。软件保持session创建时的用户、佩戴与戒指快照；断连修复不更换目标戒指 | 对首批实际型号逐一验首次授权、更新、锁屏后台、同用户换手机、同手机换用户、空闲换戒指和未保存时误切换；不同固件的STATUS长度、校时、Flash覆盖和STOP尾部证据。不得把单机通过外推为全部Android支持 |
+| BLE与下载恢复 | 新增5项故障测试：多于三次超时、连接被拒／权限异常、保存0后下载断点恢复、重复／迟到回调和手动重连竞争、空闲／关闭停止自动尝试。初始3项在旧代码失败，修复后Controller 87项及完整JVM 579项通过 | 真实采集中关开蓝牙、远离后返回、下载中断、进程与整机重启；同session、原文件、步数保持一致且START不增加。`unix_ms=0`记录的跨连接下载仍可能被门禁卡住，属于待修阻断；不得直接省略归属校验 |
+| 网络、打包与上传 | 既有测试覆盖独立走跑ZIP、暂缓跨重开、5次自动重试、回执持久化、坏任务隔离和旧包字节稳定 | Wi-Fi无外网、Wi-Fi／移动数据切换、HTTP传输中断、服务器已存但回执丢失、暂缓后手动上传、手机重启；两份真实云端对象及Python自动读回逐包对SHA、活动、用户、参考。后端能去重重命名副本，不等于手机端重传回执已验收 |
+| 后端导入与隔离 | 同session及冲突目录的既有产物损坏改为可重试研究库错误，修复后同一进程可继续；正常新包仍处理。云端回执的SHA／长度绑定到扫描快照及导入器最终冻结副本，两处同尺寸合法ZIP替换及冻结时扩容均被阻断，恢复原包后同实例重试通过。全量pytest 515项通过，0失败、0跳过；独立复核通过 | 损坏既有manifest隐藏重复raw归属的路径仍须修复。原始ZIP、拒收/冲突原因和研究索引应可追溯，异常不能静默改成正常 |
+| 长时与最终交付 | Debug、AndroidTest、Release构建及lintVitalRelease通过；Release当前仍为未签名产物，日常体验APK为Debug | 确认单次最长使用时长，逐级实测电量、存储、样本覆盖、下载上传耗时、后台和重启恢复；补通知权限、电池限制、可靠导出、最终签名与可升级安装包。固定已验证手机／固件／时长和操作说明后交付 |
+
+Android自动恢复沿用原版约3秒节奏，由现有采集owner单独调度；连接立即失败也进入同一恢复路径。相同失效连接只排一个计时器，手动连接及owner关闭使旧任务失效。恢复先查STATUS/LIST，START/STOP次数与既有规则不变；空闲页不增加无限重连。独立审查未发现本diff新增阻断，核对了重复／迟到回调、手动竞争、任务结束后停止尝试及不重发控制命令。
+
+后端独立审查确认既有产物损坏走可重试路径，无关健康包继续处理；另发现扫描快照验证之后、导入器重新复制之前的内容替换窗口。已将回执期望值传至`import_archive`，在其冻结`source.zip`后、解析及发布前复核长度与SHA，并补直接替换临时快照的回归；修复后复审通过。既有异常读数保存时序与schema规则保持不变。
+
+历史2步、73步的两份真实冻结包由0.2.3导入独立验收目录：首次均为`imported`，重复均为`already_imported`，session索引仍为两条；参考值与session对应，四份IMU／PPG CSV均含数据。输入ZIP前后SHA不变，研究目录`source.zip`与输入SHA逐包相同，导入回执版本正确。该检查复用既有本地原包，证明解码、参考和幂等回归；本轮没有重新上传或获取新的云端回执，亦未改变原有时间质量结论。
+
+三星SM-F7310（API34）从0.8.3原位安装0.8.4，前后78个文件哈希一致，版本与启动检查通过，崩溃缓冲区为空。实际首页从连接中进入可重试的未连接状态，既有记录仍可见；戒指未就绪，本轮未新发START／STOP或声称在途真机恢复通过。设备读取发现通知权限未授予，需纳入后台验收。APK SHA-256为`675bdca1aefa295ca11146c5d1b3361ab2774727de03486dd8990759b378d535`。
+
+复现：Android目录执行`gradlew.bat testDebugUnitTest assembleDebug assembleDebugAndroidTest assembleRelease lintVitalRelease`。模拟器基线六类为`PreparationNavigationInstrumentedTest`、`CollectionFlowInstrumentedTest`、`RealCollectionBridgeInstrumentedTest`、`PreparationInstrumentedTest`、`FreeLivingSessionStoreInstrumentedTest`、`CaptureFileInstrumentedTest`，统一包前缀`com.nexthci.ringfitness`，运行器和两个显式开关沿用E30。0.8.4定向选择完整`RealCollectionBridgeInstrumentedTest`及`CollectionFlowInstrumentedTest`的`disconnectAndReconnectKeepTheSameCollectingTaskAndRestoreItsStopAction`、`downloadFailureUpdatesHomeInPlaceAndRetryFinishesTheOriginalSavedReference`、`unconfirmedStopReferenceHomeKeepsItsWarningAndReturnsWithoutConfirmingTheDevice`，添加`captureFlowScreens=true`。放大字体检查先读取并临时设置模拟器`settings system font_scale=1.3`，运行该类的`complete562PathSavesRealFilesAndReceiptThenReopensTheSameResult`、`deferredSaveReopensWithTheSameZeroAndOnlyUploadsFromTheRecordAction`、`discardConfirmationCanBeCancelledThenRemovesOnlyTheSelectedStoppedSession`，结束后恢复原字体设置。后端运行`python -m pytest backend/ringo_data/tests -q`。截图和原始日志留在本地，模拟器中的设备和网络为测试替身。
 
 ## E30：单一用户名与界面收敛（2026-09-21）
 

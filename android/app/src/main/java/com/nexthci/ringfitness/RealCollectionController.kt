@@ -79,7 +79,7 @@ class RealCollectionController(
     private var unknownPreservation: UnknownPreservation? = null
     private var unknownReadGeneration: Long? = null
     private var downloadTimeout = 0L
-    private var reconnectCount = 0
+    private var reconnectScheduledGeneration: Long? = null
     private var closed = false
     private var saving = false
     private var selectedActivity: SessionActivity? = null
@@ -200,8 +200,8 @@ class RealCollectionController(
     }
 
     fun onConnected(connection: Long) = safely {
-        if (closed || connection != generation || connected) return@safely
-        connected = true; connecting = false; reconnectCount = 0
+        if (closed || connection != generation || connected || !connecting) return@safely
+        connected = true; connecting = false; reconnectScheduledGeneration = null
         query = null; readinessWait = null
         coordinator.onConnected(requireNotNull(profile?.ring).address, connection)
         endStartAttemptReason?.let { reason ->
@@ -232,12 +232,19 @@ class RealCollectionController(
         stopEvidenceGeneration = null
         closeDownload()
         coordinator.onDisconnected(connection)
+        scheduleReconnect()
         publish(pendingReferencePage() ?: CollectionPage.RECOVERY, message)
-        if (store.readPending() != null && reconnectCount < 3) {
-            val failedGeneration = generation
-            reconnectCount++
-            scheduler.schedule(3000) {
-                if (!closed && generation == failedGeneration && !connected && !connecting) safely { connect() }
+    }
+
+    /** One timer per retired connection; only unfinished local work keeps recovery alive. */
+    private fun scheduleReconnect() {
+        if (store.readPending() == null || reconnectScheduledGeneration == generation) return
+        val failedGeneration = generation
+        reconnectScheduledGeneration = failedGeneration
+        scheduler.schedule(RECONNECT_DELAY_MS) {
+            if (!closed && generation == failedGeneration && reconnectScheduledGeneration == failedGeneration) safely {
+                reconnectScheduledGeneration = null
+                if (!connected && !connecting && store.readPending() != null) connect()
             }
         }
     }
@@ -755,11 +762,12 @@ class RealCollectionController(
     }
     override fun setFault(fault: FlowTestFault) = Unit
     override fun disconnect() = Unit // A page cannot tear down the collection connection.
-    override fun reconnect() = safely { browsingHome = false; reconnectCount = 0; connect() }
+    override fun reconnect() = safely { browsingHome = false; connect() }
 
     private fun connect() {
         unknownPreservation = null
         if (connecting) return
+        reconnectScheduledGeneration = null
         abortPrecheck = null; abortWaitOperation = null; abortHighWater = null; abortCandidateInvalidated = false
         devicePreparationRequired = false
         timeRound = null; startingClockEvidence = null; boundClockEvidence = null
@@ -771,7 +779,14 @@ class RealCollectionController(
         port.disconnect()
         publish(pendingReferencePage() ?: if (store.readPending() == null) CollectionPage.HOME else CollectionPage.RECOVERY,
             "正在连接戒指")
-        check(port.connect(requireNotNull(profile?.ring), id)) { "连接未成功，请检查手机蓝牙" }
+        val accepted = try { port.connect(requireNotNull(profile?.ring), id) } catch (error: Exception) {
+            reportError(error)
+            false
+        }
+        if (!accepted) {
+            onDisconnected(id, "连接未成功，请检查手机蓝牙")
+            return
+        }
         scheduler.schedule(30_000) {
             if (!closed && generation == id && connecting) safely {
                 port.disconnect()
@@ -1191,7 +1206,8 @@ class RealCollectionController(
     fun close() {
         abortWaitOperation = null; abortHighWater = null; abortPrecheck = null
         unknownPreservation = null
-        closed = true; generation++; query = null; readinessWait = null; timeRound = null; startingClockEvidence = null
+        closed = true; generation++; reconnectScheduledGeneration = null
+        query = null; readinessWait = null; timeRound = null; startingClockEvidence = null
         coordinator.close()
         runCatching { closeDownload() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
         runCatching { port.disconnect() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
@@ -1292,6 +1308,7 @@ class RealCollectionController(
     }
 
     companion object {
+        internal const val RECONNECT_DELAY_MS = 3_000L
         internal const val READINESS_CHECK_LIMIT = 3
         internal const val READINESS_CHECK_INTERVAL_MS = 1_500L
     }

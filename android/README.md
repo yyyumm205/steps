@@ -1,10 +1,12 @@
 # RingFitness Android
 
-当前开发版：**步数采集 0.8.3-ui-flow（versionCode 45）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
+当前开发版：**步数采集 0.8.4-recovery（versionCode 46）**，应用ID为`com.nexthci.ringfitness.steps`。基于原版0.5.3继续开发，适用需求与下一项工作分别见[功能规格](../specs/independent-step-collection/requirements.md)和[执行计划](../specs/independent-step-collection/plan.md)。
 
 ## 当前可运行范围
 
 正常入口已接通：首次登记用户名与佩戴位置、选择/连接戒指、等待真实开始确认、后台采集、停止确认、整段计步器读数保存、原始文件下载校验、冻结ZIP和清华云盘上传。准备档案与采集记录使用独立App私有目录；单一前台采集服务管理BLE，独立上传服务管理网络任务。页面依据真实保存、设备证据和回执呈现结果。
+
+0.8.4-recovery恢复在途任务持续重连：蓝牙暂不可用、连接立即失败或多次超时后，仍尝试同一戒指；重复和旧连接回调不另建任务，恢复时核对原记录而不重发START。Android恢复、后端隔离和正式交付缺口见[validation E31](../specs/independent-step-collection/validation.md#e31发布核对与在途恢复2026-09-21)。本版保持开发验收状态，真实跨设备、下载中断、上传读回和长时矩阵仍须完成。
 
 0.8.3将准备信息与活动选择集中到首页，开始／采集中／结束确认复用同一页，读数及三种收尾复用同一页，下载与后台上传原位更新。首次只填一个3–24位英文字母或数字用户名，去除首尾空格并转为小写，直接作为新数据的`participant_id`。登记、更换与退出重登均可离线完成；研究者须为不同被试分配不同用户名。复用现有准备档案，无需账号服务器或历史用户名映射；既有测试资料保留，不做编号迁移。软件与设备的实际验证范围见E30。
 

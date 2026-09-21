@@ -193,6 +193,68 @@ def test_existing_artifact_damage_is_reported_without_overwriting_last_index(tmp
     assert index.read_bytes() == before
 
 
+def test_damaged_same_session_stays_retryable_while_other_good_archives_continue(tmp_path):
+    scanner, incoming, clock = scanner_at(tmp_path)
+    first = archive_at(incoming / "a.zip")
+    settled_scan(scanner, clock)
+    first_reference = scanner.output / "sessions" / first["session_id"] / "reference.csv"
+    original_reference = first_reference.read_bytes()
+    first_reference.write_text("damaged")
+
+    raw = distinct_raw(2)
+    second = archive_at(incoming / "b.zip", raw=raw, manifest=manifest_for(raw, 2))
+    scanner = DirectorySync(incoming, scanner.output, monotonic=clock)
+    failed = settled_scan(scanner, clock)
+
+    first_event = next(entry for entry in failed["files"] if entry["file"] == "a.zip")
+    second_event = next(entry for entry in failed["files"] if entry["file"] == "b.zip")
+    assert first_event["status"] == "error"
+    assert "existing canonical session integrity error" in first_event["reason"]
+    assert second_event["status"] == "imported"
+    assert (scanner.output / "sessions" / second["session_id"] / "source.zip").is_file()
+    assert not (scanner.output / "rejected").exists()
+
+    first_reference.write_bytes(original_reference)
+    retried = scanner.scan()
+    first_event = next(entry for entry in retried["files"] if entry["file"] == "a.zip")
+    assert first_event["status"] == "already_imported"
+    assert retried["index"]["status"] == "indexed"
+    assert retried["index"]["sessions"] == 2
+
+
+def test_damaged_conflict_stays_retryable_while_other_good_archives_continue(tmp_path):
+    scanner, incoming, clock = scanner_at(tmp_path)
+    first = archive_at(incoming / "a.zip")
+    settled_scan(scanner, clock)
+    archive_at(incoming / "b-conflict.zip", mutate=lambda manifest, _: manifest.update(ground_truth_steps=1))
+    conflict_result = settled_scan(scanner, clock)
+    conflict_event = next(entry for entry in conflict_result["files"] if entry["file"] == "b-conflict.zip")
+    conflict_reference = Path(conflict_event["directory"]) / "reference.csv"
+    original_reference = conflict_reference.read_bytes()
+    conflict_reference.write_text("damaged")
+
+    raw = distinct_raw(2)
+    second = archive_at(incoming / "c.zip", raw=raw, manifest=manifest_for(raw, 2))
+    scanner = DirectorySync(incoming, scanner.output, monotonic=clock)
+    failed = settled_scan(scanner, clock)
+
+    conflict_event = next(entry for entry in failed["files"] if entry["file"] == "b-conflict.zip")
+    good_event = next(entry for entry in failed["files"] if entry["file"] == "c.zip")
+    assert conflict_event["status"] == "error"
+    assert "existing conflict artifact integrity error" in conflict_event["reason"]
+    assert good_event["status"] == "imported"
+    assert (scanner.output / "sessions" / first["session_id"] / "source.zip").is_file()
+    assert (scanner.output / "sessions" / second["session_id"] / "source.zip").is_file()
+    assert not (scanner.output / "rejected").exists()
+
+    conflict_reference.write_bytes(original_reference)
+    retried = scanner.scan()
+    conflict_event = next(entry for entry in retried["files"] if entry["file"] == "b-conflict.zip")
+    assert conflict_event["status"] == "conflict"
+    assert retried["index"]["status"] == "indexed"
+    assert retried["index"]["sessions"] == 2
+
+
 def test_tampered_canonical_manifest_cannot_claim_new_raw_and_new_archive_retries(tmp_path, capsys):
     scanner, incoming, clock = scanner_at(tmp_path)
     first = archive_at(incoming / "a.zip")

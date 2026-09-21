@@ -330,6 +330,147 @@ def test_bound_inbox_imports_only_registered_hash_packages_and_leaves_unrelated_
     assert all(row["file"] != rendered_as_hash.name for row in result["local"]["files"])
 
 
+def test_registered_archive_replacement_before_snapshot_is_rejected_then_retries(tmp_path, monkeypatch):
+    approved = data_at(tmp_path, "approved.zip", number=1, steps=2)
+    replacement = data_at(tmp_path, "replacement.zip", number=2, steps=3)
+    width = max(len(approved), len(replacement))
+    approved += b"\0" * (width - len(approved))
+    replacement += b"\0" * (width - len(replacement))
+    assert len(approved) == len(replacement)
+
+    config = config_at(tmp_path)
+    http = FakeHttp([listing_for("one.zip", approved)], {"one.zip": approved})
+    service = reader(config, http)
+    cloud = service.downloader.poll()
+    archive = next(config.local_inbox.glob("*.zip"))
+
+    first = service._scan_registered(cloud)
+    assert first["files"][0]["status"] == "waiting"
+    observed_signature = service.scanner.observed[archive.name][0]
+
+    registered_files = service.downloader.registered_files
+
+    def verify_then_replace():
+        registered, errors = registered_files()
+        archive.write_bytes(replacement)
+        return registered, errors
+
+    from backend.ringo_data import sync
+    real_fingerprint = sync.fingerprint
+    monkeypatch.setattr(service.downloader, "registered_files", verify_then_replace)
+    monkeypatch.setattr(sync, "fingerprint",
+                        lambda path: observed_signature if Path(path).name == archive.name else real_fingerprint(path))
+
+    failed = service._scan_registered(cloud)
+    assert failed["files"] == [{
+        "file": archive.name,
+        "status": "error",
+        "reason": "registered cloud archive changed before import; restore or download it again",
+    }]
+    assert failed["index"]["sessions"] == 0
+    assert archive.read_bytes() == replacement
+    assert not (config.research_output / "sessions").exists()
+
+    archive.write_bytes(approved)
+    monkeypatch.setattr(service.downloader, "registered_files", registered_files)
+    monkeypatch.setattr(sync, "fingerprint", real_fingerprint)
+    resumed = service.once(sleep=lambda _: None)
+    assert not resumed["failed"]
+    assert resumed["local"]["files"][0]["status"] == "imported"
+    rows = read_rows(config.research_output / "session-index.csv")
+    assert len(rows) == 1 and rows[0]["ground_truth_steps"] == "2"
+
+
+def test_registered_snapshot_replacement_before_import_is_rejected_then_retries(tmp_path, monkeypatch):
+    approved = data_at(tmp_path, "approved.zip", number=1, steps=2)
+    replacement = data_at(tmp_path, "replacement.zip", number=2, steps=3)
+    width = max(len(approved), len(replacement))
+    approved += b"\0" * (width - len(approved))
+    replacement += b"\0" * (width - len(replacement))
+    assert len(approved) == len(replacement)
+
+    config = config_at(tmp_path)
+    http = FakeHttp([listing_for("one.zip", approved)], {"one.zip": approved})
+    service = reader(config, http)
+    cloud = service.downloader.poll()
+    archive = next(config.local_inbox.glob("*.zip"))
+    assert service._scan_registered(cloud)["files"][0]["status"] == "waiting"
+
+    from backend.ringo_data import sync
+    real_import = sync.import_archive
+
+    def replace_snapshot(source, output, limits, *, expected_archive=None):
+        Path(source).write_bytes(replacement)
+        return real_import(source, output, limits, expected_archive=expected_archive)
+
+    monkeypatch.setattr(sync, "import_archive", replace_snapshot)
+    failed = service._scan_registered(cloud)
+    assert failed["files"] == [{
+        "file": archive.name,
+        "status": "error",
+        "reason": "registered cloud archive changed before import; restore or download it again",
+    }]
+    assert failed["index"]["sessions"] == 0
+    assert archive.read_bytes() == approved
+    assert not (config.research_output / "sessions").exists()
+    assert not (config.research_output / "rejected").exists()
+
+    monkeypatch.setattr(sync, "import_archive", real_import)
+    resumed = service._scan_registered(cloud)
+    assert resumed["files"][0]["status"] == "imported"
+    assert not resumed["failed"]
+    rows = read_rows(config.research_output / "session-index.csv")
+    assert len(rows) == 1 and rows[0]["ground_truth_steps"] == "2"
+
+
+def test_registered_snapshot_growth_during_import_stays_retryable(tmp_path, monkeypatch):
+    from backend.ringo_data import importer, sync
+
+    approved = data_at(tmp_path, "approved.zip", number=1, steps=2)
+    config = config_at(tmp_path, max_archive_bytes=len(approved) + 1)
+    http = FakeHttp([listing_for("one.zip", approved)], {"one.zip": approved})
+    service = reader(config, http)
+    cloud = service.downloader.poll()
+    archive = next(config.local_inbox.glob("*.zip"))
+    assert service._scan_registered(cloud)["files"][0]["status"] == "waiting"
+
+    real_import = sync.import_archive
+    real_lock = importer.import_lock
+    active_snapshot = {}
+
+    @contextmanager
+    def grow_before_freeze(root):
+        with active_snapshot["path"].open("ab") as stream:
+            stream.write(b"xx")
+        with real_lock(root):
+            yield
+
+    def import_with_growth(source, output, limits, *, expected_archive=None):
+        active_snapshot["path"] = Path(source)
+        return real_import(source, output, limits, expected_archive=expected_archive)
+
+    monkeypatch.setattr(sync, "import_archive", import_with_growth)
+    monkeypatch.setattr(importer, "import_lock", grow_before_freeze)
+    failed = service._scan_registered(cloud)
+    assert failed["files"] == [{
+        "file": archive.name,
+        "status": "error",
+        "reason": "registered cloud archive changed before import; restore or download it again",
+    }]
+    assert failed["index"]["sessions"] == 0
+    assert archive.read_bytes() == approved
+    assert not service.scanner.processed
+    assert not (config.research_output / "rejected").exists()
+
+    monkeypatch.setattr(sync, "import_archive", real_import)
+    monkeypatch.setattr(importer, "import_lock", real_lock)
+    resumed = service._scan_registered(cloud)
+    assert resumed["files"][0]["status"] == "imported"
+    assert not resumed["failed"]
+    rows = read_rows(config.research_output / "session-index.csv")
+    assert len(rows) == 1 and rows[0]["ground_truth_steps"] == "2"
+
+
 def test_published_zip_without_receipt_waits_until_the_same_cloud_file_is_read_back(tmp_path, monkeypatch):
     data = data_at(tmp_path)
     config = config_at(tmp_path)

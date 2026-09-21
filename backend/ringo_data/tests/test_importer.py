@@ -11,7 +11,9 @@ import pytest
 
 from backend.ringo_data.__main__ import main
 from backend.ringo_data.health_raw_v2 import HEADER, MAGIC
-from backend.ringo_data.importer import ArchiveRejected, Limits, import_archive, sha256, summarize
+from backend.ringo_data.importer import (
+    ArchiveRejected, Limits, ResearchStoreIntegrityError, import_archive, sha256, summarize,
+)
 from backend.ringo_data.schema import ValidationError
 
 
@@ -197,8 +199,9 @@ def test_duplicate_rechecks_existing_derived_files(tmp_path):
     archive_at(source)
     result = import_archive(source, tmp_path / "out")
     (Path(result.directory) / "reference.csv").write_text("corrupt")
-    with pytest.raises(ArchiveRejected, match="artifact checksum"):
+    with pytest.raises(ResearchStoreIntegrityError, match="artifact checksum"):
         import_archive(source, tmp_path / "out")
+    assert not (tmp_path / "out" / "rejected").exists()
 
 
 @pytest.mark.parametrize("name", ["../escape", "/absolute", "C:drive", "nested/file", "nested\\file", "CON", "other.txt"])
@@ -428,8 +431,9 @@ def test_missing_derived_artifact_fails_duplicate_check(tmp_path):
     archive_at(source)
     result = import_archive(source, tmp_path / "out")
     (Path(result.directory) / "quality.json").unlink()
-    with pytest.raises(ArchiveRejected, match="inventory"):
+    with pytest.raises(ResearchStoreIntegrityError, match="inventory"):
         import_archive(source, tmp_path / "out")
+    assert not (tmp_path / "out" / "rejected").exists()
 
 
 def test_zip_compression_and_archive_size_quotas(tmp_path):

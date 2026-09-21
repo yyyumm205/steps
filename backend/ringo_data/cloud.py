@@ -223,7 +223,7 @@ class CloudDownloader:
 
     def registered_files(self):
         """Only verified receipts authorize an inbox ZIP to enter this research output."""
-        names, errors = set(), []
+        files, errors = {}, []
         with import_lock(self.config.local_inbox):
             state = self._state()
             for receipt in state["files"].values():
@@ -233,10 +233,10 @@ class CloudDownloader:
                 try:
                     require(path.is_file() and not path.is_symlink() and path.stat().st_size == receipt["bytes"] and
                             sha256(path) == digest, "registered local cloud file needs review")
-                    names.add(name)
+                    files[name] = (digest, receipt["bytes"])
                 except (ValidationError, OSError):
                     errors.append({"status": "download_error", "reason": "registered local cloud file needs review; original retained"})
-        return names, errors
+        return files, errors
 
     def _save(self, state):
         fd, name = tempfile.mkstemp(prefix=".cloud-receipt-", suffix=".tmp", dir=self.config.local_inbox)
@@ -343,9 +343,10 @@ class CloudSync:
     def __init__(self, config, http=None, token_reader=read_client_token):
         self.config = config
         self.downloader = CloudDownloader(config, http, token_reader)
-        self.registered = set()
+        self.registered = {}
         self.scanner = DirectorySync(config.local_inbox, config.research_output, stable_seconds=config.stable_seconds,
-                                     limits=Limits(archive_bytes=config.max_archive_bytes), include_file=lambda name: name in self.registered)
+                                     limits=Limits(archive_bytes=config.max_archive_bytes),
+                                     expected_file=lambda name: self.registered.get(name))
 
     @staticmethod
     def scope_error(error):

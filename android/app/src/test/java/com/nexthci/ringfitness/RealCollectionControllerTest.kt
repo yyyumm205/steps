@@ -1778,6 +1778,116 @@ class RealCollectionControllerTest {
         assertTrue(f.owner.state.canRetry)
     }
 
+    @Test fun pendingCaptureKeepsReconnectingAfterRepeatedBluetoothUnavailableResults() = Fixture().use { f ->
+        f.beginCollecting()
+        val original = f.store.readPending()!!
+        f.owner.onDisconnected(f.port.generation, "手机蓝牙已关闭")
+        repeat(6) { attempt ->
+            f.port.accept = {
+                if (it == "connect" && attempt % 2 == 1) throw SecurityException("Injected permission loss")
+                it != "connect"
+            }
+            f.runDelay(3_000)
+            assertFalse(f.owner.state.connecting)
+            assertTrue(f.owner.state.canRetry)
+            assertEquals(original.sessionId, f.store.readPending()!!.sessionId)
+        }
+        f.port.accept = { true }
+        f.runDelay(3_000)
+        f.owner.onConnected(f.port.generation)
+        f.observe(collecting(), listOf(initialRecord))
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertEquals(original.sessionId, f.store.readPending()!!.sessionId)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun pendingCaptureKeepsReconnectingBeyondThreeConnectionTimeouts() = Fixture().use { f ->
+        f.beginCollecting()
+        val id = f.store.readPending()!!.sessionId
+        f.owner.onDisconnected(f.port.generation, "戒指暂时不在附近")
+        repeat(6) {
+            f.runDelay(3_000)
+            assertTrue(f.owner.state.connecting)
+            f.runAllDelays(30_000)
+            assertFalse(f.owner.state.connected)
+            assertFalse(f.owner.state.connecting)
+            assertEquals(id, f.store.readPending()!!.sessionId)
+        }
+        f.runDelay(3_000)
+        f.owner.onConnected(f.port.generation)
+        f.observe(collecting(), listOf(initialRecord))
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun interruptedDownloadAutomaticallyResumesSavedZeroAfterBluetoothReturns() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("0", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        val id = f.store.readPending()!!.sessionId
+        val originalReference = f.store.readPending()!!.reference
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        f.owner.onDisconnected(f.port.generation, "手机蓝牙已关闭")
+        f.port.accept = { it != "connect" }
+        repeat(5) { f.runDelay(3_000) }
+        f.port.accept = { true }
+        f.runDelay(3_000)
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(13L, f.port.reads.last().offset)
+        f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(id, f.store.read()!!.sessionId)
+        assertEquals(originalReference, f.store.read()!!.reference)
+        assertEquals(0L, f.store.read()!!.reference!!.steps)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(1, f.port.count("stop"))
+        val connections = f.port.count("connect")
+        f.owner.onDisconnected(f.port.generation, "完成后断开")
+        assertEquals(0, f.waitCount(3_000))
+        assertEquals(connections, f.port.count("connect"))
+    }
+
+    @Test fun duplicateDisconnectAndRetiredReadyCallbacksCannotCreateParallelRecovery() = Fixture().use { f ->
+        f.beginCollecting()
+        val previousGeneration = f.port.generation
+        repeat(8) { f.owner.onDisconnected(previousGeneration, "连接中断") }
+        assertEquals(1, f.waitCount(3_000))
+        f.owner.onConnected(previousGeneration)
+        f.owner.onHealth(previousGeneration, SensorPacket.Health(stopped(), ++f.clock.now))
+        assertFalse(f.owner.state.connected)
+        f.owner.reconnect()
+        val connections = f.port.count("connect")
+        f.runAllDelays(3_000)
+        f.owner.onDisconnected(previousGeneration, "迟到的旧连接回调")
+        assertEquals(connections, f.port.count("connect"))
+        f.owner.onConnected(f.port.generation)
+        f.observe(collecting(), listOf(initialRecord))
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun idleOrClosedOwnerDoesNotContinueAutomaticConnections() = Fixture().use { f ->
+        f.port.accept = { it != "connect" }
+        f.owner.initialize()
+        assertTrue(f.owner.state.canRetry)
+        assertEquals(0, f.waitCount(3_000))
+        f.port.accept = { true }
+        f.owner.reconnect()
+        f.owner.onConnected(f.port.generation)
+        f.observe(idle())
+        f.startSelected(); f.observe(idle()); f.observe(collecting(), listOf(initialRecord))
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        f.owner.close()
+        val connections = f.port.count("connect")
+        f.runAllDelays(3_000)
+        assertEquals(connections, f.port.count("connect"))
+    }
+
     private inner class Fixture(private val uploads: RealUploadPort? = null,
         private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false,
         profileLabel: String = "owner001",
@@ -1846,6 +1956,7 @@ class RealCollectionControllerTest {
 
         fun reopen() { owner.close(); owner = createOwner(); owner.initialize() }
 
+        fun waitCount(delay: Long) = scheduled.count { it.first == delay }
         fun hasReadinessWait() = scheduled.any { it.first == RealCollectionController.READINESS_CHECK_INTERVAL_MS }
         fun runReadinessWait() = runDelay(RealCollectionController.READINESS_CHECK_INTERVAL_MS)
         fun runDelay(delay: Long) {

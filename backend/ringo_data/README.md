@@ -2,9 +2,9 @@
 
 本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录及 IMU/PPG CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)及[功能规格](../../specs/independent-step-collection/requirements.md)。
 
-当前导入器版本为 **0.2.2**，可用 `python -m backend.ringo_data --version` 查询。该版本在0.2.1契约上增加云端对象下载前后身份复核，并将跨session复用相同原始文件的后到包隔离到冲突目录，避免重复进入研究索引。重复归属只采用已经核对回执、原ZIP和全部产物的既有session；相关既有session损坏时报告研究库完整性错误，新包保持可重试。既有计数顺序、恢复证据、ZIP配额和损坏索引保护继续生效。
+当前导入器版本为 **0.2.3**，可用 `python -m backend.ringo_data --version` 查询。保留云端对象下载前后身份复核，以及跨session复用相同原始文件的冲突隔离。重复导入检查发现同session或冲突目录的既有产物损坏时，报告可重试的研究库完整性错误；原ZIP不进入坏包拒收缓存，修复产物后同一扫描进程可以重试，无关的正常包继续处理。云端回执中的长度与SHA-256传递到导入快照，在快照复制完成后再次比对；文件被替换时保留原件和重试机会。既有计数顺序、恢复证据、ZIP配额和损坏索引保护继续生效。
 
-本轮证据与适用范围见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
+本轮证据与剩余阻断见[恢复与故障隔离验证E31](../../specs/independent-step-collection/validation.md#e31发布核对与在途恢复2026-09-21)；既有契约审计见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
 
 Android 0.8.3的新登记直接使用规范化用户名作为`participant_id`，兼容字段`participant_name`与其相同，沿用现有契约。`reference.csv`、信号CSV与session索引按该字段区分被试；研究者为不同被试分配不同用户名（如`p001`、`p002`），同一人换手机继续填写原用户名。离线登记无法检查全局重名，同名会视作同一人。已有测试包保持原文，不做身份迁移；重复导入继续按session及文件哈希处理。
 
