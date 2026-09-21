@@ -266,10 +266,13 @@ class RealCollectionService : Service() {
     }
 }
 
+internal class CollectionOwnerBusyException : IllegalStateException("当前任务已开始，正在返回")
+
 /** In-process UI proxy. The foreground service owns the controller and the connection. */
 object RealCollectionBridge : CollectionFlow {
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
     private val main = Handler(Looper.getMainLooper())
+    private val ownershipLock = Any()
     @Volatile private var dispatch: (((RealCollectionController) -> Unit) -> Unit)? = null
     @Volatile private var reserved = false
     private var owner: Any? = null
@@ -283,24 +286,36 @@ object RealCollectionBridge : CollectionFlow {
         private set
 
     fun ensureStarted(context: Context, lease: Any) {
-        pageLease = lease
-        reserved = true
-        releasePending = false
-        if (owner != null && retiring === owner) {
+        val (waitingForRetiringOwner, publishInitialState) = synchronized(ownershipLock) {
+            pageLease = lease
+            reserved = true
+            releasePending = false
+            val waitingForRetiringOwner = owner != null && retiring === owner
+            if (waitingForRetiringOwner) restartContext = context.applicationContext
+            waitingForRetiringOwner to (owner == null)
+        }
+        if (waitingForRetiringOwner) {
             // The old owner must finish closing its file and GATT before a new owner starts.
-            restartContext = context.applicationContext
             publishWaiting()
             return
         }
-        if (owner == null) publish(CollectionFlowState(isSimulation = false, uploadAvailable = false,
+        if (publishInitialState) publish(CollectionFlowState(isSimulation = false, uploadAvailable = false,
             hasProfile = true, connected = false, connecting = true, busy = true))
         try { context.startForegroundService(Intent(context, RealCollectionService::class.java)) }
         catch (error: Exception) {
-            if (owner == null) { reserved = false; pageLease = null }
+            synchronized(ownershipLock) {
+                if (owner == null && pageLease === lease) { reserved = false; pageLease = null }
+            }
             throw error
         }
     }
     fun isRunning() = reserved || dispatch != null
+
+    /** Serializes an idle-only profile commit with service ownership reservation. */
+    internal fun <T> withIdleOwner(write: () -> T): T = synchronized(ownershipLock) {
+        if (reserved || owner != null || dispatch != null) throw CollectionOwnerBusyException()
+        write()
+    }
     fun releaseIfIdle(lease: Any) {
         // An older Activity may finish after its replacement has already entered.
         if (pageLease !== lease) return
@@ -323,9 +338,11 @@ object RealCollectionBridge : CollectionFlow {
         publishWaiting()
     }
     internal fun begin(token: Any) {
-        if (owner != null && owner !== token) releasePending = false
-        owner = token; reserved = true; dispatch = null; release = null
-        retiring = null; restartContext = null
+        synchronized(ownershipLock) {
+            if (owner != null && owner !== token) releasePending = false
+            owner = token; reserved = true; dispatch = null; release = null
+            retiring = null; restartContext = null
+        }
         publishWaiting()
     }
     internal fun attach(token: Any, value: ((RealCollectionController) -> Unit) -> Unit, onRelease: () -> Unit) {
@@ -334,16 +351,26 @@ object RealCollectionBridge : CollectionFlow {
         if (releasePending) onRelease()
     }
     internal fun detach(token: Any) {
-        if (owner !== token) return
-        val restartLease = pageLease
-        val restart = restartContext.takeIf { retiring === token && restartLease != null }
-        owner = null; dispatch = null; release = null; reserved = false
-        releasePending = false; retiring = null; restartContext = null
+        var detached = false
+        var restartLease: Any? = null
+        var restart: Context? = null
+        synchronized(ownershipLock) {
+            if (owner === token) {
+                restartLease = pageLease
+                restart = restartContext.takeIf { retiring === token && restartLease != null }
+                owner = null; dispatch = null; release = null
+                reserved = restart != null
+                releasePending = false; retiring = null; restartContext = null
+                if (restart == null) pageLease = null
+                detached = true
+            }
+        }
+        if (!detached) return
         if (restart != null && restartLease != null) {
-            runCatching { ensureStarted(restart, restartLease) }.onFailure { fail("采集服务未能启动，请返回后重试") }
+            runCatching { ensureStarted(requireNotNull(restart), requireNotNull(restartLease)) }
+                .onFailure { fail("采集服务未能启动，请返回后重试") }
             return
         }
-        pageLease = null
         publish(state.copy(busy = false, connecting = false, connected = false, canStart = false, canStop = false))
     }
     internal fun publish(token: Any, next: CollectionFlowState) {

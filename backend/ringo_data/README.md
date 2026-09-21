@@ -6,6 +6,8 @@
 
 本轮证据与适用范围见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
 
+Android 0.8.3的新登记直接使用规范化用户名作为`participant_id`，兼容字段`participant_name`与其相同，沿用现有契约。`reference.csv`、信号CSV与session索引按该字段区分被试；研究者为不同被试分配不同用户名（如`p001`、`p002`），同一人换手机继续填写原用户名。离线登记无法检查全局重名，同名会视作同一人。已有测试包保持原文，不做身份迁移；重复导入继续按session及文件哈希处理。
+
 ## 运行与复现
 
 以下命令均从仓库根目录执行，使 Python 能找到 `backend.ringo_data` 模块。先安装 Python 3.10+，确认 `python --version` 返回所选解释器的版本，再建立独立测试环境：

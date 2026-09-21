@@ -52,6 +52,14 @@ class PreparationStore internal constructor(
 
     fun read(): PreparationSnapshot? = synchronized(processLock) { readLocked() }
 
+    /** Uses the normalized username directly as the research identifier. */
+    fun registerUsername(raw: String, placement: RingPlacement? = null): PreparationSnapshot =
+        register(normalizeUsername(raw), placement)
+
+    /** Replaces only the current username; historical sessions retain their frozen identity. */
+    fun replaceCurrentUsername(raw: String, collectionIsIdle: Boolean): PreparationSnapshot =
+        replaceCurrentProfile(normalizeUsername(raw), collectionIsIdle)
+
     /** Existing profiles cannot be replaced through registration by an accidental edit. */
     fun register(
         raw: String,
@@ -303,6 +311,7 @@ class PreparationStore internal constructor(
     }
 
     companion object {
+        const val USERNAME_RULE = "用户名需为 3–24 位字母或数字"
         private val processLock = Any()
         private val participantPattern = Regex("^[a-z0-9]{3,24}$")
         private val legacyParticipantPattern = Regex("^[A-Za-z0-9]{3,24}$")
@@ -316,6 +325,14 @@ class PreparationStore internal constructor(
         private val fieldsV3 = fieldsV2 + "identity_type"
 
         private data class Identity(val participantId: String, val displayLabel: String)
+
+        fun isValidUsername(value: String): Boolean = legacyParticipantPattern.matches(value.trim())
+
+        private fun normalizeUsername(raw: String): String {
+            val username = raw.trim()
+            require(legacyParticipantPattern.matches(username)) { USERNAME_RULE }
+            return username.lowercase(Locale.ROOT)
+        }
 
         private fun normalizeResearchLabel(raw: String): String {
             val label = raw.trim()

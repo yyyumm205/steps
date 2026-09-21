@@ -11,7 +11,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
-import android.widget.RadioButton
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.test.core.app.ActivityScenario
@@ -20,6 +19,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -40,10 +40,9 @@ class PreparationNavigationInstrumentedTest {
     private val ring = PreparedRing("AA:BB:CC:DD:EE:01", "Ringo navigation test")
 
     @Test
-    fun firstUseAcceptsNameAndKeepsAllSixOriginalPlacementChoices() = withIsolatedFiles {
+    fun firstUseHasOneUsernameFieldAndKeepsAllSixOriginalPlacementChoices() = withIsolatedFiles {
         launch().use { scenario ->
             awaitHeading(scenario, "开始使用")
-            click(scenario, "identity_type_local")
             scenario.onActivity { activity ->
                 val spinner = tagged<Spinner>(activity, "placement_picker")
                 assertEquals(1 + RingPlacement.entries.size, spinner.adapter.count)
@@ -51,25 +50,24 @@ class PreparationNavigationInstrumentedTest {
                     RingPlacement.entries.map { it.displayName },
                     (1 until spinner.adapter.count).map { spinner.adapter.getItem(it).toString() },
                 )
-                tagged<EditText>(activity, "participant_input").setText("Alice")
-                assertEquals(
-                    "仅保存在本机，研究数据使用匿名编号",
-                    tagged<TextView>(activity, "identity_help").text.toString(),
-                )
+                val input = tagged<EditText>(activity, "participant_input")
+                assertEquals("3–24 位字母或数字", input.hint.toString())
+                input.setText("Alice")
+                assertNull(activity.findViewById<View>(android.R.id.content)
+                    .findViewWithTag<View>("identity_type_picker"))
             }
             scenario.recreate()
             awaitHeading(scenario, "开始使用")
             scenario.onActivity { activity ->
-                assertTrue(tagged<RadioButton>(activity, "identity_type_local").isChecked)
                 assertEquals("Alice", tagged<EditText>(activity, "participant_input").text.toString())
             }
             choosePlacement(scenario, RingPlacement.RIGHT_INDEX)
             click(scenario, "primary")
             awaitHeading(scenario, "选择戒指")
             val saved = requireNotNull(PreparationStore(preparationFile).read())
-            assertEquals("Alice", saved.displayLabel)
-            assertEquals(PreparationIdentityType.LOCAL_NAME, saved.identityType)
-            assertTrue(saved.participantId.matches(Regex("^local[a-f0-9]{16}$")))
+            assertEquals("alice", saved.displayLabel)
+            assertEquals(PreparationIdentityType.RESEARCH_ID, saved.identityType)
+            assertEquals("alice", saved.participantId)
             assertEquals(RingPlacement.RIGHT_INDEX, saved.placement)
             assertNull(saved.ring)
         }
@@ -113,7 +111,6 @@ class PreparationNavigationInstrumentedTest {
             launch().use { scenario ->
                 awaitHeading(scenario, "开始使用")
                 scenario.onActivity { activity ->
-                    assertTrue(tagged<RadioButton>(activity, "identity_type_research").isChecked)
                     tagged<EditText>(activity, "participant_input").setText("P001")
                 }
                 choosePlacement(scenario, RingPlacement.RIGHT_RING)
@@ -130,7 +127,9 @@ class PreparationNavigationInstrumentedTest {
                 val saved = requireNotNull(PreparationStore(preparationFile).read())
                 assertEquals(ring, saved.ring)
                 assertEquals(RingPlacement.RIGHT_RING, saved.placement)
+                assertEquals("p001", saved.displayLabel)
                 assertEquals(PreparationIdentityType.RESEARCH_ID, saved.identityType)
+                assertEquals("p001", saved.participantId)
                 val stored = preparationFile.readText(Charsets.UTF_8)
                 assertFalse(stored.contains("connected", ignoreCase = true))
                 assertFalse(stored.contains("ready", ignoreCase = true))
@@ -156,7 +155,7 @@ class PreparationNavigationInstrumentedTest {
         launch(settings = true).use { scenario ->
             awaitHeading(scenario, "设置")
             scenario.onActivity { activity ->
-                assertEquals("P001", tagged<TextView>(activity, "participant_summary").text.toString())
+                assertEquals("用户名：P001", tagged<TextView>(activity, "participant_summary").text.toString())
                 for (tag in listOf("change_identity", "edit_placement", "change_ring", "clear_profile")) {
                     assertTrue("$tag is a real action", tagged<Button>(activity, tag).let { it.isShown && it.isEnabled })
                 }
@@ -167,18 +166,15 @@ class PreparationNavigationInstrumentedTest {
             val dialog = awaitIdentityDialog(scenario)
             scenario.onActivity {
                 val root = requireNotNull(dialog.window).decorView
-                val local = requireNotNull(root.findViewWithTag<RadioButton>("identity_dialog_type_local"))
-                local.performClick()
-                assertTrue(local.isChecked)
                 val input = requireNotNull(root.findViewWithTag<EditText>("identity_dialog_input"))
                 input.setText("Alice")
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
             }
             awaitHeading(scenario, "开始使用")
             val replacement = requireNotNull(PreparationStore(preparationFile).read())
-            assertEquals("Alice", replacement.displayLabel)
-            assertEquals(PreparationIdentityType.LOCAL_NAME, replacement.identityType)
-            assertTrue(replacement.participantId.matches(Regex("^local[a-f0-9]{16}$")))
+            assertEquals("alice", replacement.displayLabel)
+            assertEquals(PreparationIdentityType.RESEARCH_ID, replacement.identityType)
+            assertEquals("alice", replacement.participantId)
             assertEquals(original.installationId, replacement.installationId)
             assertNull(replacement.placement)
             assertNull(replacement.ring)
@@ -240,6 +236,110 @@ class PreparationNavigationInstrumentedTest {
     }
 
     @Test
+    fun usernameChangeQueuedBeforeOwnerStartsCannotReplaceTheProfile() = withIsolatedFiles {
+        val original = completeProfile("P001")
+        val monitor = blockingCollectionMonitor()
+        val owner = Any()
+        var releaseDisk: CountDownLatch? = null
+        try {
+            launch(settings = true).use { scenario ->
+                awaitHeading(scenario, "设置")
+                click(scenario, "change_identity")
+                val dialog = awaitIdentityDialog(scenario)
+                releaseDisk = holdPreparationDisk()
+                scenario.onActivity {
+                    val input = requireNotNull(dialog.window).decorView
+                        .findViewWithTag<EditText>("identity_dialog_input")
+                    input.setText("Alice")
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+                    RealCollectionBridge.begin(owner)
+                }
+                releaseDisk!!.countDown()
+                awaitMonitorHit(monitor)
+            }
+            assertEquals(original, PreparationStore(preparationFile).read())
+        } finally {
+            releaseDisk?.countDown()
+            instrumentation.runOnMainSync { RealCollectionBridge.detach(owner) }
+            instrumentation.removeMonitor(monitor)
+        }
+    }
+
+    @Test
+    fun registrationQueuedBeforeOwnerStartsCannotCreateOrCompleteTheProfile() = withIsolatedFiles {
+        fun verifyBlockedWrite(expected: PreparationSnapshot?) {
+            val monitor = blockingCollectionMonitor()
+            val owner = Any()
+            var releaseDisk: CountDownLatch? = null
+            try {
+                launch().use { scenario ->
+                    awaitHeading(scenario, "开始使用")
+                    scenario.onActivity { tagged<EditText>(it, "participant_input").setText("P001") }
+                    choosePlacement(scenario, RingPlacement.LEFT_INDEX)
+                    releaseDisk = holdPreparationDisk()
+                    click(scenario, "primary")
+                    scenario.onActivity { RealCollectionBridge.begin(owner) }
+                    releaseDisk!!.countDown()
+                    awaitMonitorHit(monitor)
+                }
+                assertEquals(expected, PreparationStore(preparationFile).read())
+            } finally {
+                releaseDisk?.countDown()
+                instrumentation.runOnMainSync { RealCollectionBridge.detach(owner) }
+                instrumentation.removeMonitor(monitor)
+            }
+        }
+
+        verifyBlockedWrite(expected = null)
+        val incomplete = PreparationStore(preparationFile).registerUsername("P001")
+        assertNull(incomplete.placement)
+        verifyBlockedWrite(expected = incomplete)
+    }
+
+    @Test
+    fun profileCommitAndOwnerReservationCannotOverlap() = withIsolatedFiles {
+        completeProfile("P001")
+        val owner = Any()
+        val writeEntered = CountDownLatch(1)
+        val releaseWrite = CountDownLatch(1)
+        val writeFinishedInsideGate = CountDownLatch(1)
+        val beginAttempted = CountDownLatch(1)
+        val ownerReserved = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val write = workers.submit<PreparationSnapshot> {
+                RealCollectionBridge.withIdleOwner {
+                    writeEntered.countDown()
+                    check(releaseWrite.await(10, TimeUnit.SECONDS))
+                    PreparationStore(preparationFile).replaceCurrentUsername("Alice", collectionIsIdle = true).also {
+                        writeFinishedInsideGate.countDown()
+                    }
+                }
+            }
+            assertTrue("Profile commit must enter the ownership gate", writeEntered.await(10, TimeUnit.SECONDS))
+            val begin = workers.submit<Boolean> {
+                beginAttempted.countDown()
+                RealCollectionBridge.begin(owner)
+                ownerReserved.countDown()
+                writeFinishedInsideGate.await(0, TimeUnit.MILLISECONDS)
+            }
+
+            assertTrue("Owner reservation must be attempted", beginAttempted.await(10, TimeUnit.SECONDS))
+            assertFalse("Owner reservation must wait for the profile commit",
+                ownerReserved.await(250, TimeUnit.MILLISECONDS))
+            releaseWrite.countDown()
+            assertEquals("alice", write.get(10, TimeUnit.SECONDS).participantId)
+            assertTrue("Owner reservation must continue after the commit", begin.get(10, TimeUnit.SECONDS))
+            assertEquals("alice", requireNotNull(PreparationStore(preparationFile).read()).participantId)
+        } finally {
+            releaseWrite.countDown()
+            workers.shutdown()
+            workers.awaitTermination(10, TimeUnit.SECONDS)
+            instrumentation.runOnMainSync { RealCollectionBridge.detach(owner) }
+        }
+    }
+
+    @Test
     fun scannedRingSelectedBeforeOwnerStartsCannotReplaceTheProfileRing() = withIsolatedFiles {
         grantBluetoothPermissions()
         val original = completeProfile("P001")
@@ -269,7 +369,7 @@ class PreparationNavigationInstrumentedTest {
 
     @Test
     fun clearIdentityNeedsConfirmationAndKeepsCollectionFiles() = withIsolatedFiles {
-        completeProfile("P001")
+        val original = completeProfile("P001")
         val marker = File(context.filesDir, "collection-real/history-kept.txt").apply {
             parentFile!!.mkdirs()
             writeText("kept", Charsets.UTF_8)
@@ -277,11 +377,53 @@ class PreparationNavigationInstrumentedTest {
         launch(settings = true).use { scenario ->
             awaitHeading(scenario, "设置")
             click(scenario, "clear_profile")
+            val cancelled = awaitClearDialog(scenario)
+            scenario.onActivity { cancelled.getButton(AlertDialog.BUTTON_NEGATIVE).performClick() }
+            assertEquals(original, PreparationStore(preparationFile).read())
+            click(scenario, "clear_profile")
             val dialog = awaitClearDialog(scenario)
             scenario.onActivity { dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick() }
             awaitHeading(scenario, "开始使用")
             assertNull(PreparationStore(preparationFile).read())
             assertEquals("kept", marker.readText(Charsets.UTF_8))
+            scenario.onActivity { activity ->
+                tagged<EditText>(activity, "participant_input").setText(" p001 ")
+            }
+            choosePlacement(scenario, RingPlacement.LEFT_INDEX)
+            click(scenario, "primary")
+            awaitHeading(scenario, "选择戒指")
+            val signedInAgain = requireNotNull(PreparationStore(preparationFile).read())
+            assertEquals(original.participantId, signedInAgain.participantId)
+            assertEquals(original.installationId, signedInAgain.installationId)
+            assertEquals(RingPlacement.LEFT_INDEX, signedInAgain.placement)
+            assertEquals("kept", marker.readText(Charsets.UTF_8))
+        }
+    }
+
+    @Test
+    fun clearQueuedBeforeOwnerStartsKeepsTheCompleteProfile() = withIsolatedFiles {
+        val original = completeProfile("P001")
+        val monitor = blockingCollectionMonitor()
+        val owner = Any()
+        var releaseDisk: CountDownLatch? = null
+        try {
+            launch(settings = true).use { scenario ->
+                awaitHeading(scenario, "设置")
+                click(scenario, "clear_profile")
+                val dialog = awaitClearDialog(scenario)
+                releaseDisk = holdPreparationDisk()
+                scenario.onActivity {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+                    RealCollectionBridge.begin(owner)
+                }
+                releaseDisk!!.countDown()
+                awaitMonitorHit(monitor)
+            }
+            assertEquals(original, PreparationStore(preparationFile).read())
+        } finally {
+            releaseDisk?.countDown()
+            instrumentation.runOnMainSync { RealCollectionBridge.detach(owner) }
+            instrumentation.removeMonitor(monitor)
         }
     }
 
@@ -433,9 +575,7 @@ class PreparationNavigationInstrumentedTest {
         scenario.onActivity { activity ->
             val button = tagged<Button>(activity, tag)
             assertTrue("$tag is visible and enabled", button.isShown && button.isEnabled)
-            val handled = button.performClick()
-            if (button is RadioButton) assertTrue("$tag must become selected", button.isChecked)
-            else assertTrue("$tag must handle the click", handled)
+            assertTrue("$tag must handle the click", button.performClick())
         }
     }
 

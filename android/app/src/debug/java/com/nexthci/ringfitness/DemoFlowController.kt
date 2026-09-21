@@ -85,7 +85,7 @@ class DemoFlowController(
 
     override fun register(participantId: String, placement: RingPlacement) = safely {
         require(store.read()?.localData != null || store.read() == null) { "请先完成本次记录" }
-        preparation.register(participantId, placement)
+        preparation.registerUsername(participantId, placement)
         if (preparation.read()?.ring == null) preparation.selectRing(DEMO_RING)
         publish(CollectionPage.HOME)
     }
@@ -96,7 +96,7 @@ class DemoFlowController(
             publish(it)
             return@safely
         }
-        val profile = requireNotNull(preparation.read()) { "请先填写体验编号" }
+        val profile = requireNotNull(preparation.read()) { "请先填写用户名" }
         require(profile.ring == DEMO_RING && profile.placement != null) { "请先完成准备" }
         val current = store.read()
         if (current?.isPending == true) { showStored(current); return@safely }
@@ -543,7 +543,9 @@ class DemoFlowController(
             taskError = error
         }
         val visiblePage = if (browsingHome) CollectionPage.HOME else page
-        val busy = visiblePage in waitingPages
+        // Uploading is independent background work; a locally complete record must not block
+        // choosing and starting the next session.
+        val busy = visiblePage in waitingPages && visiblePage != CollectionPage.UPLOADING
         val blockingWork = inFlightPage()?.let { it != CollectionPage.UPLOADING } == true
         state = CollectionFlowState(page = visiblePage, taskPage = taskPage, isSimulation = true, hasProfile = profile?.ring != null,
             participantId = profile?.participantId.orEmpty(), participantLabel = profile?.displayLabel.orEmpty(),

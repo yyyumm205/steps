@@ -25,8 +25,6 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.ProgressBar
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -36,7 +34,6 @@ import java.util.concurrent.Executors
 /** Collects durable setup choices; the foreground collection service owns every ring connection. */
 class StepPreparationActivity : Activity() {
     private enum class Page { REGISTER, DEVICES, SETTINGS }
-    private class CollectionOwnerBusyException : IllegalStateException("当前任务已开始，正在返回")
 
     private val main = Handler(Looper.getMainLooper())
     private val ui by lazy { QuietUi(this) }
@@ -48,7 +45,6 @@ class StepPreparationActivity : Activity() {
     private var settingsRequested = false
     private var returnToSettings = false
     private var placementDraft = 0
-    private var identityTypeDraft = PreparationIdentityType.RESEARCH_ID
     private var loaded = false
     private var busy = false
     private var visible = false
@@ -80,11 +76,6 @@ class StepPreparationActivity : Activity() {
     private lateinit var details: Button
     private lateinit var scroll: ScrollView
     private lateinit var registration: LinearLayout
-    private lateinit var identityTypePicker: RadioGroup
-    private lateinit var researchIdChoice: RadioButton
-    private lateinit var localNameChoice: RadioButton
-    private lateinit var identityInputLabel: TextView
-    private lateinit var identityHelp: TextView
     private lateinit var participantInput: EditText
     private lateinit var placementPicker: Spinner
     private lateinit var devices: LinearLayout
@@ -122,9 +113,6 @@ class StepPreparationActivity : Activity() {
         settingsRequested = intent.getBooleanExtra(EXTRA_OPEN_SETTINGS, false)
         restoredPage = savedInstanceState?.getString(STATE_PAGE)?.let { runCatching { Page.valueOf(it) }.getOrNull() }
         placementDraft = savedInstanceState?.getInt(STATE_PLACEMENT) ?: 0
-        identityTypeDraft = PreparationIdentityType.fromWireValue(
-            savedInstanceState?.getString(STATE_IDENTITY_TYPE),
-        ) ?: PreparationIdentityType.RESEARCH_ID
         permissionDenied = savedInstanceState?.getBoolean(STATE_PERMISSION_DENIED) ?: false
         returnToSettings = savedInstanceState?.getBoolean(STATE_RETURN_TO_SETTINGS) ?: false
         buildPages(savedInstanceState?.getString(STATE_PARTICIPANT_DRAFT).orEmpty())
@@ -189,7 +177,6 @@ class StepPreparationActivity : Activity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putString(STATE_PAGE, page.name)
         outState.putString(STATE_PARTICIPANT_DRAFT, participantInput.text.toString())
-        outState.putString(STATE_IDENTITY_TYPE, identityTypeDraft.wireValue)
         outState.putInt(STATE_PLACEMENT, placementDraft)
         outState.putBoolean(STATE_PERMISSION_DENIED, permissionDenied)
         outState.putBoolean(STATE_RETURN_TO_SETTINGS, returnToSettings)
@@ -254,43 +241,16 @@ class StepPreparationActivity : Activity() {
         scroll.addView(body)
 
         registration = ui.card(body)
-        label(registration, "身份类型", 16f)
-        identityTypePicker = RadioGroup(this).apply {
-            tag = "identity_type_picker"
-            orientation = RadioGroup.HORIZONTAL
-        }
-        researchIdChoice = identityChoice("研究编号", "identity_type_research")
-        localNameChoice = identityChoice("本地姓名", "identity_type_local")
-        identityTypePicker.addView(researchIdChoice, LinearLayout.LayoutParams(0, dp(48), 1f))
-        identityTypePicker.addView(localNameChoice, LinearLayout.LayoutParams(0, dp(48), 1f))
-        registration.addView(identityTypePicker, LinearLayout.LayoutParams(-1, -2))
-        identityInputLabel = label(registration, "", 16f).apply { setPadding(0, dp(16), 0, dp(4)) }
+        label(registration, "用户名", 16f).setPadding(0, 0, 0, dp(4))
         participantInput = EditText(this).apply {
             tag = "participant_input"
             setSingleLine(true)
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            hint = "3–24 位字母或数字"
             setText(draft)
             ui.styleInput(this)
         }
         registration.addView(participantInput, LinearLayout.LayoutParams(-1, -2))
-        identityHelp = label(registration, "", 14f).apply {
-            tag = "identity_help"
-            setTextColor(ui.secondary)
-            setPadding(0, dp(8), 0, 0)
-        }
-        setIdentityTypeDraft(identityTypeDraft)
-        identityTypePicker.setOnCheckedChangeListener { _, checkedId ->
-            val selected = when (checkedId) {
-                researchIdChoice.id -> PreparationIdentityType.RESEARCH_ID
-                localNameChoice.id -> PreparationIdentityType.LOCAL_NAME
-                else -> return@setOnCheckedChangeListener
-            }
-            if (selected != identityTypeDraft) {
-                setIdentityTypeDraft(selected)
-                feedback = null
-                updateViews()
-            }
-        }
         label(registration, "戒指佩戴位置", 16f).setPadding(0, dp(24), 0, dp(4))
         placementPicker = Spinner(this).apply {
             tag = "placement_picker"
@@ -321,10 +281,10 @@ class StepPreparationActivity : Activity() {
         }
         placementLabel = label(profileCard, "", 16f).apply { tag = "placement_summary" }
         ringLabel = label(profileCard, "", 16f).apply { tag = "ring_summary" }
-        changeIdentity = link(profileCard, "更换身份") { showIdentityPicker() }.apply { tag = "change_identity" }
+        changeIdentity = link(profileCard, "更换用户") { showIdentityPicker() }.apply { tag = "change_identity" }
         editPlacement = link(profileCard, "修改佩戴位置") { showPlacementPicker() }.apply { tag = "edit_placement" }
         changeRing = link(profileCard, "更换戒指") { openDeviceSelection(fromSettings = true) }.apply { tag = "change_ring" }
-        clearProfile = link(profileCard, "清除当前身份") { confirmClearProfile() }.apply {
+        clearProfile = link(profileCard, "退出当前用户") { confirmClearProfile() }.apply {
             tag = "clear_profile"
         }
 
@@ -368,7 +328,6 @@ class StepPreparationActivity : Activity() {
                     storageProblem = null
                     profileUnreadable = false
                     loadedSnapshot?.let {
-                        setIdentityTypeDraft(it.identityType)
                         participantInput.setText(it.displayLabel)
                         placementDraft = it.placement?.ordinal?.plus(1) ?: 0
                         placementPicker.setSelection(placementDraft)
@@ -377,9 +336,9 @@ class StepPreparationActivity : Activity() {
                 }.onFailure { error ->
                     profileUnreadable = error is PreparationProfileUnreadableException
                     storageProblem = if (profileUnreadable) {
-                        error.message ?: "身份资料需要重新登记，已有采集记录仍保留"
+                        error.message ?: "用户资料需要重新填写，已有采集记录仍保留"
                     } else {
-                        "身份资料暂时无法读取，请重新打开 App"
+                        "用户资料暂时无法读取，请重新打开 App"
                     }
                 }
                 restoredPage = null
@@ -469,10 +428,7 @@ class StepPreparationActivity : Activity() {
         val selected = RingPlacement.entries.getOrNull(placementDraft - 1)
         when {
             raw.isEmpty() -> {
-                feedback = when (identityTypeDraft) {
-                    PreparationIdentityType.RESEARCH_ID -> "请输入研究编号"
-                    PreparationIdentityType.LOCAL_NAME -> "请输入本地姓名"
-                }
+                feedback = "请输入用户名"
                 updateViews()
             }
             selected == null -> {
@@ -480,10 +436,10 @@ class StepPreparationActivity : Activity() {
                 updateViews()
             }
             snapshot == null -> persist(afterSave = { openDeviceSelection(fromSettings = false) }) {
-                store.register(raw, selected, identityTypeDraft)
+                withIdleCollectionOwner { store.registerUsername(raw, selected) }
             }
             snapshot?.placement != selected -> persist(afterSave = { openDeviceSelection(fromSettings = false) }) {
-                store.savePlacement(selected)
+                withIdleCollectionOwner { store.savePlacement(selected) }
             }
             else -> openDeviceSelection(fromSettings = false)
         }
@@ -531,6 +487,7 @@ class StepPreparationActivity : Activity() {
 
     private fun updateViews() {
         if (!::primary.isInitialized) return
+        val loading = !loaded || !collectionLoaded
         val locked = collectionPending || collectionOwnerBusy || !collectionLoaded
         val pendingSettings = page == Page.SETTINGS && collectionPending
         val retiringSettings = page == Page.SETTINGS && !collectionPending && collectionOwnerBusy
@@ -541,40 +498,43 @@ class StepPreparationActivity : Activity() {
             retiringSettings -> "正在关闭戒指连接"
             else -> null
         }
-        registration.visibility = if (!hasStorageProblem && page == Page.REGISTER) View.VISIBLE else View.GONE
-        devices.visibility = if (!hasStorageProblem && page == Page.DEVICES) View.VISIBLE else View.GONE
-        settings.visibility = if (!hasStorageProblem && page == Page.SETTINGS) View.VISIBLE else View.GONE
-        back.visibility = View.VISIBLE
+        registration.visibility = if (!loading && !hasStorageProblem && page == Page.REGISTER) View.VISIBLE else View.GONE
+        devices.visibility = if (!loading && !hasStorageProblem && page == Page.DEVICES) View.VISIBLE else View.GONE
+        settings.visibility = if (!loading && !hasStorageProblem && page == Page.SETTINGS) View.VISIBLE else View.GONE
+        back.visibility = if (loading || page == Page.SETTINGS) View.GONE else View.VISIBLE
         back.text = if (page == Page.DEVICES) "返回" else "关闭"
         back.isEnabled = true
-        details.visibility = if (BuildConfig.DEBUG && !hasStorageProblem && progressText == null) View.VISIBLE else View.GONE
+        details.visibility = if (BuildConfig.DEBUG && isEmulator() && !hasStorageProblem && progressText == null) {
+            View.VISIBLE
+        } else View.GONE
         details.isEnabled = progressText == null
         heading.text = when {
+            loading -> "正在准备"
             pendingSettings -> "设置"
             hasStorageProblem && profileUnreadable -> "重新登记"
-            hasStorageProblem -> "身份资料"
+            hasStorageProblem -> "用户资料"
             page == Page.REGISTER -> "开始使用"
             page == Page.DEVICES -> "选择戒指"
             else -> "设置"
         }
         subtitle.text = when {
+            loading -> ""
             pendingSettings -> "当前记录完成后可修改设置"
             retiringSettings -> "正在关闭戒指连接"
             hasStorageProblem -> "已有采集记录会保留"
-            page == Page.REGISTER -> "填写身份和佩戴位置"
+            page == Page.REGISTER -> "填写用户名和佩戴位置"
             page == Page.DEVICES -> "点击正在使用的戒指"
             locked -> "当前记录完成后可修改设置"
-            else -> "身份与设备"
+            else -> "用户与戒指"
         }
+        subtitle.visibility = if (subtitle.text.isNullOrBlank()) View.GONE else View.VISIBLE
         participantInput.isEnabled = !busy && snapshot == null
-        researchIdChoice.isEnabled = !busy && snapshot == null
-        localNameChoice.isEnabled = !busy && snapshot == null
         placementPicker.isEnabled = !busy
-        participantLabel.text = snapshot?.displayLabel ?: "当前身份资料暂时不可用"
+        participantLabel.text = snapshot?.displayLabel?.let { "用户名：$it" } ?: "用户资料暂时不可用"
         placementLabel.text = "佩戴位置：${snapshot?.placement?.displayName ?: "待选择"}"
         ringLabel.text = "戒指：${snapshot?.ring?.name ?: "待选择"}"
         listOf(changeIdentity, editPlacement, changeRing, clearProfile).forEach {
-            it.visibility = if (locked) View.GONE else View.VISIBLE
+            it.visibility = if (locked || busy) View.GONE else View.VISIBLE
             it.isEnabled = !busy && !locked
         }
         scanStatus.text = scanMessage ?: when {
@@ -612,63 +572,31 @@ class StepPreparationActivity : Activity() {
 
     private fun showIdentityPicker() {
         if (busy || collectionPending || collectionOwnerBusy || snapshot == null || identityDialog?.isShowing == true) return
-        var selectedType = snapshot?.identityType ?: PreparationIdentityType.RESEARCH_ID
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), 0, dp(24), 0)
         }
-        val types = RadioGroup(this).apply {
-            orientation = RadioGroup.HORIZONTAL
-        }
-        val research = identityChoice("研究编号", "identity_dialog_type_research")
-        val local = identityChoice("本地姓名", "identity_dialog_type_local")
-        types.addView(research, LinearLayout.LayoutParams(0, dp(48), 1f))
-        types.addView(local, LinearLayout.LayoutParams(0, dp(48), 1f))
-        content.addView(types, LinearLayout.LayoutParams(-1, -2))
         val input = EditText(this).apply {
             tag = "identity_dialog_input"
             setSingleLine(true)
+            hint = "用户名（3–24 位字母或数字）"
             setText(snapshot?.displayLabel.orEmpty())
             setSelection(text.length)
             ui.styleInput(this)
         }
         content.addView(input, LinearLayout.LayoutParams(-1, -2))
-        val help = label(content, "", 14f).apply {
-            tag = "identity_dialog_help"
-            setTextColor(ui.secondary)
-            setPadding(0, dp(8), 0, 0)
-        }
-        fun updateDialogIdentity(type: PreparationIdentityType) {
-            selectedType = type
-            input.hint = identityHintText(type)
-            help.text = identityHelpText(type)
-        }
-        when (selectedType) {
-            PreparationIdentityType.RESEARCH_ID -> research.isChecked = true
-            PreparationIdentityType.LOCAL_NAME -> local.isChecked = true
-        }
-        updateDialogIdentity(selectedType)
-        types.setOnCheckedChangeListener { _, checkedId ->
-            updateDialogIdentity(
-                if (checkedId == local.id) PreparationIdentityType.LOCAL_NAME
-                else PreparationIdentityType.RESEARCH_ID,
-            )
-        }
         val dialog = AlertDialog.Builder(this)
-            .setTitle("更换身份")
+            .setTitle("更换用户")
             .setView(content)
-            .setPositiveButton("继续", null)
+            .setPositiveButton("保存", null)
             .setNegativeButton("取消", null)
             .create()
         identityDialog = dialog
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val raw = input.text.toString().trim()
-                if (raw.isEmpty()) {
-                    input.error = when (selectedType) {
-                        PreparationIdentityType.RESEARCH_ID -> "请输入研究编号"
-                        PreparationIdentityType.LOCAL_NAME -> "请输入本地姓名"
-                    }
+                if (!PreparationStore.isValidUsername(raw)) {
+                    input.error = PreparationStore.USERNAME_RULE
                     return@setOnClickListener
                 }
                 val previous = snapshot
@@ -676,9 +604,8 @@ class StepPreparationActivity : Activity() {
                 persist(afterSave = { saved ->
                     if (saved == previous) {
                         page = Page.SETTINGS
-                        feedback = "身份未更改"
+                        feedback = "用户名未更改"
                     } else {
-                        setIdentityTypeDraft(saved.identityType)
                         participantInput.setText(saved.displayLabel)
                         placementDraft = 0
                         placementPicker.setSelection(0)
@@ -686,7 +613,9 @@ class StepPreparationActivity : Activity() {
                         feedback = null
                     }
                 }) {
-                    store.replaceCurrentProfile(raw, collectionIsIdle = profileChangeIsIdle(), identityType = selectedType)
+                    withIdleCollectionOwner {
+                        store.replaceCurrentUsername(raw, collectionIsIdle = true)
+                    }
                 }
             }
         }
@@ -729,9 +658,9 @@ class StepPreparationActivity : Activity() {
     private fun confirmClearProfile() {
         if (busy || collectionPending || collectionOwnerBusy || clearDialog?.isShowing == true) return
         val dialog = AlertDialog.Builder(this)
-            .setTitle("清除当前身份？")
-            .setMessage("当前身份和已选戒指将从本机清除。已有采集记录会保留。")
-            .setPositiveButton("清除") { _, _ -> clearCurrentProfile() }
+            .setTitle("退出当前用户？")
+            .setMessage("用户名和已选戒指将从本机移除。已有采集记录会保留。")
+            .setPositiveButton("退出") { _, _ -> clearCurrentProfile() }
             .setNegativeButton("取消", null)
             .create()
         clearDialog = dialog
@@ -745,13 +674,14 @@ class StepPreparationActivity : Activity() {
         feedback = null
         updateViews()
         disk.execute {
-            val result = runCatching { store.clearCurrentProfile(collectionIsIdle = profileChangeIsIdle()) }
+            val result = runCatching {
+                withIdleCollectionOwner { store.clearCurrentProfile(collectionIsIdle = true) }
+            }
             main.post {
                 if (isDestroyed) return@post
                 busy = false
                 result.onSuccess {
                     snapshot = null
-                    setIdentityTypeDraft(PreparationIdentityType.RESEARCH_ID)
                     participantInput.setText("")
                     placementDraft = 0
                     placementPicker.setSelection(0)
@@ -759,6 +689,11 @@ class StepPreparationActivity : Activity() {
                     page = Page.REGISTER
                     feedback = null
                 }.onFailure {
+                    if (it is CollectionOwnerBusyException) {
+                        feedback = it.message
+                        openCollectionAndFinish()
+                        return@onFailure
+                    }
                     feedback = it.message ?: "清除失败，请重试"
                 }
                 updateViews()
@@ -772,7 +707,9 @@ class StepPreparationActivity : Activity() {
         feedback = null
         updateViews()
         disk.execute {
-            val result = runCatching { store.clearCurrentProfile(collectionIsIdle = profileChangeIsIdle()) }
+            val result = runCatching {
+                withIdleCollectionOwner { store.clearCurrentProfile(collectionIsIdle = true) }
+            }
             main.post {
                 if (isDestroyed) return@post
                 busy = false
@@ -780,26 +717,30 @@ class StepPreparationActivity : Activity() {
                     snapshot = null
                     storageProblem = null
                     profileUnreadable = false
-                    setIdentityTypeDraft(PreparationIdentityType.RESEARCH_ID)
                     participantInput.setText("")
                     placementDraft = 0
                     placementPicker.setSelection(0)
                     page = Page.REGISTER
                 }.onFailure {
-                    storageProblem = it.message ?: "身份资料暂时无法清除，请重试"
+                    if (it is CollectionOwnerBusyException) {
+                        feedback = it.message
+                        openCollectionAndFinish()
+                        return@onFailure
+                    }
+                    storageProblem = it.message ?: "用户资料暂时无法清除，请重试"
                 }
                 updateViews()
             }
         }
     }
 
-    private fun profileChangeIsIdle(): Boolean = runCatching {
-        !RealCollectionBridge.isRunning() && FreeLivingSessionStore(collectionJournal).read()?.isPending != true
-    }.getOrDefault(false)
-
     private fun bluetoothEnabled() = getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
     private fun locationEnabled() = Build.VERSION.SDK_INT > 30 ||
         getSystemService(android.location.LocationManager::class.java).isLocationEnabled
+
+    private fun isEmulator() = Build.FINGERPRINT.contains("generic", true) ||
+        Build.FINGERPRINT.contains("emulator", true) || Build.MODEL.contains("Emulator", true) ||
+        Build.MODEL.startsWith("sdk_gphone") || Build.MODEL.startsWith("Android SDK built for")
 
     private fun withBluetooth(action: () -> Unit) {
         val missing = requiredPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
@@ -919,10 +860,12 @@ class StepPreparationActivity : Activity() {
 
     /** Recheck durable work and the live owner immediately before changing profile routing. */
     private fun <T> withIdleCollectionOwner(write: () -> T): T {
-        if (RealCollectionBridge.isRunning()) throw CollectionOwnerBusyException()
-        val pending = FreeLivingSessionStore(collectionJournal).read()?.isPending == true
-        if (pending || RealCollectionBridge.isRunning()) throw CollectionOwnerBusyException()
-        return write()
+        return RealCollectionBridge.withIdleOwner {
+            if (FreeLivingSessionStore(collectionJournal).read()?.isPending == true) {
+                throw CollectionOwnerBusyException()
+            }
+            write()
+        }
     }
 
     private fun showMore() {
@@ -951,43 +894,6 @@ class StepPreparationActivity : Activity() {
         setPadding(0, dp(4), 0, dp(4))
     }
 
-    private fun identityChoice(value: String, viewTag: String) = RadioButton(this).apply {
-        id = View.generateViewId()
-        tag = viewTag
-        text = value
-        textSize = 16f
-        setTextColor(ui.ink)
-        buttonTintList = android.content.res.ColorStateList.valueOf(ui.accent)
-        gravity = android.view.Gravity.CENTER_VERTICAL
-        setPadding(dp(4), 0, dp(4), 0)
-    }
-
-    private fun setIdentityTypeDraft(type: PreparationIdentityType) {
-        identityTypeDraft = type
-        if (!::identityTypePicker.isInitialized) return
-        val choice = when (type) {
-            PreparationIdentityType.RESEARCH_ID -> researchIdChoice
-            PreparationIdentityType.LOCAL_NAME -> localNameChoice
-        }
-        if (!choice.isChecked) choice.isChecked = true
-        identityInputLabel.text = when (type) {
-            PreparationIdentityType.RESEARCH_ID -> "研究编号"
-            PreparationIdentityType.LOCAL_NAME -> "本地姓名"
-        }
-        participantInput.hint = identityHintText(type)
-        identityHelp.text = identityHelpText(type)
-    }
-
-    private fun identityHintText(type: PreparationIdentityType) = when (type) {
-        PreparationIdentityType.RESEARCH_ID -> "例如 P001"
-        PreparationIdentityType.LOCAL_NAME -> "例如 张三"
-    }
-
-    private fun identityHelpText(type: PreparationIdentityType) = when (type) {
-        PreparationIdentityType.RESEARCH_ID -> "研究者分配的 3–24 位字母或数字"
-        PreparationIdentityType.LOCAL_NAME -> "仅保存在本机，研究数据使用匿名编号"
-    }
-
     private fun button(parent: LinearLayout, value: String, prominent: Boolean, action: () -> Unit) =
         ui.button(parent, value, primary = prominent, action = action)
 
@@ -1007,7 +913,6 @@ class StepPreparationActivity : Activity() {
         const val EXTRA_OPEN_SETTINGS = "com.nexthci.ringfitness.extra.OPEN_PREPARATION_SETTINGS"
         private const val STATE_PAGE = "page"
         private const val STATE_PARTICIPANT_DRAFT = "participant_draft"
-        private const val STATE_IDENTITY_TYPE = "identity_type"
         private const val STATE_PLACEMENT = "placement_draft"
         private const val STATE_PERMISSION_DENIED = "permission_denied"
         private const val STATE_RETURN_TO_SETTINGS = "return_to_settings"

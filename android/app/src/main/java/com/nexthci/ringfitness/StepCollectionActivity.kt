@@ -45,6 +45,7 @@ abstract class StepCollectionActivity : Activity() {
     private var referenceKind = "valid"
     private var draftSessionId: String? = null
     private var dialog: AlertDialog? = null
+    private var showingRecords = false
     private data class PendingReferenceRevision(
         val sessionId: String,
         val target: SessionReference,
@@ -103,7 +104,20 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun back() {
         val state = current
-        if (state?.page == CollectionPage.HOME) finish() else flow.home()
+        when {
+            showingRecords -> {
+                showingRecords = false
+                redraw()
+            }
+            state?.let(::usesHomeSurface) == true -> finish()
+            else -> flow.home()
+        }
+    }
+
+    private fun redraw() {
+        val state = current ?: return
+        current = null
+        render(state)
     }
 
     private fun rememberDrafts() {
@@ -117,6 +131,7 @@ abstract class StepCollectionActivity : Activity() {
         rememberDrafts()
         val old = current
         current = state
+        if (!usesHomeSurface(state)) showingRecords = false
         resolveReferenceRevision(state)
         if (state.session?.sessionId != null && draftSessionId != state.session.sessionId) {
             draftSessionId = state.session.sessionId
@@ -143,6 +158,8 @@ abstract class StepCollectionActivity : Activity() {
         stepsInput = null; reasonInput = null; participantInput = null; placementPicker = null; elapsedLabel = null
         val root = ui.column().apply {
             setBackgroundColor(ui.background)
+            isFocusableInTouchMode = true
+            requestFocus()
             setOnApplyWindowInsetsListener { view, insets ->
                 val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
@@ -156,25 +173,31 @@ abstract class StepCollectionActivity : Activity() {
         val header = ui.column(root, 20).apply { setPadding(ui.dp(20), ui.dp(4), ui.dp(20), ui.dp(4)) }
         val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         header.addView(row)
-        val returnLabel = if (state.page == CollectionPage.HOME) {
-            if (state.isSimulation) "退出演示" else "退出"
-        } else "首页"
-        val returnButton = ui.button(row, returnLabel, tag = "flow_back") { back() }
-        returnButton.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
-        returnButton.minHeight = ui.dp(48); returnButton.minimumHeight = ui.dp(48)
-        returnButton.background = ui.linkBackground()
-        returnButton.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        val homeSurface = usesHomeSurface(state)
+        if (!homeSurface || showingRecords || state.isSimulation) {
+            val returnLabel = if (homeSurface && state.isSimulation && !showingRecords) "退出演示" else "首页"
+            val returnButton = ui.button(row, returnLabel, tag = "flow_back") { back() }
+            returnButton.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+            returnButton.minHeight = ui.dp(48); returnButton.minimumHeight = ui.dp(48)
+            returnButton.background = ui.linkBackground()
+            returnButton.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+        } else {
+            ui.text(row, "步数采集", 20f, bold = true).apply {
+                tag = "flow_heading"
+                layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+            }
+        }
         if (state.isSimulation) {
             val options = ui.button(row, "演示选项", tag = "flow_options") { showOptions() }
             options.layoutParams = LinearLayout.LayoutParams(-2, -2)
             options.minHeight = ui.dp(48); options.minimumHeight = ui.dp(48)
             options.background = ui.linkBackground()
-        } else if (state.page == CollectionPage.HOME) {
-            val settings = ui.button(row, "设置", tag = "flow_settings") { openPreparationSettings() }
+        } else {
+            val settings = ui.button(row, if (state.session?.isPending == true) "信息" else "设置",
+                tag = "flow_settings") { openPreparationSettings() }
             settings.layoutParams = LinearLayout.LayoutParams(-2, -2)
             settings.minHeight = ui.dp(48); settings.minimumHeight = ui.dp(48)
             settings.background = ui.linkBackground()
-            settings.isEnabled = settingsAvailable(state)
         }
         if (state.isSimulation) {
             ui.text(header, "流程演示 · 设备与传输为模拟", 13f).apply {
@@ -205,20 +228,24 @@ abstract class StepCollectionActivity : Activity() {
         }
         else if (!state.hasProfile) registration(body, footer, state)
         else renderTask(body, footer, state)
+        if (old?.page != state.page) {
+            scroll.post {
+                root.requestFocus()
+                scroll.scrollTo(0, 0)
+            }
+        }
     }
 
     private fun renderTask(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val session = state.session
         when {
-            state.page == CollectionPage.HOME -> home(body, footer, state)
+            usesHomeSurface(state) -> if (showingRecords) records(body, state) else home(body, footer, state)
             state.page in setOf(CollectionPage.STARTING, CollectionPage.COLLECTING, CollectionPage.STOPPING) ->
                 captureSession(body, footer, state)
             state.page == CollectionPage.SAVING -> saving(body, state)
             state.page == CollectionPage.FINISH -> finishSession(body, footer, state)
             state.page == CollectionPage.REFERENCE && session?.stopConfirmedAtMs != null -> finishSession(body, footer, state)
             state.page == CollectionPage.REFERENCE -> reference(body, footer, state)
-            state.page in setOf(CollectionPage.DOWNLOADING, CollectionPage.UPLOADING, CollectionPage.COMPLETE) ->
-                transfer(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) && session == null -> recovery(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
                 session?.startAbort?.stoppedObservation != null -> recovery(body, footer, state)
@@ -231,10 +258,16 @@ abstract class StepCollectionActivity : Activity() {
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
                 session?.stopConfirmedAtMs != null && session.reference == null -> finishSession(body, footer, state)
             state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) && session?.reference != null ->
-                transfer(body, footer, state)
+                recovery(body, footer, state)
             else -> recovery(body, footer, state)
         }
     }
+
+    private fun usesHomeSurface(state: CollectionFlowState): Boolean =
+        state.page == CollectionPage.HOME ||
+            state.page in setOf(CollectionPage.DOWNLOADING, CollectionPage.UPLOADING, CollectionPage.COMPLETE) ||
+            (state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
+                state.session?.reference != null && state.session.stopConfirmedAtMs != null)
 
     private fun title(body: LinearLayout, text: String, subtitle: String? = null) {
         ui.text(body, text, 28f, bold = true).tag = "flow_heading"
@@ -250,9 +283,9 @@ abstract class StepCollectionActivity : Activity() {
     private fun registration(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         title(body, "准备开始", if (state.isSimulation) "填好信息，就可以体验一次完整记录。" else null)
         val card = ui.card(body)
-        ui.text(card, "被试编号", bold = true)
+        ui.text(card, "用户名", bold = true)
         ui.gap(card, 12)
-        participantInput = ui.input(card, if (state.isSimulation) "例如 demo001" else "填写被试编号", "flow_participant").apply { setText(participantDraft) }
+        participantInput = ui.input(card, "3–24 位字母或数字", "flow_participant").apply { setText(participantDraft) }
         ui.gap(card, 24)
         ui.text(card, "戒指佩戴位置", bold = true)
         ui.gap(card, 10)
@@ -275,8 +308,6 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun home(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
         val task = homeTask(state)
-        title(body, "步数采集")
-
         val device = ui.card(body)
         val deviceRow = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
         device.addView(deviceRow, LinearLayout.LayoutParams(-1, -2))
@@ -285,6 +316,11 @@ abstract class StepCollectionActivity : Activity() {
         ui.text(deviceText, state.ringName.ifBlank { "戒指" }, 18f, bold = true)
         ui.gap(deviceText, 6)
         ui.text(deviceText, connectionLabel(state), 14f, muted = true).tag = "home_device_status"
+        ui.gap(deviceText, 12)
+        ui.text(deviceText, listOf(
+            state.participantLabel.ifBlank { state.participantId },
+            state.placement?.displayName ?: "待选择佩戴位置",
+        ).filter { it.isNotBlank() }.joinToString(" · "), 14f, muted = true).tag = "home_profile_summary"
         when {
             state.connecting || state.checkingDevice -> deviceRow.addView(ui.progress(),
                 LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)))
@@ -296,9 +332,10 @@ abstract class StepCollectionActivity : Activity() {
             }
         }
 
-        val pendingTask = state.session?.isPending == true ||
-            (state.taskPage != null && state.session?.localData == null) || state.preservingExisting ||
-            state.connecting || state.checkingDevice || (!state.canStart && state.canRetry)
+        val pendingTask = state.session?.isPending == true || state.preservingExisting ||
+            (state.taskPage in setOf(CollectionPage.STARTING, CollectionPage.COLLECTING, CollectionPage.STOPPING,
+                CollectionPage.FINISH, CollectionPage.REFERENCE, CollectionPage.SAVING, CollectionPage.DOWNLOADING,
+                CollectionPage.RECOVERY, CollectionPage.ERROR) && state.session?.localData == null)
         if (pendingTask) {
             val taskCard = ui.card(body, ui.statusSurface)
             ui.text(taskCard, task.title, 14f, muted = true)
@@ -306,11 +343,10 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(taskCard, task.status, 24f, bold = true).tag = "home_task_status"
             task.hint?.takeIf { it.isNotBlank() }?.let { ui.gap(taskCard, 10); ui.text(taskCard, it) }
             val actionLabel = task.action.takeUnless { it.endsWith("…") }
-            val reconnectAlreadyShown = !state.connected && state.canRetry && actionLabel == "重新连接"
             val localFinishAction = state.canRecordReferenceLocally ||
                 (state.session?.stopConfirmedAtMs != null && state.session.reference == null &&
                     state.taskPage in setOf(CollectionPage.FINISH, CollectionPage.REFERENCE, CollectionPage.RECOVERY))
-            if (actionLabel != null && !reconnectAlreadyShown && (!state.busy || localFinishAction) &&
+            if (actionLabel != null && (state.connected || localFinishAction) && (!state.busy || localFinishAction) &&
                 (!state.connecting || localFinishAction)
             ) {
                 ui.gap(taskCard, 12)
@@ -325,8 +361,8 @@ abstract class StepCollectionActivity : Activity() {
                     }
                 }
             }
-        } else {
-            val startCard = ui.card(body, if (state.canStart) ui.statusSurface else ui.surface)
+        } else if (state.canStart) {
+            val startCard = ui.card(body, ui.statusSurface)
             ui.text(startCard, "本次活动", 14f, muted = true)
             ui.gap(startCard, 10)
             val choices = LinearLayout(this)
@@ -337,59 +373,92 @@ abstract class StepCollectionActivity : Activity() {
                     LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = ui.dp(12) }
             }
             ui.gap(startCard, 18)
-            ui.text(startCard, if (state.canStart) "佩戴好设备，站定后将计步器清零。" else task.status,
-                15f, muted = !state.canStart)
-            task.hint?.takeIf { !state.canStart && it.isNotBlank() }?.let {
-                ui.gap(startCard, 8); ui.text(startCard, it, 14f, muted = true)
-            }
+            ui.text(startCard, "佩戴好设备，站定后将计步器清零。", 15f, muted = true)
         }
 
-        val profile = ui.card(body)
-        detail(profile, "身份", state.participantLabel.ifBlank { state.participantId })
-        ui.gap(profile, 14)
-        detail(profile, "佩戴位置", state.placement?.displayName ?: "待填写")
         val localRecords = state.records.filter { it.localComplete }
-        val recentUploaded = localRecords.filter { it.transferStatus == "complete" }.takeLast(3).map { it.sessionId }.toSet()
-        val recentRecords = localRecords.filter { it.transferStatus != "complete" || it.sessionId in recentUploaded }.reversed()
-        if (recentRecords.isNotEmpty()) {
-            ui.text(body, "采集记录", 16f, bold = true)
-            ui.gap(body, 12)
-            recentRecords.forEach { record ->
-                val card = ui.card(body)
-                ui.text(card,
-                    listOfNotNull(formatDateTime(record.startedAtMs, record.timeZoneId), record.activity.label).joinToString(" · "),
-                    14f, muted = true).tag = "record_time_${record.sessionId}"
-                ui.gap(card, 8)
-                ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true)
-                ui.gap(card, 8)
-                ui.text(card, when {
-                    record.localReviewRequired -> "戒指数据需要检查"
-                    record.transferStatus == "complete" -> if (state.isSimulation) "已保存 · 模拟上传完成" else "已上传"
-                    record.transferInFlight -> "已保存 · 正在上传"
-                    record.uploadDeferred -> "已保存 · 稍后上传"
-                    !state.uploadAvailable -> "已保存 · 待上传"
-                    record.transferStatus in setOf("failed", "transferring") -> "已保存 · 上传待重试"
-                    else -> "已保存 · 等待上传"
-                }, 14f, muted = true).tag = "record_status_${record.sessionId}"
-                if (record.referenceStatus == "unreliable") { ui.gap(card, 8); ui.text(card, "读数有异常", 14f, muted = true) }
-                if (record.referenceEditable) {
-                    ui.button(card, "修改步数", tag = "edit_reference_${record.sessionId}") {
-                        showReferenceCorrectionStatus(record)
-                    }
-                }
-                if (state.uploadAvailable && !record.transferInFlight && record.transferStatus != "complete") {
-                    ui.button(card, when {
-                        record.localReviewRequired -> "重新检查"
-                        record.transferStatus == "pending" -> "上传记录"
-                        else -> "重试上传"
-                    }, tag = "retry_upload_${record.sessionId}") { flow.retryUpload(record.sessionId) }
-                }
+        if (localRecords.isNotEmpty()) {
+            val recordsCard = ui.card(body)
+            ui.text(recordsCard, "采集记录", 16f, bold = true)
+            ui.gap(recordsCard, 10)
+            ui.text(recordsCard, recordsSummary(localRecords), 14f, muted = true).tag = "home_records_summary"
+            ui.button(recordsCard, "查看记录", tag = "open_records") {
+                showingRecords = true
+                redraw()
             }
         }
         if (!pendingTask && state.canStart && state.selectedActivity != null && !state.busy) {
             action(footer, "开始采集") { flow.start() }
         } else if (!pendingTask && state.canStart && state.selectedActivity == null) {
             ui.text(footer, "选择走路或跑步后开始。", 14f, muted = true)
+        }
+    }
+
+    private fun records(body: LinearLayout, state: CollectionFlowState) {
+        title(body, "采集记录")
+        val records = state.records.filter { it.localComplete }.reversed()
+        if (records.isEmpty()) {
+            val empty = ui.card(body)
+            ui.text(empty, "暂无记录", 16f, muted = true)
+            return
+        }
+        records.forEach { record ->
+            val card = ui.card(body)
+            ui.text(card, listOfNotNull(
+                formatDateTime(record.startedAtMs, record.timeZoneId) ?: "开始时间待核对",
+                record.activity.label,
+            ).joinToString(" · "), 14f, muted = true).tag = "record_time_${record.sessionId}"
+            ui.gap(card, 8)
+            ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true).tag =
+                "record_steps_${record.sessionId}"
+            ui.gap(card, 8)
+            ui.text(card, recordStatus(record, state), 14f, muted = true).tag = "record_status_${record.sessionId}"
+            if (record.referenceStatus == "unreliable") {
+                ui.gap(card, 8)
+                ui.text(card, "读数已注明异常", 14f, muted = true)
+            }
+            if (record.referenceEditable) {
+                ui.button(card, "修改步数", tag = "edit_reference_${record.sessionId}") {
+                    showReferenceCorrectionStatus(record)
+                }
+            }
+            recordAction(record, state)?.let { (label, action) ->
+                ui.button(card, label, tag = "retry_upload_${record.sessionId}") { action() }
+            }
+        }
+    }
+
+    private fun recordsSummary(records: List<FlowRecordSummary>): String {
+        val pending = records.count { it.transferStatus != "complete" }
+        return when {
+            records.any { it.localReviewRequired } -> "${records.size} 条记录 · 有数据需要检查"
+            records.any { it.transferStatus == "failed" } -> "${records.size} 条记录 · 有上传需要重试"
+            pending > 0 -> "${records.size} 条记录 · $pending 条等待上传"
+            else -> "${records.size} 条记录 · 已全部上传"
+        }
+    }
+
+    private fun recordStatus(record: FlowRecordSummary, state: CollectionFlowState): String = when {
+        record.localReviewRequired -> if (record.transferInFlight) "正在校验上传文件" else "上传校验未通过"
+        record.transferStatus == "complete" -> if (state.isSimulation) "模拟上传完成" else "已上传"
+        record.transferInFlight -> "正在上传"
+        record.uploadDeferred -> "已保存，稍后上传"
+        !state.uploadAvailable -> "已保存在手机"
+        record.transferStatus == "failed" -> "上传失败，数据已保存在手机"
+        else -> "等待网络，将自动上传"
+    }
+
+    private fun recordAction(record: FlowRecordSummary, state: CollectionFlowState): Pair<String, () -> Unit>? {
+        if (!state.uploadAvailable || record.transferInFlight || record.transferStatus == "complete" ||
+            record.localReviewRequired) return null
+        val label = when {
+            record.uploadDeferred -> "上传"
+            record.transferStatus == "failed" -> "重试上传"
+            else -> return null
+        }
+        return label to {
+            flow.retryUpload(record.sessionId)
+            Toast.makeText(this, "已请求上传，结果将在此更新", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -404,7 +473,7 @@ abstract class StepCollectionActivity : Activity() {
         state.session?.startAbort?.stoppedObservation != null && state.session.isPending ->
             if (state.preservingExisting || state.taskPage == CollectionPage.DOWNLOADING)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
-            else HomeTask("数据待保存", "戒指已停止", "继续保存", state.error)
+            else HomeTask("数据待保存", "戒指已停止", "继续保存", displayError(state.error))
         state.preservingExisting -> HomeTask("准备戒指", "正在保存已有数据", "保存中…", "保存完成后即可开始。")
         state.checkingDevice -> HomeTask("设备", "正在检查戒指", "检查中…")
         state.canStopUnconfirmedStart -> HomeTask("当前记录", "需要结束戒指记录", "结束并保存可用数据", "数据会保留在手机。")
@@ -572,13 +641,23 @@ abstract class StepCollectionActivity : Activity() {
                 action(footer, "保存，稍后上传", !state.busy) { submitFinish(false) }
             else -> {
                 action(footer, "保存并上传", !state.busy) { submitFinish(true) }
-                ui.button(footer, "保存，稍后上传", tag = "finish_defer") { submitFinish(false) }
-                    .isEnabled = !state.busy
+                val secondary = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                footer.addView(secondary, LinearLayout.LayoutParams(-1, -2))
+                ui.button(secondary, "保存，稍后上传", tag = "finish_defer") { submitFinish(false) }.apply {
+                    isEnabled = !state.busy
+                    layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = ui.dp(6) }
+                }
+                ui.button(secondary, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
+                    isEnabled = !state.busy
+                    layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = ui.dp(6) }
+                }
             }
         }
-        ui.button(footer, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
-            isEnabled = !state.busy
-            background = ui.linkBackground()
+        if (fixedPolicy != null || !state.uploadAvailable) {
+            ui.button(footer, "放弃本段", tag = "finish_discard") { showDiscardConfirmation() }.apply {
+                isEnabled = !state.busy
+                background = ui.linkBackground()
+            }
         }
     }
 
@@ -632,82 +711,6 @@ abstract class StepCollectionActivity : Activity() {
             rememberDrafts(); hideKeyboard()
             flow.saveReference(stepsDraft, referenceKind, if (referenceKind == "valid") "" else reasonDraft)
         }
-    }
-
-    private fun transfer(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        val complete = state.page == CollectionPage.COMPLETE
-        val session = state.session
-        if (session?.startAbort != null) {
-            title(body, "正在保留戒指数据", "戒指已停止，请稍等片刻。")
-            val progress = ui.card(body)
-            detail(progress, "本次数据", "保存中")
-            progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
-                topMargin = ui.dp(20); gravity = Gravity.CENTER
-            })
-            action(footer, "返回首页") { flow.home() }
-            return
-        }
-        val reference = session?.reference
-        val localReviewRequired = state.records.any { it.sessionId == session?.sessionId && it.localReviewRequired }
-        val localComplete = session?.localData?.files?.let { files ->
-            files.isNotEmpty() && files.all { it.simulated == state.isSimulation }
-        } == true
-        val uploaded = !localReviewRequired && localComplete && session?.transfer?.status == SessionTransferStatus.COMPLETE &&
-            session.transfer.receipt?.let { it.sessionId == session.sessionId && it.simulated == state.isSimulation } == true
-        val uploadInFlight = localComplete && (state.records.any { it.sessionId == session?.sessionId && it.transferInFlight } ||
-            state.isSimulation && state.page == CollectionPage.UPLOADING)
-        title(body, when {
-            localReviewRequired && state.busy -> "正在检查戒指数据"
-            localReviewRequired -> "戒指数据需要检查"
-            complete && localComplete -> "这一段已保存"
-            complete -> "正在完成本地保存"
-            else -> "正在整理记录"
-        }, when {
-            localReviewRequired && state.busy -> "步数已保存，正在重新校验本地文件。"
-            localReviewRequired -> "步数已保存，请重新检查本地文件。"
-            localComplete -> "本次记录已经保存在手机。"
-            reference != null -> "步数已保存，请稍等片刻。"
-            else -> "正在核对本次记录。"
-        })
-        val summary = ui.card(body, ui.statusSurface)
-        ui.text(summary, reference?.steps?.let { "$it 步" } ?: if (reference != null) "未提供读数" else "待保存读数",
-            36f, bold = true).tag = "saved_reference"
-        ui.gap(summary, 14)
-        ui.text(summary, if (reference?.status == ReferenceStatus.UNRELIABLE) "已附上异常说明" else "本次计步器读数", 14f)
-        val progress = ui.card(body)
-        detail(progress, "计步器读数", if (reference != null) "已保存" else "待保存")
-        ui.gap(progress, 20)
-        detail(progress, "戒指数据", when {
-            localReviewRequired && state.busy -> "正在校验"
-            localReviewRequired -> "待检查"
-            localComplete -> "已保存"
-            state.page == CollectionPage.DOWNLOADING -> "正在下载…"
-            else -> "待下载"
-        })
-        ui.gap(progress, 20)
-        detail(progress, if (state.isSimulation) "模拟上传" else "上传", when {
-            localReviewRequired -> "等待文件检查"
-            uploaded -> "已完成"
-            uploadInFlight -> "正在上传…"
-            session?.completionPolicy == CompletionPolicy.SAVE_LATER -> "稍后上传"
-            !state.uploadAvailable -> "待上传"
-            localComplete && session?.transfer?.status in setOf(SessionTransferStatus.FAILED, SessionTransferStatus.TRANSFERRING) -> "上传待重试"
-            localComplete -> "待上传"
-            else -> "等待下载完成"
-        })
-        if (state.uploadAvailable && localComplete && !uploaded && !uploadInFlight && session != null) {
-            ui.button(progress,
-                when {
-                    localReviewRequired -> "重新检查"
-                    session.transfer.status == SessionTransferStatus.PENDING -> "上传记录"
-                    else -> "重试上传"
-                },
-                tag = "retry_upload_${session.sessionId}") { flow.retryUpload(session.sessionId) }
-        }
-        if (!complete || uploadInFlight) progress.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)).apply {
-            topMargin = ui.dp(20); gravity = Gravity.CENTER
-        })
-        action(footer, "返回首页") { flow.home() }
     }
 
     private fun showReferenceCorrectionStatus(record: FlowRecordSummary) {
@@ -851,7 +854,7 @@ abstract class StepCollectionActivity : Activity() {
             action(footer, "停止并保留数据", !state.busy) { flow.stop() }
         } else if (retryEnabled) action(footer, retryLabel, block = retry)
         if (session == null && !state.isSimulation && !state.busy && !RealCollectionBridge.isRunning()) {
-            ui.button(body, "检查身份与戒指", tag = "recovery_settings") { openPreparationSettings() }
+            ui.button(body, "检查用户与戒指", tag = "recovery_settings") { openPreparationSettings() }
         }
     }
 
@@ -882,36 +885,53 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun connectionLabel(state: CollectionFlowState): String = when {
-        state.connecting -> "正在连接…"
-        !state.connected -> "连接已中断"
-        state.checkingDevice -> "已连接，正在检查"
-        state.preservingExisting -> "已连接，正在保存已有数据"
+        state.connecting -> "正在连接"
+        !state.connected -> "未连接"
+        state.checkingDevice -> "正在检查"
+        state.preservingExisting -> "正在保存戒指数据"
         state.session?.isPending == true -> "已连接"
         state.canStart -> "可以开始"
-        else -> "已连接，暂不可开始"
+        else -> "需要检查"
     }
 
     private fun openPreparationSettings() {
         val state = current ?: return
-        val recoverySettings = state.session == null && state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
-            !state.busy && !state.isSimulation && !RealCollectionBridge.isRunning()
-        if (!settingsAvailable(state) && !recoverySettings) return
+        if (state.isSimulation) return
+        if (state.session?.isPending == true) {
+            dialog?.dismiss()
+            dialog = AlertDialog.Builder(this)
+                .setTitle("用户与戒指")
+                .setMessage(listOf(
+                    "用户名：${state.participantLabel.ifBlank { state.participantId }}",
+                    "戒指：${state.ringName.ifBlank { "已选戒指" }}",
+                    "佩戴位置：${state.placement?.displayName ?: "待选择"}",
+                ).joinToString("\n"))
+                .setPositiveButton("关闭", null)
+                .show()
+            return
+        }
         startActivity(Intent(this, StepPreparationActivity::class.java)
             .putExtra(StepPreparationActivity.EXTRA_OPEN_SETTINGS, true)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP))
         finish()
     }
 
-    private fun settingsAvailable(state: CollectionFlowState): Boolean =
-        state.page == CollectionPage.HOME && !state.isSimulation
-
     private fun displayError(message: String?): String? = message?.let { raw ->
         when {
             raw.contains("权限") -> "请允许蓝牙权限后重试。"
             raw.contains("蓝牙已关闭") -> "请打开手机蓝牙后重试。"
             raw.contains("空间") -> "手机存储空间不足，请清理空间后重试。"
-            raw.contains("连接") || raw.contains("超时") -> "请将戒指靠近手机后重试。"
-            else -> raw
+            raw.contains("-16") || raw.contains("充电") -> "请将戒指取出充电盒，等待 10 秒后重新检查。"
+            raw.contains("仍在采集") || raw.contains("仍在记录") -> "戒指仍在记录，请结束并保存当前数据。"
+            raw.contains("指纹") || raw.contains("校验") || raw.contains("不完整") ->
+                "数据检查未完成，请重试。"
+            raw.contains("连接") || raw.contains("超时") || raw.contains("靠近") -> "请将戒指靠近手机后重试。"
+            raw.contains("上传") || raw.contains("网络") -> "数据已保存在手机，联网后可继续上传。"
+            raw.contains("下载") || raw.contains("文件") -> "数据下载未完成，请重试。"
+            raw.contains("未保存") || raw.contains("保存失败") -> "步数未保存，请重试。"
+            raw.contains("身份") || raw.contains("用户") || raw.contains("佩戴") -> "请检查用户名与戒指设置。"
+            raw.contains("联系研究者") -> "本次记录需要检查，请重试。"
+            else -> "暂时无法完成，请重试。"
         }
     }
 

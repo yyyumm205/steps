@@ -31,6 +31,90 @@ class PreparationStoreTest {
     private val ring = PreparedRing("A1:B2:C3:D4:E5:F6", "Ringo 戒指")
 
     @Test
+    fun usernameKeepsTheSameIdentifierAcrossSwitchLogoutAndInstallation() {
+        val file = profileFile()
+        val store = PreparationStore(file)
+        val first = store.registerUsername(" Alice01 ", RingPlacement.RIGHT_INDEX)
+        val selected = store.selectRing(ring)
+        assertEquals("alice01", first.participantId)
+        assertEquals("alice01", first.displayLabel)
+        assertEquals(selected, PreparationStore(file).read())
+        assertEquals(selected, store.registerUsername("ALICE01"))
+        assertEquals(selected, store.replaceCurrentUsername("aLiCe01", collectionIsIdle = true))
+
+        val other = store.replaceCurrentUsername("Bob02", collectionIsIdle = true)
+        assertEquals("bob02", other.participantId)
+        assertNull(other.ring)
+        assertNull(other.placement)
+        val returned = store.replaceCurrentUsername("ALICE01", collectionIsIdle = true)
+        assertEquals(first.participantId, returned.participantId)
+        store.clearCurrentProfile(collectionIsIdle = true)
+        val signedInAgain = store.registerUsername("alice01")
+        assertEquals(first.participantId, signedInAgain.participantId)
+        assertEquals(first.installationId, signedInAgain.installationId)
+
+        val otherPhone = PreparationStore(File(temporary.root, "other-phone/profile.properties"))
+            .registerUsername("ALICE01")
+        assertEquals(first.participantId, otherPhone.participantId)
+        assertNotEquals(first.installationId, otherPhone.installationId)
+    }
+
+    @Test
+    fun usernameRejectsInvalidInputAndPreservesCurrentIdentityOnFailedSwitch() {
+        val file = profileFile()
+        val store = PreparationStore(file)
+        for (invalid in listOf("", "ab", "张三", "alice bob", "alice_01", "a".repeat(25))) {
+            assertThrows(IllegalArgumentException::class.java) { store.registerUsername(invalid) }
+            assertNull(store.read())
+        }
+        store.registerUsername("Alice01", RingPlacement.LEFT_INDEX)
+        val saved = store.selectRing(ring)
+        val bytes = file.readBytes()
+        assertThrows(IllegalArgumentException::class.java) { store.registerUsername("bob02") }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.replaceCurrentUsername("bob02", collectionIsIdle = false)
+        }
+        val failing = PreparationStore(file) { _, _ -> throw IOException("simulated full disk") }
+        assertThrows(IOException::class.java) {
+            failing.replaceCurrentUsername("bob02", collectionIsIdle = true)
+        }
+        assertEquals(saved, store.read())
+        assertArrayEquals(bytes, file.readBytes())
+    }
+
+    @Test
+    fun returningFromLegacyTestProfileUsesUsernameWithoutRewritingOldSession() {
+        val store = PreparationStore(profileFile())
+        store.register("Alice01", RingPlacement.RIGHT_INDEX, PreparationIdentityType.LOCAL_NAME)
+        val legacy = store.selectRing(ring)
+        val journal = File(temporary.newFolder("collection"), "session.json")
+        val sessions = FreeLivingSessionStore(journal, { source, target ->
+            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING)
+        }, {})
+        sessions.requestStart(legacy, 1_000, "Asia/Shanghai")
+        val bytes = journal.readBytes()
+
+        // The caller permits profile changes only when its collection owner is idle.
+        val replacement = store.replaceCurrentUsername("Alice01", collectionIsIdle = true)
+        assertEquals("alice01", replacement.participantId)
+        assertNotEquals(legacy.participantId, replacement.participantId)
+        assertArrayEquals(bytes, journal.readBytes())
+        assertEquals(legacy.participantId, sessions.read()!!.preparation.participantId)
+    }
+
+    @Test
+    fun usernameNormalizationDoesNotDependOnPhoneLanguage() {
+        val previous = Locale.getDefault()
+        try {
+            Locale.setDefault(Locale.forLanguageTag("tr-TR"))
+            assertEquals("i001", PreparationStore(profileFile()).registerUsername(" I001 ").participantId)
+        } finally {
+            Locale.setDefault(previous)
+        }
+    }
+
+    @Test
     fun firstReadDoesNotCreateIdentityOrFiles() {
         val file = profileFile()
         assertNull(PreparationStore(file).read())

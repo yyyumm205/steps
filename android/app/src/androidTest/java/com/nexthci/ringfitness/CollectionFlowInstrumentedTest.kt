@@ -260,6 +260,7 @@ class CollectionFlowInstrumentedTest {
                     FlowRecordSummary("catalog-history-uploaded", 562, "valid", "complete", true,
                         activity = SessionActivity.WALKING))
                 screen("catalog_home_history_top", base.copy(canStart = true, records = history))
+                click(scenario, "open_records")
                 capture("catalog_home_history_uploaded", "record_status_catalog-history-uploaded")
                 capture("catalog_home_history_queue", "record_status_catalog-history-queued")
                 capture("catalog_home_history_uploading", "record_status_catalog-history-uploading")
@@ -355,10 +356,10 @@ class CollectionFlowInstrumentedTest {
             assertEquals(0, saved.transfer.attempts)
             assertNull(saved.transfer.receipt)
             captureReviewScreen(scenario, "deferred_saved")
-            click(scenario, "flow_primary")
             awaitHeading(scenario, "步数采集")
+            openRecords(scenario)
             scenario.onActivity {
-                assertEquals("已保存 · 稍后上传", tagged<TextView>(it, "record_status_${saved.sessionId}").text.toString())
+                assertEquals("已保存，稍后上传", tagged<TextView>(it, "record_status_${saved.sessionId}").text.toString())
                 assertNull(taggedOrNull<Button>(it, "flow_primary"))
             }
             captureReviewScreen(scenario, "deferred_history")
@@ -366,6 +367,7 @@ class CollectionFlowInstrumentedTest {
         launch().use { reopened ->
             awaitHeading(reopened, "步数采集")
             assertEquals(saved, session(handle))
+            openRecords(reopened)
             click(reopened, "retry_upload_${saved.sessionId}")
             awaitFlow(handle, "manual upload receipt") { it.records.single().transferStatus == "complete" }
             assertEquals(saved.reference, session(handle).reference)
@@ -383,10 +385,12 @@ class CollectionFlowInstrumentedTest {
             type(scenario, "flow_steps", "73")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
+            awaitFlow(handle, "previous record upload completes before discard isolation check") {
+                it.records.single().transferStatus == "complete"
+            }
             val previous = session(handle)
             val otherFiles = handle.directory.listFiles()!!.filter { it.name.startsWith(previous.sessionId) }
                 .associate { it.name to hash(it.readBytes()) }
-            click(scenario, "flow_primary")
             awaitHeading(scenario, "步数采集")
             val discardedId = reachFinish(scenario, handle, SessionActivity.RUNNING)
             val stopped = session(handle)
@@ -441,13 +445,18 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
             val first = session(handle)
-            click(scenario, "flow_primary")
             awaitHeading(scenario, "步数采集")
             scenario.onActivity { assertNull(taggedOrNull<Button>(it, "flow_primary")) }
             reachFinish(scenario, handle, SessionActivity.RUNNING)
             assertEquals(SessionActivity.RUNNING, session(handle).activity)
             assertNotEquals(first.sessionId, session(handle).sessionId)
-            assertEquals(first, FreeLivingSessionStore(File(handle.directory, "session.json")).read(first.sessionId))
+            val persistedFirst = requireNotNull(
+                FreeLivingSessionStore(File(handle.directory, "session.json")).read(first.sessionId))
+            // The previous upload may finish while the next activity is collected.
+            assertEquals(first.copy(transfer = persistedFirst.transfer), persistedFirst)
+            awaitFlow(handle, "previous activity upload completes independently") {
+                it.records.single { record -> record.sessionId == first.sessionId }.transferStatus == "complete"
+            }
         }
     }
 
@@ -465,7 +474,7 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("正在恢复", tagged<TextView>(activity, "flow_heading").text.toString())
                 assertEquals("继续恢复", tagged<Button>(activity, "flow_primary").text.toString())
                 assertTrue(tagged<Button>(activity, "flow_primary").isEnabled)
-                assertEquals("已连接，暂不可开始", tagged<TextView>(activity, "flow_detail_戒指").text.toString())
+                assertEquals("需要检查", tagged<TextView>(activity, "flow_detail_戒指").text.toString())
                 assertNull(taggedOrNull<View>(activity, "saved_reference"))
                 assertNull(taggedOrNull<View>(activity, "preserve_reference"))
                 assertNull(taggedOrNull<View>(activity, "end_start_attempt"))
@@ -539,10 +548,10 @@ class CollectionFlowInstrumentedTest {
             }
             renderFixture(scenario, fixture)
             scenario.onActivity {
-                assertEquals("正在保留戒指数据", tagged<TextView>(it, "flow_heading").text.toString())
-                assertEquals("保存中", tagged<TextView>(it, "flow_detail_本次数据").text.toString())
-                assertEquals("返回首页", tagged<Button>(it, "flow_primary").text.toString())
-                assertTrue(tagged<Button>(it, "flow_primary").isEnabled)
+                assertEquals("步数采集", tagged<TextView>(it, "flow_heading").text.toString())
+                assertEquals("戒指已停止", tagged<TextView>(it, "home_task_status").text.toString())
+                assertNull(taggedOrNull<Button>(it, "flow_primary"))
+                assertNull(taggedOrNull<Button>(it, "home_task_action"))
                 assertNoResearchCompletion(it)
             }
             fixture.state = fixture.state.copy(page = CollectionPage.HOME)
@@ -655,14 +664,15 @@ class CollectionFlowInstrumentedTest {
                 assertNull(fixture.state.session!!.startAttemptArchive)
                 assertNull(fixture.state.session!!.localData)
             }
-            fixture.state = fixture.state.copy(page = CollectionPage.HOME, taskPage = null,
+            fixture.state = fixture.state.copy(page = CollectionPage.HOME, taskPage = CollectionPage.RECOVERY,
                 session = null, canEndStartAttempt = false, error = "戒指返回异常，请重新连接后再试")
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertEquals("步数采集", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("已连接，暂不可开始", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertEquals("需要检查", tagged<TextView>(activity, "home_device_status").text.toString())
                 assertEquals("戒指暂未就绪", tagged<TextView>(activity, "home_task_status").text.toString())
                 assertEquals("重新检查", tagged<Button>(activity, "home_task_action").text.toString())
+                assertNull(taggedOrNull<View>(activity, "home_recheck"))
                 assertNull(taggedOrNull<View>(activity, "end_start_attempt"))
             }
             fixture.state = fixture.state.copy(page = CollectionPage.HOME)
@@ -676,7 +686,7 @@ class CollectionFlowInstrumentedTest {
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertEquals("正在检查戒指", tagged<TextView>(activity, "home_task_status").text.toString())
-                assertEquals("已连接，正在检查", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertEquals("正在检查", tagged<TextView>(activity, "home_device_status").text.toString())
                 assertNull(taggedOrNull<Button>(activity, "flow_primary"))
                 assertNull(taggedOrNull<Button>(activity, "home_task_action"))
             }
@@ -699,22 +709,26 @@ class CollectionFlowInstrumentedTest {
                 hasProfile = true, participantId = "view001", placement = RingPlacement.LEFT_INDEX,
                 connected = true, canStart = true, records = history, selectedActivity = SessionActivity.WALKING))
             renderFixture(scenario, fixture)
+            scenario.onActivity {
+                assertNotNull(taggedOrNull<View>(it, "home_records_summary"))
+                assertEquals("开始采集", tagged<Button>(it, "flow_primary").text.toString())
+            }
+            openRecords(scenario)
             scenario.onActivity { activity ->
                 fun statuses(view: View): List<String> = buildList {
                     (view.tag as? String)?.takeIf { it.startsWith("record_status_") }?.let { add(it.removePrefix("record_status_")) }
                     if (view is ViewGroup) repeat(view.childCount) { addAll(statuses(view.getChildAt(it))) }
                 }
-                assertEquals(history.drop(1).reversed().map { it.sessionId },
+                assertEquals(history.reversed().map { it.sessionId },
                     statuses(activity.findViewById(android.R.id.content)))
-                assertNull(taggedOrNull<View>(activity, "record_status_uploaded-old"))
-                assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
-                history.filter { it.transferStatus != "complete" }.forEach {
+                history.filter { it.transferStatus == "failed" }.forEach {
                     val retry = tagged<Button>(activity, "retry_upload_${it.sessionId}")
                     assertTrue(retry.isEnabled)
                     retry.performClick()
                 }
+                assertNull(taggedOrNull<View>(activity, "retry_upload_pending-d"))
             }
-            assertEquals(history.filter { it.transferStatus != "complete" }.map { it.sessionId }, fixture.uploadRetries)
+            assertEquals(history.filter { it.transferStatus == "failed" }.map { it.sessionId }, fixture.uploadRetries)
         }
     }
 
@@ -730,6 +744,7 @@ class CollectionFlowInstrumentedTest {
             launch().use { scenario ->
                 TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
                 renderFixture(scenario, fixture)
+                openRecords(scenario)
                 scenario.onActivity {
                     assertEquals("2026-09-19 00:05 · 走路",
                         tagged<TextView>(it, "record_time_timezone-history").text.toString())
@@ -761,28 +776,33 @@ class CollectionFlowInstrumentedTest {
                 records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "transferring", true, true))))
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("这一段已保存", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("正在上传…", tagged<TextView>(activity, "flow_detail_上传").text.toString())
-                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
-                assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
+                assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
                 assertNull(taggedOrNull<View>(activity, "flow_error"))
+            }
+            openRecords(scenario)
+            scenario.onActivity { activity ->
+                assertEquals("正在上传", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
             }
             fixture.state = fixture.state.copy(session = session.copy(
                 transfer = SessionTransfer(SessionTransferStatus.FAILED, 1)),
                 records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "failed", true)))
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("上传待重试", tagged<TextView>(activity, "flow_detail_上传").text.toString())
-                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
+                assertEquals("上传失败，数据已保存在手机",
+                    tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("重试上传", tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
             }
             click(scenario, "retry_upload_${session.sessionId}")
             assertEquals(listOf(session.sessionId), fixture.uploadRetries)
             fixture.state = fixture.state.copy(page = CollectionPage.HOME)
             renderFixture(scenario, fixture)
+            click(scenario, "flow_back")
             scenario.onActivity { activity ->
                 assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
                 assertNull(taggedOrNull<View>(activity, "flow_error"))
             }
+            openRecords(scenario)
             click(scenario, "retry_upload_${session.sessionId}")
             assertEquals(listOf(session.sessionId, session.sessionId), fixture.uploadRetries)
             fixture.state = fixture.state.copy(page = CollectionPage.COMPLETE,
@@ -791,10 +811,34 @@ class CollectionFlowInstrumentedTest {
                 records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "complete", true)))
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("已完成", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("已上传", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
                 assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
-                assertEquals("返回首页", tagged<Button>(activity, "flow_primary").text.toString())
             }
+        }
+    }
+
+    @Test fun pendingRecordInformationKeepsReferenceDraftOnTheSamePage() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.FINISH, isSimulation = false,
+                uploadAvailable = true, hasProfile = true, participantId = preparation.participantId,
+                placement = preparation.placement, ringName = "Ringo test", session = renderingSession(preparation)))
+            renderFixture(scenario, fixture)
+            type(scenario, "flow_steps", "123")
+            scenario.onActivity { activity ->
+                assertEquals("信息", tagged<Button>(activity, "flow_settings").text.toString())
+                tagged<Button>(activity, "flow_settings").performClick()
+                val dialog = StepCollectionActivity::class.java.getDeclaredField("dialog")
+                    .apply { isAccessible = true }.get(activity) as AlertDialog
+                assertTrue(dialog.isShowing)
+                assertTrue(dialog.findViewById<TextView>(android.R.id.message).text.contains(preparation.participantId))
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
+                assertFalse(activity.isFinishing)
+                assertEquals("123", tagged<EditText>(activity, "flow_steps").text.toString())
+            }
+            click(scenario, "flow_primary")
+            assertEquals("123", fixture.finalizedReference!!.second.first)
         }
     }
 
@@ -811,24 +855,20 @@ class CollectionFlowInstrumentedTest {
                 records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "pending", true,
                     localReviewRequired = true))))
             renderFixture(scenario, fixture)
+            openRecords(scenario)
             scenario.onActivity { activity ->
-                assertEquals("戒指数据需要检查", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("17 步", tagged<TextView>(activity, "saved_reference").text.toString())
-                assertEquals("已保存", tagged<TextView>(activity, "flow_detail_计步器读数").text.toString())
-                assertEquals("待检查", tagged<TextView>(activity, "flow_detail_戒指数据").text.toString())
-                assertEquals("等待文件检查", tagged<TextView>(activity, "flow_detail_上传").text.toString())
-                assertEquals("重新检查", tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+                assertEquals("17 步", tagged<TextView>(activity, "record_steps_${session.sessionId}").text.toString())
+                assertEquals("上传校验未通过", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertNull(taggedOrNull<Button>(activity, "retry_upload_${session.sessionId}"))
             }
-            click(scenario, "retry_upload_${session.sessionId}")
-            assertEquals(listOf(session.sessionId), fixture.uploadRetries)
+            assertTrue(fixture.uploadRetries.isEmpty())
             fixture.state = fixture.state.copy(page = CollectionPage.HOME)
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("戒指数据需要检查", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
-                assertEquals("重新检查", tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+                assertEquals("上传校验未通过", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertNull(taggedOrNull<Button>(activity, "retry_upload_${session.sessionId}"))
             }
-            click(scenario, "retry_upload_${session.sessionId}")
-            assertEquals(listOf(session.sessionId, session.sessionId), fixture.uploadRetries)
+            assertTrue(fixture.uploadRetries.isEmpty())
         }
     }
 
@@ -843,16 +883,16 @@ class CollectionFlowInstrumentedTest {
                 assertNull(taggedOrNull<View>(activity, "flow_options"))
                 assertNull(taggedOrNull<View>(activity, "home_manage"))
                 assertTrue(tagged<Button>(activity, "flow_settings").isEnabled)
-                assertEquals("退出", tagged<Button>(activity, "flow_back").text.toString())
-                assertEquals("正在连接…", tagged<TextView>(activity, "home_device_status").text.toString())
-                assertEquals("正在连接戒指", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertNull(taggedOrNull<View>(activity, "flow_back"))
+                assertEquals("正在连接", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertNull(taggedOrNull<View>(activity, "home_task_status"))
                 assertNull(taggedOrNull<Button>(activity, "flow_primary"))
                 assertNull(taggedOrNull<Button>(activity, "home_task_action"))
             }
             fixture.state = fixture.state.copy(connecting = false, canRetry = true)
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("连接已中断", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertEquals("未连接", tagged<TextView>(activity, "home_device_status").text.toString())
                 assertEquals("重新连接", tagged<Button>(activity, "home_reconnect").text.toString())
                 assertNull("The disconnected home has one reconnect action",
                     taggedOrNull<Button>(activity, "home_task_action"))
@@ -881,7 +921,7 @@ class CollectionFlowInstrumentedTest {
             fixture.state = fixture.state.copy(canStart = false, checkingDevice = true, busy = true)
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("已连接，正在检查", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertEquals("正在检查", tagged<TextView>(activity, "home_device_status").text.toString())
                 assertTrue(tagged<Button>(activity, "flow_settings").isEnabled)
                 assertNull(taggedOrNull<View>(activity, "home_manage"))
             }
@@ -947,28 +987,28 @@ class CollectionFlowInstrumentedTest {
                 placement = preparation.placement, session = session, savedSteps = 562))
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("正在完成本地保存", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("待保存读数", tagged<TextView>(activity, "saved_reference").text.toString())
-                assertEquals("待保存", tagged<TextView>(activity, "flow_detail_计步器读数").text.toString())
-                assertEquals("待下载", tagged<TextView>(activity, "flow_detail_戒指数据").text.toString())
+                assertNull(taggedOrNull<View>(activity, "home_records_summary"))
+                assertTrue(visibleTexts(activity.window.decorView).none { it.contains("已上传") })
             }
             // These are UI-only evidence fixtures. No BLE, real raw file or cloud request is made.
             val local = session.copy(reference = SessionReference(ReferenceStatus.VALID, 0, 4_000),
                 localData = SessionLocalData(listOf(SessionRawFile("view.rfbin", 1, 1, "0".repeat(64))), 5_000))
-            fixture.state = fixture.state.copy(session = local)
+            val pendingRecord = FlowRecordSummary(local.sessionId, 0, "valid", "pending", true)
+            fixture.state = fixture.state.copy(session = local, records = listOf(pendingRecord))
             renderFixture(scenario, fixture)
+            openRecords(scenario)
             scenario.onActivity { activity ->
-                assertEquals("这一段已保存", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("0 步", tagged<TextView>(activity, "saved_reference").text.toString())
-                assertEquals("已保存", tagged<TextView>(activity, "flow_detail_戒指数据").text.toString())
-                assertEquals("待上传", tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("0 步", tagged<TextView>(activity, "record_steps_${local.sessionId}").text.toString())
+                assertEquals("已保存在手机",
+                    tagged<TextView>(activity, "record_status_${local.sessionId}").text.toString())
             }
             fixture.state = fixture.state.copy(session = local.copy(transfer = SessionTransfer(
-                SessionTransferStatus.COMPLETE, 1, SessionTransferReceipt("view-receipt", 6_000, true, local.sessionId))))
+                SessionTransferStatus.COMPLETE, 1, SessionTransferReceipt("view-receipt", 6_000, true, local.sessionId))),
+                records = listOf(pendingRecord))
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
-                assertEquals("A simulated receipt cannot confirm a real upload", "待上传",
-                    tagged<TextView>(activity, "flow_detail_上传").text.toString())
+                assertEquals("A simulated receipt cannot confirm a real upload", "已保存在手机",
+                    tagged<TextView>(activity, "record_status_${local.sessionId}").text.toString())
             }
         }
     }
@@ -983,9 +1023,18 @@ class CollectionFlowInstrumentedTest {
             type(scenario, "flow_steps", "562")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
+            awaitFlow(handle, "simulated upload receipt") {
+                session(handle).transfer.status == SessionTransferStatus.COMPLETE &&
+                    it.records.singleOrNull { record -> record.sessionId == id }?.transferStatus == "complete"
+            }
             captureReviewScreen(scenario, "complete")
+            openRecords(scenario)
+            await(scenario, "receipt reflected in record") {
+                taggedOrNull<TextView>(it, "record_status_$id")?.text?.toString() == "模拟上传完成"
+            }
             scenario.onActivity { activity ->
-                assertEquals("562 步", tagged<TextView>(activity, "saved_reference").text.toString())
+                assertEquals("562 步", tagged<TextView>(activity, "record_steps_$id").text.toString())
+                assertEquals("模拟上传完成", tagged<TextView>(activity, "record_status_$id").text.toString())
                 assertTrue(tagged<TextView>(activity, "demo_marker").isShown)
             }
             val saved = session(handle)
@@ -1006,12 +1055,12 @@ class CollectionFlowInstrumentedTest {
             assertNull("The simulated device must not invent a verified real signal boundary", saved.startedAtMs)
             assertNull(saved.endedAtMs)
             scenario.recreate()
-            awaitHeading(scenario, "这一段已保存")
-            assertEquals(saved, session(handle))
-            click(scenario, "flow_primary")
             awaitHeading(scenario, "步数采集")
+            assertEquals(saved, session(handle))
+            openRecords(scenario)
             scenario.onActivity {
                 assertNull(taggedOrNull<Button>(it, "flow_primary"))
+                assertEquals("562 步", tagged<TextView>(it, "record_steps_$id").text.toString())
             }
             captureReviewScreen(scenario, "history")
         }
@@ -1025,13 +1074,14 @@ class CollectionFlowInstrumentedTest {
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
             scenario.recreate()
-            awaitHeading(scenario, "这一段已保存")
+            awaitHeading(scenario, "步数采集")
             val saved = session(handle)
             val reference = requireNotNull(saved.reference)
             assertEquals(0L, reference.steps)
             assertEquals(ReferenceStatus.VALID, reference.status)
             assertNotNull(reference.groundTruthRecordedAtMs)
-            scenario.onActivity { assertEquals("0 步", tagged<TextView>(it, "saved_reference").text.toString()) }
+            openRecords(scenario)
+            scenario.onActivity { assertEquals("0 步", tagged<TextView>(it, "record_steps_${saved.sessionId}").text.toString()) }
         }
     }
 
@@ -1171,9 +1221,11 @@ class CollectionFlowInstrumentedTest {
             type(scenario, "flow_steps", "101")
             click(scenario, "flow_primary")
             awaitHeading(scenario, "这一段已保存")
+            awaitFlow(handle, "upload reaches its failed terminal state") {
+                session(handle).transfer.status == SessionTransferStatus.FAILED
+            }
             assertEquals(SessionTransferStatus.FAILED, session(handle).transfer.status)
             captureReviewScreen(scenario, "upload_failure")
-            click(scenario, "flow_back")
             awaitHeading(scenario, "步数采集")
             captureReviewScreen(scenario, "upload_retry_home")
             val second = reachReference(scenario, handle)
@@ -1267,11 +1319,10 @@ class CollectionFlowInstrumentedTest {
             type(scenario, "flow_steps", "562")
             click(scenario, "flow_primary")
             awaitFlow(handle, "download is active") { it.page == CollectionPage.DOWNLOADING }
-            click(scenario, "flow_back")
             awaitHeading(scenario, "步数采集")
-            scenario.onActivity { assertEquals("查看下载", tagged<Button>(it, "home_task_action").text.toString()) }
+            scenario.onActivity { assertNull(taggedOrNull<Button>(it, "home_task_action")) }
             awaitFlow(handle, "download failure remains at home") {
-                it.page == CollectionPage.HOME && it.taskPage == CollectionPage.ERROR
+                it.page in setOf(CollectionPage.HOME, CollectionPage.ERROR) && it.taskPage == CollectionPage.ERROR
             }
             awaitHeading(scenario, "步数采集")
             scenario.onActivity {
@@ -1287,6 +1338,9 @@ class CollectionFlowInstrumentedTest {
             assertFalse(handle.flow.state.canStart)
             click(scenario, "home_task_action")
             awaitHeading(scenario, "这一段已保存")
+            awaitFlow(handle, "retried download reaches upload receipt") {
+                it.records.single { record -> record.sessionId == id }.transferStatus == "complete"
+            }
             assertEquals(id, session(handle).sessionId)
             assertEquals(saved.reference, session(handle).reference)
             assertNotNull(session(handle).localData)
@@ -1606,7 +1660,19 @@ class CollectionFlowInstrumentedTest {
     }
 
     private fun awaitHeading(scenario: ActivityScenario<DemoCollectionActivity>, text: String) =
-        await(scenario, "page $text") { taggedOrNull<TextView>(it, "flow_heading")?.text?.toString() == text }
+        await(scenario, "page $text") {
+            when (text) {
+                "步数采集" -> taggedOrNull<View>(it, "home_device_status") != null
+                "这一段已保存" -> taggedOrNull<View>(it, "home_records_summary") != null &&
+                    taggedOrNull<View>(it, "home_task_status") == null
+                else -> taggedOrNull<TextView>(it, "flow_heading")?.text?.toString() == text
+            }
+        }
+
+    private fun openRecords(scenario: ActivityScenario<DemoCollectionActivity>) {
+        click(scenario, "open_records")
+        awaitHeading(scenario, "采集记录")
+    }
 
     private fun await(scenario: ActivityScenario<DemoCollectionActivity>, description: String,
         condition: (DemoCollectionActivity) -> Boolean) {
