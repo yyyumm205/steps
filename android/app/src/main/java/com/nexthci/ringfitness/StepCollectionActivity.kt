@@ -933,6 +933,8 @@ abstract class StepCollectionActivity : Activity() {
                     "用户名：${state.participantLabel.ifBlank { state.participantId }}",
                     "戒指：${state.ringName.ifBlank { "已选戒指" }}",
                     "佩戴位置：${state.placement?.displayName ?: "待选择"}",
+                    "当前记录完成前，设置暂不可修改",
+                    "应用版本：${BuildConfig.VERSION_NAME}",
                 ).joinToString("\n"))
                 .setPositiveButton("关闭", null)
                 .show()

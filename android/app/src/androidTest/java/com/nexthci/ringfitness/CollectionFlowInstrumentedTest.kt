@@ -988,7 +988,10 @@ class CollectionFlowInstrumentedTest {
                 val dialog = StepCollectionActivity::class.java.getDeclaredField("dialog")
                     .apply { isAccessible = true }.get(activity) as AlertDialog
                 assertTrue(dialog.isShowing)
-                assertTrue(dialog.findViewById<TextView>(android.R.id.message).text.contains(preparation.participantId))
+                val message = dialog.findViewById<TextView>(android.R.id.message).text.toString()
+                assertTrue(message.contains(preparation.participantId))
+                assertTrue(message.contains("当前记录完成前，设置暂不可修改"))
+                assertTrue(message.contains("应用版本：${BuildConfig.VERSION_NAME}"))
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick()
                 assertFalse(activity.isFinishing)
                 assertEquals("123", tagged<EditText>(activity, "flow_steps").text.toString())
