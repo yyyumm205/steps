@@ -55,6 +55,7 @@ class StepPreparationActivity : Activity() {
     private var feedback: String? = null
     private var permissionDenied = false
     private var pendingBluetoothAction: (() -> Unit)? = null
+    private var deviceSettingsReturnPending = false
     private var scanner: RingBleClient? = null
     private var scanning = false
     private var scanGeneration = 0L
@@ -92,6 +93,7 @@ class StepPreparationActivity : Activity() {
     private lateinit var changeRing: Button
     private lateinit var clearProfile: Button
     private lateinit var backgroundAccess: LinearLayout
+    private lateinit var bluetoothSettings: Button
     private lateinit var notificationSettings: Button
     private lateinit var batterySettings: Button
     private lateinit var message: TextView
@@ -120,6 +122,7 @@ class StepPreparationActivity : Activity() {
         placementDraft = savedInstanceState?.getInt(STATE_PLACEMENT) ?: 0
         permissionDenied = savedInstanceState?.getBoolean(STATE_PERMISSION_DENIED) ?: false
         returnToSettings = savedInstanceState?.getBoolean(STATE_RETURN_TO_SETTINGS) ?: false
+        deviceSettingsReturnPending = savedInstanceState?.getBoolean(STATE_DEVICE_SETTINGS_RETURN) ?: false
         buildPages(savedInstanceState?.getString(STATE_PARTICIPANT_DRAFT).orEmpty())
         if (Build.VERSION.SDK_INT >= 33) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
@@ -156,6 +159,8 @@ class StepPreparationActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        permissionDenied = BluetoothPermissionRecovery.missing(this).isNotEmpty()
+        if (!permissionDenied && scanMessage == BluetoothPermissionRecovery.scanHint) scanMessage = null
         routeStarted = false
         refreshCollectionState()
     }
@@ -185,6 +190,7 @@ class StepPreparationActivity : Activity() {
         outState.putInt(STATE_PLACEMENT, placementDraft)
         outState.putBoolean(STATE_PERMISSION_DENIED, permissionDenied)
         outState.putBoolean(STATE_RETURN_TO_SETTINGS, returnToSettings)
+        outState.putBoolean(STATE_DEVICE_SETTINGS_RETURN, deviceSettingsReturnPending)
         super.onSaveInstanceState(outState)
     }
 
@@ -294,7 +300,10 @@ class StepPreparationActivity : Activity() {
         }
 
         backgroundAccess = ui.card(body).apply { tag = "background_access" }
-        label(backgroundAccess, "后台运行", 16f).setTypeface(null, Typeface.BOLD)
+        label(backgroundAccess, "手机权限与后台运行", 16f).setTypeface(null, Typeface.BOLD)
+        bluetoothSettings = link(backgroundAccess, BluetoothPermissionRecovery.actionLabel) { openNeededSettings() }.apply {
+            tag = "bluetooth_settings"
+        }
         notificationSettings = link(backgroundAccess, "开启通知") { openNotificationSettings() }.apply {
             tag = "notification_settings"
         }
@@ -403,9 +412,28 @@ class StepPreparationActivity : Activity() {
             return
         }
         val current = snapshot
+        if (deviceSettingsReturnPending && current?.placement != null && !collectionOwnerBusy) {
+            deviceSettingsReturnPending = false
+            page = Page.DEVICES
+            updateViews()
+            if (BluetoothPermissionRecovery.missing(this).isEmpty() && bluetoothEnabled() && locationEnabled()) scan()
+            return
+        }
         when {
             current == null || current.placement == null -> page = Page.REGISTER
-            current.ring == null -> openDeviceSelection(fromSettings = false)
+            current.ring == null -> {
+                if (page != Page.DEVICES) {
+                    // The first transition from registration intentionally uses the existing
+                    // withBluetooth() gate. Once the device page is visible, a denied request
+                    // must leave the page usable instead of asking again from onResume.
+                    openDeviceSelection(fromSettings = false)
+                } else {
+                    updateViews()
+                    if (visible && !scanning && BluetoothPermissionRecovery.missing(this).isEmpty() &&
+                        bluetoothEnabled() && locationEnabled()) scan()
+                    return
+                }
+            }
             settingsRequested -> page = Page.SETTINGS
             else -> {
                 openCollectionAndFinish()
@@ -496,7 +524,14 @@ class StepPreparationActivity : Activity() {
         page = Page.DEVICES
         feedback = null
         updateViews()
-        if (visible && collectionLoaded) withBluetooth(::scan)
+        if (visible && collectionLoaded) {
+            val missing = BluetoothPermissionRecovery.missing(this)
+            // A first transition may request runtime access. Permanent denial is rendered as
+            // an enabled primary action so the participant chooses when to open system settings.
+            if (missing.isEmpty() || !BluetoothPermissionRecovery.requiresSettings(this, missing)) {
+                withBluetooth(::scan)
+            }
+        }
     }
 
     private fun updateViews() {
@@ -516,8 +551,10 @@ class StepPreparationActivity : Activity() {
         devices.visibility = if (!loading && !hasStorageProblem && page == Page.DEVICES) View.VISIBLE else View.GONE
         settings.visibility = if (!loading && !hasStorageProblem && page == Page.SETTINGS) View.VISIBLE else View.GONE
         val longRunningAccess = longRunningAccess()
+        val missingBluetooth = BluetoothPermissionRecovery.missing(this).isNotEmpty()
         backgroundAccess.visibility = if (!loading && !hasStorageProblem && page == Page.SETTINGS &&
-            longRunningAccess.showSettings) View.VISIBLE else View.GONE
+            (longRunningAccess.showSettings || missingBluetooth)) View.VISIBLE else View.GONE
+        bluetoothSettings.visibility = if (missingBluetooth) View.VISIBLE else View.GONE
         notificationSettings.visibility = if (longRunningAccess.showNotificationSettings) View.VISIBLE else View.GONE
         batterySettings.visibility = if (longRunningAccess.showBatterySettings) View.VISIBLE else View.GONE
         back.visibility = if (loading || page == Page.SETTINGS) View.GONE else View.VISIBLE
@@ -556,8 +593,7 @@ class StepPreparationActivity : Activity() {
             it.visibility = if (locked || busy) View.GONE else View.VISIBLE
             it.isEnabled = !busy && !locked
         }
-        scanStatus.text = scanMessage ?: when {
-            permissionDenied -> "允许蓝牙权限后即可搜索"
+        scanStatus.text = if (missingBluetooth) BluetoothPermissionRecovery.scanHint else scanMessage ?: when {
             !bluetoothEnabled() -> "打开手机蓝牙后即可搜索"
             else -> "将戒指放在手机附近"
         }
@@ -567,6 +603,7 @@ class StepPreparationActivity : Activity() {
             hasStorageProblem -> "重新读取"
             page == Page.REGISTER -> "下一步"
             page == Page.DEVICES && scanning -> "停止搜索"
+            page == Page.DEVICES && missingBluetooth -> BluetoothPermissionRecovery.actionLabel
             page == Page.DEVICES -> "重新搜索"
             else -> "返回采集"
         }
@@ -576,8 +613,8 @@ class StepPreparationActivity : Activity() {
         primary.isEnabled = progressText == null
         val statusMessage = when {
             pendingSettings -> collectionProblem ?: "请先完成当前记录"
-            hasStorageProblem -> storageProblem.orEmpty()
-            else -> feedback.orEmpty()
+            hasStorageProblem -> visiblePreparationMessage(storageProblem)
+            else -> visiblePreparationMessage(feedback)
         }
         message.text = statusMessage
         message.visibility = if (statusMessage.isEmpty()) View.GONE else View.VISIBLE
@@ -587,6 +624,16 @@ class StepPreparationActivity : Activity() {
             dialog.listView.isEnabled = !busy
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.isEnabled = !busy
         }
+    }
+
+    /** Keep internal storage/ownership diagnostics out of the participant surface. */
+    private fun visiblePreparationMessage(raw: String?): String = when {
+        raw.isNullOrBlank() -> ""
+        raw.contains("联系研究者") || raw.contains("无法读取") || raw.contains("不完整") ->
+            "当前记录暂时无法读取，请重新连接戒指后重试。"
+        raw.contains("空间") -> "手机存储空间不足，请清理空间后重试。"
+        raw.contains("权限") -> "请允许蓝牙权限后重试。"
+        else -> raw
     }
 
     private fun showIdentityPicker() {
@@ -762,9 +809,14 @@ class StepPreparationActivity : Activity() {
         Build.MODEL.startsWith("sdk_gphone") || Build.MODEL.startsWith("Android SDK built for")
 
     private fun withBluetooth(action: () -> Unit) {
-        val missing = requiredPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        val missing = BluetoothPermissionRecovery.missing(this)
         if (missing.isNotEmpty()) {
+            if (BluetoothPermissionRecovery.requiresSettings(this, missing)) {
+                openNeededSettings()
+                return
+            }
             pendingBluetoothAction = action
+            BluetoothPermissionRecovery.recordRequest(this, missing)
             requestPermissions(missing.toTypedArray(), REQUEST_BLUETOOTH)
             return
         }
@@ -777,12 +829,13 @@ class StepPreparationActivity : Activity() {
 
     private fun openNeededSettings() {
         val settingsIntent = when {
-            requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED } ->
-                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+            BluetoothPermissionRecovery.missing(this).isNotEmpty() ->
+                BluetoothPermissionRecovery.settingsIntent(this)
             !bluetoothEnabled() -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
             !locationEnabled() -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
             else -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
         }
+        deviceSettingsReturnPending = page == Page.DEVICES
         startActivity(settingsIntent)
     }
 
@@ -798,16 +851,10 @@ class StepPreparationActivity : Activity() {
         if (requestCode != REQUEST_BLUETOOTH) return
         val action = pendingBluetoothAction
         pendingBluetoothAction = null
-        permissionDenied = requiredPermissions().any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        permissionDenied = BluetoothPermissionRecovery.missing(this).isNotEmpty()
         if (!permissionDenied && visible && action != null) withBluetooth(action)
-        else scanMessage = "允许蓝牙权限后即可搜索"
+        else scanMessage = BluetoothPermissionRecovery.scanHint
         updateViews()
-    }
-
-    private fun requiredPermissions() = if (Build.VERSION.SDK_INT >= 31) {
-        listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-    } else {
-        listOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 
     private fun scan() {
@@ -979,6 +1026,7 @@ class StepPreparationActivity : Activity() {
         private const val STATE_PLACEMENT = "placement_draft"
         private const val STATE_PERMISSION_DENIED = "permission_denied"
         private const val STATE_RETURN_TO_SETTINGS = "return_to_settings"
+        private const val STATE_DEVICE_SETTINGS_RETURN = "device_settings_return"
         private const val REQUEST_BLUETOOTH = 10
         private const val REQUEST_NOTIFICATIONS = 11
         private const val ACCESS_PREFERENCES = "long_running_access"

@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前工作版本：**步数采集 0.8.10-save-recovery（versionCode 52）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，本轮实际结果与待验范围见[验证记录E37](../specs/independent-step-collection/validation.md#e37保存恢复与用户记录隔离2026-09-22)。
+当前工作版本：**步数采集 0.8.11-compat-recovery（versionCode 53）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，本轮实际结果与待验范围见[验证记录E38](../specs/independent-step-collection/validation.md#e38恢复兼容与有限下载2026-09-22)。
 
 ## 当前流程
 

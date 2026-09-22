@@ -114,6 +114,7 @@ object RealUploadScheduler {
 class RealUploadService : JobService() {
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+    private var foregroundActive = false // Accessed only on main.
     private data class Run(val params: JobParameters, val owner: Any = Any(),
         val cancelled: AtomicBoolean = AtomicBoolean(false))
     // Android may parcel a new JobParameters object for stop; callbacks are ordered per job ID.
@@ -127,14 +128,17 @@ class RealUploadService : JobService() {
         try {
             startForeground(NOTIFICATION_ID, uploadNotification("正在准备上传"),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            foregroundActive = true
         } catch (error: RuntimeException) {
-            Log.e(TAG, "Upload foreground protection could not start", error)
-            main.post { finish(params, run, retry = true) }
-            return true
+            // A regular background job has no general Android 12+ exemption to start an FGS.
+            // JobScheduler still owns this run and supplies its wake lock and execution window.
+            // Its stop callback cancels transport and leaves durable work for the next window.
+            Log.w(TAG, "Foreground protection unavailable; continuing scheduled upload", error)
         }
         executor.execute {
             var retry = false
             try {
+                if (BuildConfig.DEBUG) Log.i(TAG, "Upload job queue processing started")
                 val queue = RealUploadScheduler.queue(this)
                 val attempted = mutableSetOf<String>()
                 while (!stop.get()) {
@@ -162,7 +166,7 @@ class RealUploadService : JobService() {
             run.cancelled.set(true)
             RealUploadScheduler.stopped(run.owner)
         }
-        if (runs.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
+        if (runs.isEmpty()) stopForegroundProtection()
         return true
     }
 
@@ -175,7 +179,7 @@ class RealUploadService : JobService() {
             val retry = RealUploadScheduler.finished(run.owner, retry = true) ?: true
             jobFinished(run.params, retry)
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopForegroundProtection()
         stopSelf()
     }
 
@@ -185,7 +189,7 @@ class RealUploadService : JobService() {
             RealUploadScheduler.stopped(run.owner)
         }
         runs.clear()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopForegroundProtection()
         executor.shutdownNow()
         super.onDestroy()
     }
@@ -193,14 +197,20 @@ class RealUploadService : JobService() {
     private fun finish(params: JobParameters, run: Run, retry: Boolean) {
         if (runs[params.jobId] !== run) return
         runs.remove(params.jobId)
-        if (runs.isEmpty()) stopForeground(STOP_FOREGROUND_REMOVE)
+        if (runs.isEmpty()) stopForegroundProtection()
         if (!run.cancelled.get()) RealUploadScheduler.finished(run.owner, retry)?.let { needsRetry ->
             jobFinished(params, needsRetry)
         }
     }
 
     private fun updateNotification(text: String) {
+        if (!foregroundActive) return
         getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, uploadNotification(text))
+    }
+
+    private fun stopForegroundProtection() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        foregroundActive = false
     }
 
     private fun uploadNotification(text: String): Notification {

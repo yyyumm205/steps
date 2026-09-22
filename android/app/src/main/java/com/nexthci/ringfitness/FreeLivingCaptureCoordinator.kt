@@ -665,6 +665,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun confirmStart(observed: HealthRecordObservation) {
+        unconfirmedStartStopCandidate = null
         val before = baseline
         val current = session ?: return
         val candidate = observed.records.singleOrNull { record -> before?.let {
@@ -675,14 +676,13 @@ class FreeLivingCaptureCoordinator(
             candidate.sessionId != observed.status.sessionId || (candidate.unixMs == 0L && candidate.uptimeMs == 0L) ||
             candidate.bytes < observed.status.bytes || candidate.records < observed.status.records ||
             !onlyKnownRecords(observed, candidate)) {
-            val pendingRecord = observed.records.singleOrNull { it.sessionId == observed.status.sessionId }
-            if (startCommandIssued && before?.connectionGeneration == generation && observed.status.collecting &&
-                observed.status.errorCode == 0 && pendingRecord != null &&
-                pendingRecord.bytes >= observed.status.bytes &&
-                pendingRecord.records >= observed.status.records && onlyKnownRecords(observed, pendingRecord)) {
-                // The record is not strong enough to become research data, but the same-connection
-                // idle -> START -> collecting transition is enough to offer a protective STOP and
-                // raw-data preservation path instead of leaving the ring collecting indefinitely.
+            val proof = current.startBaseline?.unknownTimeStartEvidence
+            if (startCommandIssued && before?.connectionGeneration == generation && proof != null &&
+                runCatching {
+                    UnconfirmedStartAbort(clock.nowEpochMs(), proof.ownerId, observed).validate(current)
+                }.isSuccess) {
+                // Only advertise the protective STOP that the durable abort and preservation
+                // contract can accept. The owner rechecks its identity before executing it.
                 unconfirmedStartStopCandidate = observed
             }
             review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
@@ -842,6 +842,7 @@ class FreeLivingCaptureCoordinator(
     }
 
     private fun recoverAssociation(observed: HealthRecordObservation) {
+        unconfirmedStartStopCandidate = null
         val current = session ?: return
         if (current.phase == FreeLivingSessionPhase.START_REQUESTED) {
             val startBaseline = current.startBaseline
@@ -871,9 +872,8 @@ class FreeLivingCaptureCoordinator(
                 (candidate.unixMs > 0L || candidate.uptimeMs > 0L) &&
                 candidate.bytes >= observed.status.bytes && candidate.records >= observed.status.records &&
                 onlyKnownRecords(observed, candidate)) {
-                // A different connection cannot prove which phone sent START. Preserve the record
-                // and offer a controlled STOP, but never promote it to this research session.
-                unconfirmedStartStopCandidate = observed
+                // A fresh connection can inspect the record, but cannot recover the original
+                // connection's authority to perform an unconfirmed-start STOP.
                 review(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, observed)
             } else {
                 review(CaptureControlIssue.RECOVERY_REQUIRES_REVIEW, observed)

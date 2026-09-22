@@ -77,6 +77,8 @@ class RealCollectionController(
     private var backupDownloader: RealSessionDownload? = null
     private var backupObservation: HealthRecordObservation? = null
     private var backupRecord: HealthMessage.ListItem? = null
+    /** Stable identity for a preserved-record download across GATT reconnects. */
+    private var backupTransferId: String? = null
     private val preservationOwnerId = UUID.randomUUID().toString()
     private var unknownBackupAttempt: String? = null
     private data class UnknownPreservation(val record: HealthMessage.ListItem, val backupId: String,
@@ -84,6 +86,24 @@ class RealCollectionController(
     private var unknownPreservation: UnknownPreservation? = null
     private var unknownReadGeneration: Long? = null
     private var downloadTimeout = 0L
+    private data class DownloadRecovery(
+        val transferId: String,
+        var failures: Int = 0,
+        var failedGeneration: Long? = null,
+        var durableHighWater: Long = 0L,
+        var replayHighWater: Long = 0L,
+    )
+    private var downloadRecovery: DownloadRecovery? = null
+    private data class BackupGapRecovery(
+        val before: HealthRecordObservation,
+        val record: HealthMessage.ListItem,
+        val transferId: String = UUID.randomUUID().toString(),
+        var awaitingInspection: Boolean = false,
+    )
+    private var backupGapRecovery: BackupGapRecovery? = null
+    private class DownloadRecoveryLimitException : java.io.IOException(
+        "下载多次没有进展，步数与已保存的数据会保留，请重新连接后重试",
+    )
     private var reconnectScheduledGeneration: Long? = null
     private var closed = false
     private var saving = false
@@ -236,6 +256,15 @@ class RealCollectionController(
 
     fun onDisconnected(connection: Long, message: String) = safely {
         if (closed || connection != generation) return@safely
+        // Capture the backup descriptor before closeDownload clears the live downloader. A
+        // start-abort preservation has no ordinary pendingDownload() entry, so it needs the same
+        // bounded reconnect budget as a normal session download.
+        if (backupObservation != null && backupRecord != null && backupGapRecovery == null) {
+            backupGapRecovery = BackupGapRecovery(
+                requireNotNull(backupObservation), requireNotNull(backupRecord),
+                backupTransferId ?: UUID.randomUUID().toString(),
+            )
+        }
         connected = false; connecting = false; query = null; readinessWait = null; lastIdle = null
         abortWaitOperation = null; abortHighWater = null; abortPrecheck = null
         unknownPreservation = null
@@ -245,6 +274,18 @@ class RealCollectionController(
         recoveryTimeRound = null; recoveredStopClock = null
         closeDownload()
         coordinator.onDisconnected(connection)
+        val recovery = pendingDownload()?.let { downloadRecoveryFor(it.sessionId) }
+            ?: backupGapRecovery?.let {
+                it.awaitingInspection = true
+                downloadRecoveryFor(it.transferId)
+            }
+        recovery?.let {
+            if (recovery.failedGeneration != connection) {
+                recovery.failedGeneration = connection
+                recovery.failures++
+                if (recovery.failures >= DOWNLOAD_RECOVERY_LIMIT) throw DownloadRecoveryLimitException()
+            }
+        }
         scheduleReconnect()
         publish(pendingReferencePage() ?: CollectionPage.RECOVERY, message)
     }
@@ -252,13 +293,14 @@ class RealCollectionController(
     /** One timer per retired connection; only unfinished local work keeps recovery alive. */
     private fun scheduleReconnect() {
         val pending = store.readPending()
-        if (pending == null || pending.isRingDeferred || reconnectScheduledGeneration == generation) return
+        if ((pending == null && backupGapRecovery == null) || pending?.isRingDeferred == true ||
+            reconnectScheduledGeneration == generation) return
         val failedGeneration = generation
         reconnectScheduledGeneration = failedGeneration
         scheduler.schedule(RECONNECT_DELAY_MS) {
             if (!closed && generation == failedGeneration && reconnectScheduledGeneration == failedGeneration) safely {
                 reconnectScheduledGeneration = null
-                if (!connected && !connecting && store.readPending() != null) connect()
+                if (!connected && !connecting && (store.readPending() != null || backupGapRecovery != null)) connect()
             }
         }
     }
@@ -303,15 +345,23 @@ class RealCollectionController(
                 is HealthMessage.DataChunk -> {
                     val before = backup.nextOffset
                     backup.append(message)
-                    if (backup.nextOffset > before) scheduleBackupTimeout()
+                    if (backup.nextOffset > before) {
+                        backupGapRecovery?.let {
+                            rememberTransferProgress(downloadRecoveryFor(it.transferId), backup.nextOffset, null)
+                        }
+                        scheduleBackupTimeout()
+                    }
                 }
                 is HealthMessage.ReadEnd -> {
+                    if (backup.isRepeatedReadEnd(message)) return@safely
                     if (backup.checkpoint(message)) {
                         val completed = backup.finish(message)
                         val record = requireNotNull(backupRecord)
                         val attempt = unknownBackupAttempt
                         val savedAtMs = clock.nowEpochMs()
                         backups.accept(requireNotNull(profile?.ring).address, record, completed, savedAtMs, attempt)
+                        backupGapRecovery = null
+                        backupTransferId = null
                         if (attempt != null) {
                             unknownPreservation = UnknownPreservation(record, attempt, completed.file.sha256, generation, savedAtMs)
                             unknownReadGeneration = generation
@@ -345,16 +395,23 @@ class RealCollectionController(
                 is HealthMessage.DataChunk -> {
                     val before = replayDownloadOffset ?: download.nextOffset
                     replayDownloadOffset?.let { offset ->
-                        require(message.offset in 0..offset && message.payload.size.toLong() <= download.nextOffset - message.offset) {
+                        require(message.offset >= 0 && message.payload.size.toLong() <= download.nextOffset - message.offset) {
                             "重连后的片段不一致，已保留原始数据"
                         }
+                        if (message.offset > offset) throw RealSessionDownload.DownloadGapException()
                         download.append(message) // Compare the entire durable prefix before appending a new tail.
                         replayDownloadOffset = maxOf(offset, message.offset + message.payload.size)
                     } ?: download.append(message)
-                    if ((replayDownloadOffset ?: download.nextOffset) > before) scheduleDownloadTimeout()
+                    if ((replayDownloadOffset ?: download.nextOffset) > before) {
+                        rememberDownloadProgress(download.nextOffset, replayDownloadOffset)
+                        scheduleDownloadTimeout()
+                    }
                 }
                 is HealthMessage.ReadEnd -> {
+                    if (download.isRepeatedReadEnd(message)) return@safely
                     replayDownloadOffset?.let { offset ->
+                        if (message.nextOffset > offset && message.nextOffset <= download.nextOffset)
+                            throw RealSessionDownload.DownloadGapException()
                         require(message.nextOffset == offset && (!message.done || offset == download.nextOffset)) {
                             "重连后的下载位置不一致，已保留原始数据"
                         }
@@ -465,6 +522,15 @@ class RealCollectionController(
                 val observation = HealthRecordObservation(requireNotNull(profile?.ring).address, generation,
                     statusPacket.message as HealthMessage.Status, statusPacket.receivedEpochMs, round.records.toList())
                 recordDiagnostic(observation)
+                backupGapRecovery?.takeIf { it.awaitingInspection }?.let { recovery ->
+                    require(observation.address == recovery.before.address && !observation.status.collecting &&
+                        observation.status.copy(errorCode = 0) == recovery.before.status.copy(errorCode = 0) &&
+                        observation.records.size == recovery.before.records.size &&
+                        observation.records.toSet() == recovery.before.records.toSet() && recovery.record in observation.records) {
+                        "待保留的记录有变化，已保存片段会保留，请重新检查"
+                    }
+                    recovery.awaitingInspection = false
+                }
                 val current = store.readPending()
                 if (abortPrecheck != null) {
                     beginUnconfirmedStartAbort(observation)
@@ -860,6 +926,8 @@ class RealCollectionController(
     override fun disconnect() = Unit // A page cannot tear down the collection connection.
     override fun reconnect() = safely {
         browsingHome = false
+        if (pendingDownload() != null || backupGapRecovery != null) downloadRecovery = null
+        backupGapRecovery = null
         if (store.readPending()?.isRingDeferred == true) publish(CollectionPage.RING_PENDING) else connect()
     }
 
@@ -1017,6 +1085,7 @@ class RealCollectionController(
                 return
             }
             backupRecord = next
+            if (backupTransferId == null) backupTransferId = UUID.randomUUID().toString()
             unknownBackupAttempt = if (next.unixMs == 0L) UUID.randomUUID().toString() else null
             backupDownloader = backups.open(observed.address, next, unknownBackupAttempt)
         }
@@ -1025,7 +1094,7 @@ class RealCollectionController(
         publish(if (onlyRecord == null) CollectionPage.HOME else CollectionPage.DOWNLOADING)
         val download = requireNotNull(backupDownloader)
         download.beginRead()
-        check(port.read(requireNotNull(backupRecord).sessionId, download.nextOffset, 16_384)) {
+        check(port.read(requireNotNull(backupRecord).sessionId, download.nextOffset, READ_WINDOW_BYTES)) {
             "保存中断，请重新连接戒指后继续"
         }
         scheduleBackupTimeout()
@@ -1236,6 +1305,9 @@ class RealCollectionController(
         if (actual != expected) store.updateDeviceEvidence(current.sessionId,
             DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
         val next = downloadFactory(directory, current, actual)
+        val recovery = downloadRecoveryFor(current.sessionId)
+        // Reopening an existing checkpoint is not new transfer progress.
+        recovery.durableHighWater = maxOf(recovery.durableHighWater, next.nextOffset)
         lastIdle = observed
         val replay = expected.unixMs == 0L && stopEvidenceGeneration != generation && next.nextOffset > 0
         if (next.nextOffset == actual.bytes && !replay) {
@@ -1310,7 +1382,7 @@ class RealCollectionController(
         val id = requireNotNull(store.readPending()?.deviceSessionId)
         val replay = replayDownloadOffset
         val offset = replay ?: download.nextOffset
-        val length = if (replay != null) minOf(8192L, download.nextOffset - replay).toInt() else 16_384
+        val length = if (replay != null) minOf(READ_WINDOW_BYTES.toLong(), download.nextOffset - replay).toInt() else READ_WINDOW_BYTES
         download.beginRead(offset)
         check(port.read(id, offset, length)) { "下载连接中断，请重试" }
         scheduleDownloadTimeout()
@@ -1325,6 +1397,30 @@ class RealCollectionController(
                 onDisconnected(generation, "下载中断，已保存的部分将继续保留")
             }
         }
+    }
+
+    private fun pendingDownload(): FreeLivingSession? = store.readPending()?.takeIf {
+        it.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && it.reference != null &&
+            it.completionPolicy != null && !it.isRingDeferred && it.localData == null && it.startAbort == null
+    }
+
+    private fun downloadRecoveryFor(transferId: String): DownloadRecovery =
+        downloadRecovery?.takeIf { it.transferId == transferId }
+            ?: DownloadRecovery(transferId).also { downloadRecovery = it }
+
+    private fun rememberDownloadProgress(durableOffset: Long, replayOffset: Long?) {
+        val recovery = downloadRecoveryFor(requireNotNull(store.readPending()).sessionId)
+        rememberTransferProgress(recovery, durableOffset, replayOffset)
+    }
+
+    private fun rememberTransferProgress(recovery: DownloadRecovery, durableOffset: Long, replayOffset: Long?) {
+        if (durableOffset > recovery.durableHighWater ||
+            (replayOffset != null && replayOffset > recovery.replayHighWater)) {
+            recovery.failures = 0
+            recovery.durableHighWater = maxOf(recovery.durableHighWater, durableOffset)
+            recovery.replayHighWater = maxOf(recovery.replayHighWater, replayOffset ?: 0L)
+        }
+        // Replaying the same saved prefix after another reconnect never resets this budget.
     }
 
     private fun closeDownload() {
@@ -1424,6 +1520,24 @@ class RealCollectionController(
     private fun safely(failurePage: CollectionPage = CollectionPage.ERROR, action: () -> Unit) {
         if (closed) return
         try { action() } catch (error: Exception) {
+            val missingSessionData = error is RealSessionDownload.DownloadGapException &&
+                downloader != null && pendingDownload() != null
+            val missingBackupData = error is RealSessionDownload.DownloadGapException && backupDownloader != null &&
+                backupObservation != null && backupRecord != null
+            if (missingSessionData || missingBackupData) {
+                if (missingBackupData && backupGapRecovery == null) {
+                    val recovery = BackupGapRecovery(requireNotNull(backupObservation), requireNotNull(backupRecord))
+                    backupGapRecovery = recovery
+                    downloadRecoveryFor(recovery.transferId).durableHighWater = requireNotNull(backupDownloader).nextOffset
+                }
+                // Finish and preserve this contiguous prefix before a fresh connection can READ
+                // again. DATA and READ_END carry no request/session identity on the old channel.
+                val interruptedConnection = generation
+                onDisconnected(interruptedConnection, "下载片段缺失，正在重新连接后继续保存")
+                runCatching { port.disconnect() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+                return
+            }
+            backupGapRecovery = null
             abortWaitOperation = null
             abortPrecheck = null
             val clockStartFailed = startingClockEvidence != null
@@ -1440,7 +1554,8 @@ class RealCollectionController(
             reportError(error)
             runCatching { closeDownload() }
             query = null; readinessWait = null; lastIdle = null; connecting = false
-            val noProgress = error is RealSessionDownload.DownloadNoProgressException
+            val noProgress = error is RealSessionDownload.DownloadNoProgressException ||
+                error is DownloadRecoveryLimitException
             if (noProgress) {
                 // Pause until an explicit retry. Retire late replies and reconnect timers as well.
                 val previousGeneration = generation++
@@ -1474,6 +1589,8 @@ class RealCollectionController(
 
     companion object {
         internal const val RECONNECT_DELAY_MS = 3_000L
+        internal const val DOWNLOAD_RECOVERY_LIMIT = 3
+        internal const val READ_WINDOW_BYTES = 8 * 1024
         internal const val READINESS_CHECK_LIMIT = 3
         internal const val READINESS_CHECK_INTERVAL_MS = 1_500L
     }

@@ -183,14 +183,21 @@ class RealUploadQueue(
                     }
                 })
                 require(transportInvoked) { "上传传输未报告网络请求" }
-                require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes && receipt.fileId.isNotBlank())
-                task = task.copy(receipt = receipt, receivedAtMs = now())
+                require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes &&
+                    receipt.fileId.matches(Regex("[a-fA-F0-9]{40,64}")))
+                val receivedAt = now()
+                require(receivedAt > 0)
+                task = task.copy(receipt = receipt, receivedAtMs = receivedAt)
                 failureStage = "receipt"
+                // The server result is already verified. If its first local commit fails,
+                // retain that result for local completion instead of repeating the POST.
+                receiptVerified = true
                 synchronized(taskLock) { save(task) }
             }
             failureStage = "receipt"
             val receipt = requireNotNull(task.receipt)
-            require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes) {
+            require(receipt.fileName == archive.file.name && receipt.bytes == archive.bytes &&
+                receipt.fileId.matches(Regex("[a-fA-F0-9]{40,64}")) && requireNotNull(task.receivedAtMs) > 0) {
                 "上传回执与冻结包不一致，已保留本地数据"
             }
             receiptVerified = true

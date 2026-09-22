@@ -14,6 +14,7 @@ import java.io.File
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.UUID
 
 class FreeLivingCaptureCoordinatorTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -286,7 +287,7 @@ class FreeLivingCaptureCoordinatorTest {
         f.coordinator.reconcile()
         f.observe(collecting(), listOf(record()), connection = 2)
         assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
-        assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+        assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
         assertEquals(saved, f.store.read())
         assertEquals(1, f.port.count("start"))
     }
@@ -304,7 +305,7 @@ class FreeLivingCaptureCoordinatorTest {
         f.observe(collecting(), listOf(record()), connection = 2)
         assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
         assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
-        assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+        assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
         assertNull(f.store.read()!!.startConfirmedAtMs)
         assertEquals(1, f.port.count("start"))
     }
@@ -331,7 +332,7 @@ class FreeLivingCaptureCoordinatorTest {
 
         assertEquals(CaptureControlPhase.NEEDS_REVIEW, reopened.state.phase)
         assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, reopened.state.issue)
-        assertNotNull(reopened.state.unconfirmedStartStopCandidate)
+        assertNull(reopened.state.unconfirmedStartStopCandidate)
         assertNull(f.store.read()!!.startConfirmedAtMs)
         assertEquals(1, f.port.count("start"))
     }
@@ -953,7 +954,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertNull(f.store.read()!!.endedAtMs)
     }
 
-    @Test fun reusedIdWithUnchangedOrMissingAnchorGetsOnlyProtectiveStopAuthority() {
+    @Test fun reusedIdWithoutUnknownTimeAbortEvidenceCannotOfferProtectiveStop() {
         val old = record(id = 9)
         val oldStatus = idle().copy(bytes = old.bytes, records = old.records)
         val candidates = listOf(old, old.copy(unixMs = epoch + 1), old.copy(uptimeMs = 2000),
@@ -966,10 +967,85 @@ class FreeLivingCaptureCoordinatorTest {
             f.observe(collecting(id = 9), listOf(candidate))
             assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
             assertNull(f.store.read()!!.startConfirmedAtMs)
-            assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+            assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
             f.coordinator.requestStop()
-            // Research STOP remains unavailable; the owner uses the separate audited
-            // unconfirmed-start STOP and preservation path.
+            assertEquals(0, f.port.count("stop"))
+        }
+    }
+
+    @Test fun sameConnectionUnknownTimeCandidateIsAcceptedByTheDurableAbortContract() {
+        val f = Fixture()
+        val proof = f.beginUnknownTimeStart()
+        val fresh = record().copy(uptimeMs = 1500, unixMs = 0)
+        f.observe(collecting(), listOf(fresh))
+
+        val candidate = requireNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+        val current = requireNotNull(f.store.readPending())
+        val saved = f.store.requestUnconfirmedStartAbort(current.sessionId, candidate, epoch + 1, proof.ownerId)
+        assertEquals(candidate, saved.startAbort!!.collectingObservation)
+        assertNull(saved.startConfirmedAtMs)
+        assertNull(saved.stopConfirmedAtMs)
+        assertNull(saved.reference)
+        assertNull(saved.localData)
+        assertFalse(saved.uploadAllowed)
+        assertTrue(saved.isPending)
+        assertEquals(1, f.port.count("start"))
+        assertEquals(0, f.port.count("stop"))
+    }
+
+    @Test fun aClockProofCannotOfferAbortForKnownTimeOrOutOfWindowCandidates() {
+        val candidates = listOf(
+            record().copy(uptimeMs = 1500, unixMs = epoch + 10_000),
+            record().copy(uptimeMs = 0, unixMs = 0),
+            record().copy(uptimeMs = 999, unixMs = 0),
+            record().copy(uptimeMs = 31_001, unixMs = 0),
+        )
+        for (candidate in candidates) {
+            val f = Fixture()
+            f.beginUnknownTimeStart()
+            f.observe(collecting(), listOf(candidate))
+            assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
+            assertNull(f.store.readPending()!!.startConfirmedAtMs)
+            assertNull(f.store.readPending()!!.startAbort)
+            assertEquals(0, f.port.count("stop"))
+        }
+    }
+
+    @Test fun aNewConfirmationClearsThePreviousAbortCandidate() {
+        for (confirmResearchStart in listOf(false, true)) {
+            val f = Fixture()
+            val proof = f.beginUnknownTimeStart()
+            val fresh = record().copy(uptimeMs = 1500, unixMs = 0)
+            f.observe(collecting(), listOf(fresh))
+            assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+
+            f.coordinator.reconcile()
+            val unixMs = if (confirmResearchStart) proof.clock.deviceUnixMs + 500 else epoch + 10_000
+            f.observe(collecting(), listOf(fresh.copy(unixMs = unixMs)))
+            assertNull(f.coordinator.state.unconfirmedStartStopCandidate)
+            assertEquals(confirmResearchStart, f.store.readPending()!!.startConfirmedAtMs != null)
+            assertEquals(0, f.port.count("stop"))
+        }
+    }
+
+    @Test fun anUnknownTimeStartProofDoesNotAuthorizeAbortAfterReconnectionOrRestart() {
+        for (restart in listOf(false, true)) {
+            val f = Fixture()
+            val proof = f.beginUnknownTimeStart()
+            val fresh = record().copy(uptimeMs = 1500, unixMs = 0)
+            f.observe(collecting(), listOf(fresh))
+            assertNotNull(f.coordinator.state.unconfirmedStartStopCandidate)
+            f.coordinator.onDisconnected(1)
+
+            val recovering = if (restart) f.newCoordinator() else f.coordinator
+            recovering.onConnected(address, 2)
+            recovering.reconcile()
+            deliver(recovering, 2, collecting(), listOf(fresh.copy(unixMs = proof.clock.deviceUnixMs + 500)))
+            assertNull(recovering.state.unconfirmedStartStopCandidate)
+            assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, recovering.state.issue)
+            assertNull(f.store.readPending()!!.startConfirmedAtMs)
+            assertNull(f.store.readPending()!!.startAbort)
+            assertEquals(1, f.port.count("start"))
             assertEquals(0, f.port.count("stop"))
         }
     }
@@ -1132,6 +1208,19 @@ class FreeLivingCaptureCoordinatorTest {
             connect()
             coordinator.requestStart(preparation)
             observe(idle())
+        }
+        fun beginUnknownTimeStart(): UnknownTimeStartEvidence {
+            val old = record(id = 9).copy(uptimeMs = 900_000, unixMs = 0)
+            val status = idle().copy(bytes = old.bytes, records = old.records)
+            val proof = UnknownTimeStartEvidence(old, UUID.randomUUID().toString(), "a".repeat(64),
+                UUID.randomUUID().toString(), 1, epoch - 200,
+                PhoneClockSyncEvidence(UUID.randomUUID().toString(), address, 1,
+                    epoch - 100, epoch - 90, 100, 110, epoch - 95, 1000))
+            connect()
+            coordinator.requestStart(preparation, ExistingRecordAuthorization(address, status, listOf(old), 1, proof))
+            observe(status, listOf(old))
+            assertEquals(1, port.count("start"))
+            return proof
         }
         fun beginCollecting() {
             beginStart()

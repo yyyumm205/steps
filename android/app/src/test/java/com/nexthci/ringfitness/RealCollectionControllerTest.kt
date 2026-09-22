@@ -33,7 +33,7 @@ class RealCollectionControllerTest {
             assertTrue(f.owner.state.busy)
             assertFalse(f.owner.state.canStart)
             assertFalse(f.owner.canReleaseIfIdle())
-            assertEquals(listOf(Read(7, 0, 16_384)), f.port.reads)
+            assertEquals(listOf(Read(7, 0, 8192)), f.port.reads)
             f.startSelected()
             assertEquals(0, f.port.count("start"))
             f.finishDownload()
@@ -581,8 +581,8 @@ class RealCollectionControllerTest {
         val observedStates = mutableListOf<CollectionFlowState>()
         f.owner.observe { observedStates += it }.use {
             repeat(2) { window ->
-                val start = window * 16_384
-                val end = start + 16_384
+                val start = window * 8192
+                val end = start + 8192
                 f.health(HealthMessage.DataChunk(start.toLong(), bytes.copyOfRange(start, end)))
                 f.health(HealthMessage.ReadEnd(end.toLong(), false))
                 assertEquals(savingState, f.owner.state)
@@ -600,7 +600,7 @@ class RealCollectionControllerTest {
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
         f.health(HealthMessage.DataChunk(0, firstPacket))
-        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        f.owner.reconnect(); f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
         val retired = f.port.generation
         repeat(3) { attempt ->
@@ -634,7 +634,8 @@ class RealCollectionControllerTest {
         f.observe(stopped(), listOf(finalRecord))
         val saved = f.store.readPending()!!
         f.health(HealthMessage.DataChunk(0, firstPacket))
-        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        f.owner.reconnect(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
         repeat(3) { f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false)) }
         assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
         assertTrue(f.owner.state.canRetry)
@@ -665,6 +666,83 @@ class RealCollectionControllerTest {
         assertTrue(f.owner.state.canRetry)
         assertFalse(f.owner.state.preservingExisting)
         assertArrayEquals(firstPacket, File(f.directory, "device-backups").walkTopDown().single { it.extension == "part" }.readBytes())
+    }
+
+    @Test fun duplicateCompletedBackupEndsDoNotStartAnotherReadOrInterruptTheNextWindow() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        val previousEnd = HealthMessage.ReadEnd(firstPacket.size.toLong(), false)
+        f.health(previousEnd)
+        f.observe(stopped(), listOf(finalRecord))
+        val reads = f.port.reads.toList()
+        repeat(4) { f.health(previousEnd) }
+        assertEquals(reads, f.port.reads)
+        f.health(HealthMessage.DataChunk(firstPacket.size.toLong(), payload.copyOfRange(firstPacket.size, payload.size)))
+        f.health(previousEnd)
+        assertEquals(reads, f.port.reads)
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        assertTrue(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+        assertTrue(f.errors.isEmpty())
+        assertNull(f.store.read())
+    }
+
+    @Test fun backupGapReconnectsBeforeContinuingItsPreservedPrefix() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        val previous = f.port.generation
+        f.health(HealthMessage.DataChunk(20, payload.copyOfRange(20, 22)))
+        assertFalse(f.owner.state.connected)
+        f.runAllDelays(3_000)
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(Read(7, 13, 8192), f.port.reads.last())
+        f.owner.onHealth(previous, SensorPacket.Health(HealthMessage.DataChunk(13, byteArrayOf(100)), ++f.clock.now))
+        f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        assertTrue(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+        assertTrue(f.errors.isEmpty())
+        assertNull(f.store.read())
+    }
+
+    @Test fun backupGapRecoveryRejectsAChangedSnapshotBeforeReading() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        f.health(HealthMessage.ReadEnd(20, false))
+        f.runAllDelays(3_000); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord.copy(uptimeMs = finalRecord.uptimeMs + 1)))
+        assertEquals(1, f.port.reads.size)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertArrayEquals(payload.copyOf(13), File(f.directory, "device-backups").walkTopDown().single { it.extension == "part" }.readBytes())
+        assertNull(f.store.read())
+    }
+
+    @Test fun unknownClockBackupGapRetriesUseIsolatedAttemptsAndStopWithoutNewProgress() = Fixture().use { f ->
+        val record = finalRecord.copy(unixMs = 0)
+        val prefix = payload.copyOf(13)
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(record))
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) { attempt ->
+            f.health(HealthMessage.DataChunk(0, prefix))
+            f.health(HealthMessage.ReadEnd(20, false))
+            if (attempt + 1 < RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+                f.runAllDelays(3_000); f.owner.onConnected(f.port.generation)
+                f.observe(stopped(), listOf(record))
+                assertEquals(Read(7, 0, 8192), f.port.reads.last())
+            }
+        }
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertFalse(f.owner.state.connected)
+        assertEquals(0, f.waitCount(3_000))
+        val partials = File(f.directory, "device-backups").walkTopDown().filter { it.extension == "part" }.toList()
+        assertEquals(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT, partials.size)
+        partials.forEach { assertArrayEquals(prefix, it.readBytes()) }
+        assertNull(f.store.read())
+        assertEquals(0, f.port.count("start"))
     }
 
     @Test fun changedRecordDuringBackupCannotBeMixedIntoAnotherWindow() = Fixture().use { f ->
@@ -823,7 +901,7 @@ class RealCollectionControllerTest {
         assertEquals(0L, f.store.read()!!.reference!!.steps)
         assertTrue(f.port.reads.isEmpty())
         f.observe(stopped(), listOf(finalRecord))
-        assertEquals(listOf(Read(7, 0, 16_384)), f.port.reads)
+        assertEquals(listOf(Read(7, 0, 8192)), f.port.reads)
         f.finishDownload()
         val saved = requireNotNull(f.store.read())
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
@@ -998,7 +1076,7 @@ class RealCollectionControllerTest {
         f.reopen()
         f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
-        assertEquals(Read(7, 13, 16_384), f.port.reads.last())
+        assertEquals(Read(7, 13, 8192), f.port.reads.last())
         assertEquals(before.sessionId, f.store.read()!!.sessionId)
         assertEquals(before.reference, f.store.read()!!.reference)
         f.health(HealthMessage.DataChunk(9, payload.copyOfRange(9, payload.size)))
@@ -1051,7 +1129,7 @@ class RealCollectionControllerTest {
         f.observe(grownStatus, listOf(grown))
 
         assertNull(f.store.read()!!.localData)
-        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+        assertEquals(Read(7, payload.size.toLong(), 8192), f.port.reads.last())
         assertArrayEquals(previousBytes, previousFile.readBytes())
         f.health(HealthMessage.DataChunk(payload.size.toLong(), tail))
         f.health(HealthMessage.ReadEnd(grown.bytes, true))
@@ -1075,7 +1153,7 @@ class RealCollectionControllerTest {
         val tailOne = imu(1, 1_120)
         val grownOnce = finalRecord.copy(bytes = payload.size + tailOne.size.toLong(), records = 3)
         f.observe(stopped().copy(bytes = grownOnce.bytes, records = grownOnce.records), listOf(grownOnce))
-        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+        assertEquals(Read(7, payload.size.toLong(), 8192), f.port.reads.last())
 
         f.reopen()
         f.owner.onConnected(f.port.generation)
@@ -1083,7 +1161,7 @@ class RealCollectionControllerTest {
         val grownTwice = finalRecord.copy(bytes = payload.size + tailOne.size + tailTwo.size.toLong(), records = 4)
         val finalStatus = stopped().copy(bytes = grownTwice.bytes, records = grownTwice.records)
         f.observe(finalStatus, listOf(grownTwice))
-        assertEquals(Read(7, payload.size.toLong(), 16_384), f.port.reads.last())
+        assertEquals(Read(7, payload.size.toLong(), 8192), f.port.reads.last())
         f.health(HealthMessage.DataChunk(payload.size.toLong(), tailOne + tailTwo))
         f.health(HealthMessage.ReadEnd(grownTwice.bytes, true))
         f.observe(finalStatus, listOf(grownTwice))
@@ -1267,6 +1345,174 @@ class RealCollectionControllerTest {
         assertEquals(22L, f.store.read()!!.reference!!.steps)
     }
 
+    @Test fun completedWindowEndsAreIgnoredBeforeAndAfterTheNextWindowData() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("21", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        val previousEnd = HealthMessage.ReadEnd(firstPacket.size.toLong(), false)
+        f.health(previousEnd)
+        val reads = f.port.reads.toList()
+        repeat(4) { f.health(previousEnd) }
+        assertEquals(reads, f.port.reads)
+        f.health(HealthMessage.DataChunk(firstPacket.size.toLong(), payload.copyOfRange(firstPacket.size, payload.size)))
+        f.health(previousEnd)
+        assertEquals(reads, f.port.reads)
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(21L, f.store.read()!!.reference!!.steps)
+        assertTrue(f.errors.isEmpty())
+    }
+
+    @Test fun missingChunkOrReadEndGapReconnectsAndCompletesFromTheContiguousPrefix() {
+        for (gapInEnd in listOf(false, true)) Fixture().use { f ->
+            f.reachReference(); f.saveReference("26", "valid", "")
+            f.observe(stopped(), listOf(finalRecord))
+            val saved = f.store.readPending()!!
+            f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            val previous = f.port.generation
+            f.health(if (gapInEnd) HealthMessage.ReadEnd(20, false)
+                else HealthMessage.DataChunk(20, payload.copyOfRange(20, 22)))
+            assertFalse(f.owner.state.connected)
+            assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+            f.runAllDelays(3_000); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertEquals(Read(7, 13, 8192), f.port.reads.last())
+            f.owner.onHealth(previous, SensorPacket.Health(HealthMessage.DataChunk(13, byteArrayOf(100)), ++f.clock.now))
+            f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+            f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+            f.observe(stopped(), listOf(finalRecord))
+            assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+            assertEquals(saved.sessionId, f.store.read()!!.sessionId)
+            assertEquals(saved.reference, f.store.read()!!.reference)
+            assertTrue(f.errors.isEmpty())
+        }
+    }
+
+    @Test fun repeatedMissingChunksStopAfterTheSharedRecoveryLimit() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("27", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) { attempt ->
+            f.health(HealthMessage.DataChunk(20, payload.copyOfRange(20, 22)))
+            if (attempt + 1 < RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+                f.runAllDelays(3_000); f.owner.onConnected(f.port.generation)
+                f.observe(stopped(), listOf(finalRecord))
+            }
+        }
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertEquals(0, f.waitCount(3_000))
+        assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        assertEquals(27L, f.store.readPending()!!.reference!!.steps)
+        assertNull(f.store.readPending()!!.localData)
+    }
+
+    @Test fun silentDownloadStopsAcrossConnectionsAndManualRetryKeepsTheReference() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("22", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        val saved = f.store.readPending()!!
+        var retired = f.port.generation
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) { attempt ->
+            retired = f.port.generation
+            f.runAllDelays(30_000)
+            if (attempt + 1 < RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+                f.runAllDelays(3_000)
+                f.owner.onConnected(f.port.generation)
+                f.observe(stopped(), listOf(finalRecord))
+            }
+        }
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertFalse(f.owner.state.connected)
+        assertEquals(saved.reference, f.store.readPending()!!.reference)
+        assertEquals(0L, f.directory.listFiles()!!.single { it.extension == "part" }.length())
+        assertNull(f.store.readPending()!!.localData)
+        val paused = f.owner.state
+        val connections = f.port.count("connect")
+        val reads = f.port.reads.size
+        f.owner.onDisconnected(retired, "迟到断开")
+        f.owner.onConnected(retired)
+        f.owner.onHealth(retired, SensorPacket.Health(HealthMessage.DataChunk(0, payload), ++f.clock.now))
+        assertEquals(paused, f.owner.state)
+        assertEquals(connections, f.port.count("connect"))
+        assertEquals(reads, f.port.reads.size)
+        assertEquals(0, f.waitCount(3_000))
+
+        f.errors.clear()
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(saved.sessionId, f.store.read()!!.sessionId)
+        assertEquals(saved.reference, f.store.read()!!.reference)
+        assertEquals(1, f.port.count("start")); assertEquals(1, f.port.count("stop"))
+    }
+
+    @Test fun repeatedDataAcrossConnectionsCannotKeepAStalledDownloadAlive() = Fixture().use { f ->
+        val prefix = payload.copyOf(13)
+        f.reachReference(); f.saveReference("23", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, prefix))
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) { attempt ->
+            repeat(5) { f.health(HealthMessage.DataChunk(0, prefix)) }
+            f.runAllDelays(30_000)
+            if (attempt + 1 < RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+                f.runAllDelays(3_000)
+                f.owner.onConnected(f.port.generation)
+                f.observe(stopped(), listOf(finalRecord))
+                assertEquals(13L, f.port.reads.last().offset)
+            }
+        }
+        assertFalse(f.owner.state.busy)
+        assertTrue(f.owner.state.canRetry)
+        assertArrayEquals(prefix, f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        assertEquals(23L, f.store.readPending()!!.reference!!.steps)
+        assertNull(f.store.readPending()!!.localData)
+    }
+
+    @Test fun downloadRecoveryConnectionFailuresShareTheBudgetAndDuplicateDisconnectsDoNotSpendIt() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("24", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        val failed = f.port.generation
+        f.runAllDelays(30_000)
+        repeat(5) { f.owner.onDisconnected(failed, "重复断开") }
+        assertEquals(1, f.waitCount(3_000))
+        f.port.accept = { it != "connect" }
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT - 1) { f.runAllDelays(3_000) }
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertFalse(f.owner.state.busy)
+        assertTrue(f.owner.state.canRetry)
+        assertEquals(0, f.waitCount(3_000))
+        val paused = f.owner.state
+        if (f.waitCount(30_000) > 0) f.runAllDelays(30_000)
+        assertEquals(paused, f.owner.state)
+        assertEquals(24L, f.store.readPending()!!.reference!!.steps)
+    }
+
+    @Test fun newDownloadedBytesRestoreTheAutomaticRecoveryBudget() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("25", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        fun recover() {
+            f.runAllDelays(30_000)
+            assertFalse(f.owner.state.connected)
+            f.runAllDelays(3_000)
+            f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+        }
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT - 1) { recover() }
+        f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT - 1) { recover() }
+        assertEquals(13L, f.port.reads.last().offset)
+        f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(25L, f.store.read()!!.reference!!.steps)
+        assertTrue(f.errors.isEmpty())
+    }
+
     @Test fun savedRecordReopensAsLocalAndPendingUploadWithoutAnotherDownload() = Fixture().use { f ->
         f.reachReference()
         f.saveReference("124", "valid", "")
@@ -1315,7 +1561,7 @@ class RealCollectionControllerTest {
         assertNull(original.endedAtMs)
         f.saveReference("12", "valid", "")
         f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
-        assertEquals(listOf(Read(7, 0, 16_384)), f.port.reads)
+        assertEquals(listOf(Read(7, 0, 8192)), f.port.reads)
         f.finishDownload()
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(original.sessionId, f.store.read()!!.sessionId)
@@ -1410,7 +1656,7 @@ class RealCollectionControllerTest {
         assertEquals(Read(7, 0, 13), f.port.reads.last())
         f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
         f.health(HealthMessage.ReadEnd(13, false))
-        assertEquals(Read(7, 13, 16_384), f.port.reads.last())
+        assertEquals(Read(7, 13, 8192), f.port.reads.last())
         f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
         f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
         f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
@@ -1461,7 +1707,7 @@ class RealCollectionControllerTest {
         assertEquals(Read(7, 0, 13), f.port.reads.last())
         f.health(HealthMessage.DataChunk(0, prefix))
         f.health(HealthMessage.ReadEnd(13, false))
-        assertEquals(Read(7, 13, 16_384), f.port.reads.last())
+        assertEquals(Read(7, 13, 8192), f.port.reads.last())
         f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
         f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
         f.observe(stopped(), listOf(record))
@@ -1469,6 +1715,40 @@ class RealCollectionControllerTest {
         assertEquals(saved.sessionId, f.store.read()!!.sessionId)
         assertEquals(saved.reference, f.store.read()!!.reference)
         assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun repeatingTheSameVerifiedPrefixAcrossReconnectsDoesNotResetTheRecoveryBudget() = Fixture().use { f ->
+        val record = finalRecord.copy(unixMs = 0)
+        val prefix = payload.copyOf(13)
+        f.reachReference(unixMs = 0); f.saveReference("74", "valid", "")
+        val startClock = f.seedRecoveryClock()
+        f.observe(stopped(), listOf(record))
+        f.health(HealthMessage.DataChunk(0, prefix))
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+            f.runAllDelays(3_000)
+            f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(record))
+            f.recoveryTimeReply(startClock)
+            f.observe(stopped(), listOf(record))
+            assertEquals(Read(7, 0, 13), f.port.reads.last())
+            f.health(HealthMessage.DataChunk(0, prefix))
+            f.health(HealthMessage.ReadEnd(13, false))
+            assertEquals(13L, f.port.reads.last().offset)
+            f.runAllDelays(30_000)
+        }
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertArrayEquals(prefix, f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        val connections = f.port.count("connect")
+        val paused = f.owner.state
+        // Completed TIME GET requests leave obsolete timers at this same delay.
+        f.runAllDelays(3_000)
+        assertEquals(connections, f.port.count("connect"))
+        assertEquals(paused, f.owner.state)
+        assertEquals(74L, f.store.readPending()!!.reference!!.steps)
+        assertNull(f.store.readPending()!!.localData)
     }
 
     @Test fun unknownClockChangedPrefixCannotBeMergedOrOverwriteSavedBytes() = Fixture().use { f ->
@@ -1506,7 +1786,7 @@ class RealCollectionControllerTest {
         assertEquals(Read(7, 8192, 1808), f.port.reads.last())
         f.health(HealthMessage.DataChunk(8192, longPayload.copyOfRange(8192, 10_000)))
         f.health(HealthMessage.ReadEnd(10_000, false))
-        assertEquals(Read(7, 10_000, 16_384), f.port.reads.last())
+        assertEquals(Read(7, 10_000, 8192), f.port.reads.last())
         f.health(HealthMessage.DataChunk(10_000, longPayload.copyOfRange(10_000, longPayload.size)))
         f.health(HealthMessage.ReadEnd(record.bytes, true)); f.observe(status, listOf(record))
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
@@ -2258,7 +2538,7 @@ class RealCollectionControllerTest {
         assertEquals(0, f.port.count("stop"))
     }
 
-    @Test fun interruptedDownloadAutomaticallyResumesSavedZeroAfterBluetoothReturns() = Fixture().use { f ->
+    @Test fun interruptedDownloadPausesAfterRepeatedConnectionFailuresAndResumesSavedZeroOnRetry() = Fixture().use { f ->
         f.reachReference()
         f.saveReference("0", "valid", "")
         f.observe(stopped(), listOf(finalRecord))
@@ -2267,9 +2547,13 @@ class RealCollectionControllerTest {
         f.health(HealthMessage.DataChunk(0, payload.copyOf(13)))
         f.owner.onDisconnected(f.port.generation, "手机蓝牙已关闭")
         f.port.accept = { it != "connect" }
-        repeat(5) { f.runDelay(3_000) }
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT - 1) { f.runDelay(3_000) }
+        assertEquals(0, f.waitCount(3_000))
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertArrayEquals(payload.copyOf(13), f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
         f.port.accept = { true }
-        f.runDelay(3_000)
+        f.owner.retry()
         f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
         assertEquals(13L, f.port.reads.last().offset)

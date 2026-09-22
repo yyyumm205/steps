@@ -239,6 +239,47 @@ class RealSessionDownloadTest {
         }
     }
 
+    @Test fun recoverableGapKeepsOnlyTheContiguousPrefixAndIsDifferentFromInvalidPayload() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { download ->
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(8)))
+            assertThrows(RealSessionDownload.DownloadGapException::class.java) {
+                download.append(HealthMessage.DataChunk(10, payload.copyOfRange(10, 12)))
+            }
+            assertThrows(RealSessionDownload.DownloadGapException::class.java) {
+                download.checkpoint(HealthMessage.ReadEnd(12, false))
+            }
+            assertEquals(8L, download.nextOffset)
+            assertArrayEquals(payload.copyOf(8), part(directory).readBytes())
+        }
+    }
+
+    @Test fun duplicateEndRecognitionRequiresAnExactlyAcceptedProgressingWindow() {
+        val directory = temporary.newFolder()
+        val completed = HealthMessage.ReadEnd(13, false)
+        adapter(directory).use { download ->
+            download.beginRead()
+            assertFalse(download.checkpoint(HealthMessage.ReadEnd(0, false)))
+            assertFalse(download.isRepeatedReadEnd(HealthMessage.ReadEnd(0, false)))
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            assertFalse(download.checkpoint(completed))
+            assertTrue(download.isRepeatedReadEnd(completed))
+            assertFalse(download.isRepeatedReadEnd(completed.copy(done = true)))
+            assertFalse(download.isRepeatedReadEnd(HealthMessage.ReadEnd(12, false)))
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(13, payload.copyOfRange(13, 15)))
+            assertTrue(download.isRepeatedReadEnd(completed))
+        }
+        adapter(directory).use { resumed ->
+            assertFalse(resumed.isRepeatedReadEnd(completed))
+            resumed.beginRead(0)
+            resumed.append(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            resumed.checkpointReplay(completed, 13)
+            assertTrue(resumed.isRepeatedReadEnd(completed))
+        }
+    }
+
     @Test fun gapAndOutOfRangeChunksCannotCreateSparseOrExtraData() {
         val directory = temporary.newFolder()
         adapter(directory).use { download ->
@@ -258,7 +299,7 @@ class RealSessionDownloadTest {
         adapter(directory).use { download ->
             download.append(HealthMessage.DataChunk(0, payload.copyOf(10)))
             assertThrows(IllegalArgumentException::class.java) { download.finish(end(10)) }
-            assertThrows(IllegalArgumentException::class.java) {
+            assertThrows(RealSessionDownload.DownloadGapException::class.java) {
                 download.checkpoint(HealthMessage.ReadEnd(11, false))
             }
             assertFalse(final(directory).exists())

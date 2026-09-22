@@ -57,6 +57,8 @@ class RealSessionDownload internal constructor(
         "下载连续 $MAX_NO_PROGRESS_WINDOWS 轮没有进展，已保存的部分会保留，请重新连接后重试",
     )
 
+    class DownloadGapException : IOException("下载片段缺失，已保存的部分会保留并继续读取")
+
     private val directory = directory.canonicalFile
     private var record = record
     private val prefix = "$sessionId-ring-${record.sessionId}"
@@ -79,6 +81,7 @@ class RealSessionDownload internal constructor(
     private var output: RandomAccessFile? = null
     private var completed: Completed? = null
     private val completedPrefixOffsets = mutableSetOf<Long>()
+    private val completedReadEnds = mutableSetOf<HealthMessage.ReadEnd>()
     private val prefixDigest = MessageDigest.getInstance("SHA-256")
     private var readWindowStart = 0L
     private var consecutiveEmptyWindows = 0
@@ -137,8 +140,9 @@ class RealSessionDownload internal constructor(
     fun append(chunk: HealthMessage.DataChunk): Long {
         check(completed == null) { "原始文件已完成" }
         val stream = checkNotNull(output) { "下载已关闭" }
-        require(chunk.payload.isNotEmpty() && chunk.offset >= 0 && chunk.offset <= nextOffset) { "下载片段存在缺口" }
+        require(chunk.payload.isNotEmpty() && chunk.offset >= 0) { "下载片段位置无效" }
         require(chunk.offset <= record.bytes - chunk.payload.size) { "下载片段超过记录范围" }
+        if (chunk.offset > nextOffset) throw DownloadGapException()
         val overlap = minOf(stream.length() - chunk.offset, chunk.payload.size.toLong()).coerceAtLeast(0).toInt()
         if (overlap > 0) {
             val existing = ByteArray(overlap)
@@ -156,12 +160,17 @@ class RealSessionDownload internal constructor(
 
     /** A READ window end is accepted only at the exact contiguous byte position. */
     fun checkpoint(end: HealthMessage.ReadEnd): Boolean {
+        if (end.nextOffset > nextOffset && end.nextOffset <= record.bytes) throw DownloadGapException()
         require(end.nextOffset == nextOffset) { "下载结束位置与已保存片段不一致" }
         require(!end.done || nextOffset == record.bytes) { "戒指提前结束下载，原始片段已保留" }
         persistCheckpoint()
+        if (nextOffset > readWindowStart) completedReadEnds += end
         checkReadProgress(nextOffset, end.done)
         return end.done
     }
+
+    /** Untagged repeats are harmless only when this record actually completed that exact window. */
+    fun isRepeatedReadEnd(end: HealthMessage.ReadEnd): Boolean = end in completedReadEnds
 
     /** Replay advances a verified cursor while the saved payload's nextOffset stays unchanged. */
     fun checkpointReplay(end: HealthMessage.ReadEnd, replayOffset: Long) {
@@ -169,6 +178,7 @@ class RealSessionDownload internal constructor(
             (!end.done || replayOffset == nextOffset)) {
             "重连后的下载位置不一致，已保留原始数据"
         }
+        if (replayOffset > readWindowStart) completedReadEnds += end
         checkReadProgress(replayOffset, end.done)
     }
 

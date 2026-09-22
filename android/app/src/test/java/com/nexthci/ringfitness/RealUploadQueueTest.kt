@@ -242,6 +242,33 @@ class RealUploadQueueTest {
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
     }
 
+    @Test fun firstReceiptTaskSyncFailureCompletesLocallyAfterReopenWithoutUploadingTwice() {
+        val f = Fixture()
+        f.queue.enqueue(f.id, link, false)
+        val original = f.archive.readBytes()
+        var failures = 0
+        f.taskSync = { directory ->
+            val file = File(directory, "${f.id}.json")
+            if (directory.name == "upload-tasks" && file.isFile && failures == 0 &&
+                JsonParser.parseString(file.readText()).asJsonObject.has("receipt")) {
+                failures++
+                throw IOException("Injected first receipt directory sync failure")
+            }
+        }
+
+        assertTrue("A validated response can be completed locally", f.queue.run(f.id))
+        assertEquals(1, failures)
+        assertNotNull(f.queue.task(f.id)!!.receipt)
+        assertFalse(f.queue.needsLocalReview(f.id))
+        assertEquals(1, f.requests)
+        assertEquals(SessionTransferStatus.TRANSFERRING, f.store.read()!!.transfer.status)
+        assertTrue(f.openQueue().restore(link))
+        assertFalse(f.openQueue().run(f.id))
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+        assertEquals(1, f.requests)
+        assertArrayEquals(original, f.archive.readBytes())
+    }
+
     @Test fun serverCommitWithLostReceiptStopsAutomaticReplayAndRequiresReview() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
@@ -609,6 +636,7 @@ class RealUploadQueueTest {
         var afterPayloadStart: (() -> Unit)? = null
         var failFreeze = false
         var duringFreeze: (() -> Unit)? = null
+        var taskSync: (File) -> Unit = {}
         val destinations = mutableListOf<String>()
         val uploadedHashes = mutableListOf<String>()
         val uploadedNames = mutableListOf<String>()
@@ -659,7 +687,7 @@ class RealUploadQueueTest {
             if (uncertainAfterServerCommit) throw UploadOutcomeUncertainException("Injected lost receipt")
             if (failAfterResponse) failJournal = true
             RemoteSessionReceipt(file.name, "a".repeat(40), file.length())
-        }, now = { time + 10 }, sync = {})
+        }, now = { time + 10 }, sync = { taskSync(it) })
     }
     private class SimulatedProcessExit : Error()
     private fun sha(file: File) = MessageDigest.getInstance("SHA-256").digest(file.readBytes()).joinToString("") { "%02x".format(it.toInt() and 255) }
