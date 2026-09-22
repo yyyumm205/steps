@@ -319,7 +319,12 @@ def decode_archive(stage, manifest, limits):
         reasons.append("multiple_raw_files_require_overlap_review")
     if len({x["sha256"] for x in raw_entries}) != len(raw_entries):
         reasons.append("duplicate_raw_content")
-    if any(c[k] for r in reports for c in r["channels"].values() for k in ("gaps", "overlaps", "rollbacks")):
+    packet_timing_issue = any(
+        c[k] for r in reports for c in r["channels"].values() for k in ("gaps", "overlaps", "rollbacks"))
+    sequence_issue = any(
+        r["ppg_vitals_sequence"][k]
+        for r in reports for k in ("gap_events", "duplicates", "rollbacks"))
+    if packet_timing_issue or sequence_issue:
         reasons.append("raw_timing_discontinuity")
     quality = {"rules_version": 2, "analysis_status": "pending_review", "analysis_reasons": reasons,
                "daily_aggregation_eligible": False, "absolute_sample_time_status": "unknown",

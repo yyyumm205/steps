@@ -22,7 +22,17 @@ data class FlowRecordSummary(
     val referenceEditable: Boolean = false,
     val referenceReason: String? = null,
     val ringDeferred: Boolean = false,
+    /** A requested upload has no active or persisted system job and can be queued again. */
+    val uploadRequeueAvailable: Boolean = false,
+    /** Phone-side anchor used only when rendering history without a verified sample boundary. */
+    val phoneStartAtMs: Long? = null,
 )
+
+internal val FlowRecordSummary.displayStartedAtMs: Long?
+    get() = startedAtMs ?: phoneStartAtMs
+
+internal fun FreeLivingSession.phoneStartAnchorMs(): Long? =
+    startConfirmedAtMs ?: startRequestedAtMs.takeIf { it > 0 }
 
 data class CollectionFlowState(
     val page: CollectionPage = CollectionPage.HOME,
@@ -40,6 +50,10 @@ data class CollectionFlowState(
     val connecting: Boolean = false,
     val checkingDevice: Boolean = false,
     val preservingExisting: Boolean = false,
+    /** Durable raw bytes already saved for the current ring transfer. */
+    val downloadSavedBytes: Long? = null,
+    val downloadTotalBytes: Long? = null,
+    val downloadFinalizing: Boolean = false,
     val busy: Boolean = false,
     val error: String? = null,
     val savedSteps: Long? = null,

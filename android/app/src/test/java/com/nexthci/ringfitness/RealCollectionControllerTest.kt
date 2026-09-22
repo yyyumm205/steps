@@ -684,6 +684,24 @@ class RealCollectionControllerTest {
         assertArrayEquals(firstPacket, File(f.directory, "device-backups").walkTopDown().single { it.extension == "part" }.readBytes())
     }
 
+    @Test fun backupReadWindowResetsWatchdogAfterRecordInspection() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+
+        // The status/LIST inspection happens after the first READ window. A later READ must
+        // start a fresh inactivity window even though the logical watchdog remains single.
+        f.clock.elapsed = 40_000L
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(Read(7, firstPacket.size.toLong(), 8192), f.port.reads.last())
+        f.clock.elapsed = 60_000L
+        f.runAllDelays(30_000)
+
+        assertTrue("a fresh READ must keep the transfer alive", f.owner.state.connected)
+        assertTrue(f.waitCount(10_000) > 0)
+    }
+
     @Test fun duplicateCompletedBackupEndsDoNotStartAnotherReadOrInterruptTheNextWindow() = Fixture().use { f ->
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
@@ -872,6 +890,46 @@ class RealCollectionControllerTest {
         }
         f.finishDownload()
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+    }
+
+    @Test fun threeHourScaleDownloadKeepsOneWatchdogAndCommitsAfterHundredsOfWindows() = Fixture().use { f ->
+        val packetCount = 2_300
+        val longPayload = ByteArrayOutputStream().apply {
+            write(firstPacket)
+            repeat(packetCount) { index -> write(imu(255, 1_060L + index * 5_100L)) }
+        }.toByteArray()
+        val longRecord = initialRecord.copy(bytes = longPayload.size.toLong(), records = packetCount + 1L)
+        val longStopped = stopped().copy(bytes = longRecord.bytes, records = longRecord.records)
+
+        f.beginCollecting(initialRecord)
+        f.clock.now += 3 * 60 * 60 * 1_000L
+        f.owner.stop()
+        f.observe(longStopped, listOf(longRecord))
+        f.saveReference("18000", "valid", "")
+        f.observe(longStopped, listOf(longRecord))
+        assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+        val scheduledBeforePayload = f.waitCount(30_000)
+
+        var offset = 0
+        while (offset + RealCollectionController.READ_WINDOW_BYTES < longPayload.size) {
+            val end = minOf(offset + RealCollectionController.READ_WINDOW_BYTES, longPayload.size)
+            f.health(HealthMessage.DataChunk(offset.toLong(), longPayload.copyOfRange(offset, end)))
+            f.health(HealthMessage.ReadEnd(end.toLong(), false))
+            offset = end
+        }
+
+        assertEquals("DATA chunks and READ windows share one watchdog", scheduledBeforePayload,
+            f.waitCount(30_000))
+        f.health(HealthMessage.DataChunk(offset.toLong(), longPayload.copyOfRange(offset, longPayload.size)))
+        f.health(HealthMessage.ReadEnd(longPayload.size.toLong(), true))
+        assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+        f.observe(longStopped, listOf(longRecord))
+        val completed = requireNotNull(f.store.read())
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(longPayload.size.toLong() + HealthRawV2.HEADER_SIZE,
+            completed.localData!!.files.single().bytes)
+        assertEquals(18_000L, completed.reference!!.steps)
+        assertTrue("errors=${f.errors}", f.errors.isEmpty())
     }
 
     @Test fun aCompleteInspectionIsRequiredBeforeStartAndStartRequiresDeviceConfirmation() = Fixture().use { f ->
@@ -1187,6 +1245,46 @@ class RealCollectionControllerTest {
         assertEquals(grownTwice, saved.deviceRecordEvidence!!.record)
         assertArrayEquals(payload + tailOne + tailTwo,
             File(f.directory, saved.localData!!.files.single().fileName).readBytes().drop(HealthRawV2.HEADER_SIZE).toByteArray())
+    }
+
+    @Test fun continuouslyGrowingStoppedRecordPausesAfterBoundedFinalizationChecks() = Fixture().use { f ->
+        f.reachReference()
+        f.saveReference("0", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, payload))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        assertEquals(CollectionPage.DOWNLOADING, f.owner.state.page)
+
+        var currentRecord = finalRecord
+        var currentPayload = payload
+        repeat(RealCollectionController.MAX_FINALIZATION_EXPANSIONS) { index ->
+            val tail = imu(1, 2_000L + index)
+            val nextPayload = currentPayload + tail
+            val nextRecord = currentRecord.copy(
+                bytes = nextPayload.size.toLong(),
+                records = currentRecord.records + 1,
+            )
+            val nextStatus = stopped().copy(bytes = nextRecord.bytes, records = nextRecord.records)
+            f.observe(nextStatus, listOf(nextRecord))
+            f.health(HealthMessage.DataChunk(currentRecord.bytes, tail))
+            f.health(HealthMessage.ReadEnd(nextRecord.bytes, true))
+            currentRecord = nextRecord
+            currentPayload = nextPayload
+        }
+
+        val oneMoreTail = imu(1, 3_000)
+        val stillGrowing = currentRecord.copy(
+            bytes = (currentPayload.size + oneMoreTail.size).toLong(),
+            records = currentRecord.records + 1,
+        )
+        f.observe(stopped().copy(bytes = stillGrowing.bytes, records = stillGrowing.records), listOf(stillGrowing))
+
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertNull(f.store.readPending()!!.localData)
+        assertTrue(f.directory.listFiles()!!.any { it.extension == "rfbin" })
+        assertTrue(f.errors.any { it is java.io.IOException && it.message?.contains("仍在整理") == true })
     }
 
     @Test fun finalInspectionAllowsAProtectedBaselineToDisappearButRejectsANewUnrelatedRecord() {
@@ -1741,13 +1839,13 @@ class RealCollectionControllerTest {
         f.observe(stopped(), listOf(record))
         f.health(HealthMessage.DataChunk(0, prefix))
         f.owner.onDisconnected(f.port.generation, "连接中断")
-        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) {
+        repeat(RealCollectionController.DOWNLOAD_RECOVERY_LIMIT) { attempt ->
             f.runAllDelays(3_000)
             f.owner.onConnected(f.port.generation)
             f.observe(stopped(), listOf(record))
             f.recoveryTimeReply(startClock)
             f.observe(stopped(), listOf(record))
-            assertEquals(Read(7, 0, 13), f.port.reads.last())
+            assertEquals("attempt=$attempt reads=${f.port.reads}", Read(7, 0, 13), f.port.reads.last())
             f.health(HealthMessage.DataChunk(0, prefix))
             f.health(HealthMessage.ReadEnd(13, false))
             assertEquals(13L, f.port.reads.last().offset)
@@ -1797,7 +1895,12 @@ class RealCollectionControllerTest {
         f.observe(status, listOf(record)); f.recoveryTimeReply(start); f.observe(status, listOf(record))
         assertEquals(Read(7, 0, 8192), f.port.reads.last())
         val first = HealthMessage.DataChunk(0, longPayload.copyOf(8192))
-        f.health(first); f.health(first)
+        f.clock.elapsed = 25_000
+        f.health(first)
+        f.clock.elapsed = 31_000
+        f.runAllDelays(30_000)
+        assertTrue("verified replay progress must keep a long prefix transfer alive", f.owner.state.connected)
+        f.health(first)
         f.health(HealthMessage.ReadEnd(8192, false))
         assertEquals(Read(7, 8192, 1808), f.port.reads.last())
         f.health(HealthMessage.DataChunk(8192, longPayload.copyOfRange(8192, 10_000)))
@@ -2081,6 +2184,11 @@ class RealCollectionControllerTest {
             f.owner.initialize()
 
             assertEquals(listOf(owner.sessionId), f.owner.state.records.map { it.sessionId })
+            val summary = f.owner.state.records.single()
+            assertNull(owner.startedAtMs)
+            assertEquals("uncertain", owner.captureBoundaryStatus)
+            assertEquals(owner.startConfirmedAtMs, summary.phoneStartAtMs)
+            assertEquals(owner.startConfirmedAtMs, summary.displayStartedAtMs)
             assertNull(f.owner.state.session)
             assertEquals(setOf(owner.sessionId to false, other.sessionId to false), uploads.requests.toSet())
             uploads.inFlight.clear()
@@ -2164,13 +2272,62 @@ class RealCollectionControllerTest {
             assertEquals(19L, completed.reference!!.steps)
             assertTrue(File(f.directory, completed.localData!!.files.single().fileName).isFile)
             assertEquals(SessionTransferStatus.PENDING, completed.transfer.status)
+            assertTrue(f.owner.state.records.single().uploadRequeueAvailable)
+            assertFalse(f.owner.state.records.single().localReviewRequired)
             assertEquals(commands, f.port.calls)
             assertTrue(f.errors.any { it.message == "Injected upload scheduling failure" })
             f.owner.home()
+            uploads.reject = false
             f.owner.retryUpload(completed.sessionId)
+            assertEquals(listOf(completed.sessionId to true), uploads.requests)
             assertEquals(CollectionPage.HOME, f.owner.state.page)
             assertNull(f.owner.state.error)
             assertEquals(commands, f.port.calls)
+        }
+    }
+
+    @Test fun uploadSchedulerStateIncludesReplayableTransferringImmediateUploads() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            val immediate = f.seedLocal().also {
+                f.store.setCompletionPolicy(it.sessionId, CompletionPolicy.SAVE_UPLOAD)
+            }
+            val claimedBeforePayload = f.seedLocal().also {
+                f.store.setCompletionPolicy(it.sessionId, CompletionPolicy.SAVE_UPLOAD)
+                f.store.markTransferStarted(it.sessionId)
+            }
+            val later = f.seedLocal().also {
+                f.store.setCompletionPolicy(it.sessionId, CompletionPolicy.SAVE_LATER)
+            }
+            val complete = f.seedLocal().also {
+                f.store.setCompletionPolicy(it.sessionId, CompletionPolicy.SAVE_UPLOAD)
+                f.store.markTransferStarted(it.sessionId)
+                f.store.completeTransfer(it.sessionId,
+                    SessionTransferReceipt("complete-receipt", ++f.clock.now, false, it.sessionId))
+            }
+            val ringOnly = f.store.requestStart(f.preparation.read()!!, ++f.clock.now, "Asia/Shanghai")
+            f.store.confirmStart(ringOnly.sessionId, ring.address, collecting(), ++f.clock.now)
+            f.store.requestStop(ringOnly.sessionId, ++f.clock.now)
+            f.store.confirmStop(ringOnly.sessionId, ring.address, stopped(), ++f.clock.now)
+            f.store.saveReference(ringOnly.sessionId, SessionReference(ReferenceStatus.VALID, 4, ++f.clock.now))
+            f.store.setCompletionPolicy(ringOnly.sessionId, CompletionPolicy.DEFER_ON_RING)
+
+            f.owner.initialize()
+            uploads.inFlight.clear()
+            uploads.retryQueries.clear()
+            uploads.requeueAvailable += immediate.sessionId
+            uploads.requeueAvailable += claimedBeforePayload.sessionId
+            f.owner.refreshUploads()
+
+            assertEquals(setOf(immediate.sessionId, claimedBeforePayload.sessionId, complete.sessionId),
+                uploads.retryQueries.toSet())
+            assertEquals(3, uploads.retryQueries.size)
+            val summaries = f.owner.state.records.associateBy { it.sessionId }
+            assertTrue(summaries.getValue(immediate.sessionId).uploadRequeueAvailable)
+            assertTrue(summaries.getValue(claimedBeforePayload.sessionId).uploadRequeueAvailable)
+            assertFalse(summaries.getValue(later.sessionId).uploadRequeueAvailable)
+            assertFalse(summaries.getValue(complete.sessionId).uploadRequeueAvailable)
+            assertFalse(summaries.getValue(ringOnly.sessionId).uploadRequeueAvailable)
         }
     }
 
@@ -2826,15 +2983,25 @@ class RealCollectionControllerTest {
         val requests = mutableListOf<Pair<String, Boolean>>()
         val inFlight = mutableSetOf<String>()
         val localReview = mutableSetOf<String>()
+        val requeueAvailable = mutableSetOf<String>()
+        val retryQueries = mutableListOf<String>()
         var reject = false
         var configured = true
         override val available get() = configured
         override fun enqueue(sessionId: String, retry: Boolean) {
-            check(!reject) { "Injected upload scheduling failure" }
+            if (reject) {
+                requeueAvailable += sessionId
+                error("Injected upload scheduling failure")
+            }
             requests += sessionId to retry
             inFlight += sessionId
+            requeueAvailable -= sessionId
         }
         override fun isInFlight(sessionId: String) = sessionId in inFlight
+        override fun canRetryUpload(sessionId: String): Boolean {
+            retryQueries += sessionId
+            return sessionId in requeueAvailable
+        }
         override fun needsLocalReview(sessionId: String) = sessionId in localReview
     }
 

@@ -1,5 +1,6 @@
 package com.nexthci.ringfitness
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
@@ -194,6 +195,8 @@ class StepPreparationActivity : Activity() {
         super.onSaveInstanceState(outState)
     }
 
+    // API 33+ is handled by the OnBackInvoked callback registered in onCreate.
+    @SuppressLint("GestureBackNavigation")
     @Deprecated("Legacy Android back callback")
     override fun onBackPressed() = goBack()
 

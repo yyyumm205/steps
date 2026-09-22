@@ -29,6 +29,7 @@ import java.util.concurrent.TimeUnit
 class RealCollectionService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadScheduledExecutor { Thread(it, "collection-real-owner") }
+    private val notificationGate = CollectionNotificationGate()
     private var controller: RealCollectionController? = null
     private var client: RingBleClient? = null // Accessed exclusively on main, like the GATT queue.
     @Volatile private var clientGeneration = 0L
@@ -43,7 +44,11 @@ class RealCollectionService : Service() {
         RealCollectionBridge.begin(this)
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL, "戒指采集", NotificationManager.IMPORTANCE_LOW))
-        try { startForeground(NOTIFICATION, notification("正在连接戒指")) } catch (error: SecurityException) {
+        val initialNotificationText = "正在连接戒指"
+        try {
+            startForeground(NOTIFICATION, notification(initialNotificationText))
+            notificationGate.record(initialNotificationText)
+        } catch (error: SecurityException) {
             RealCollectionBridge.fail("请允许蓝牙权限后重新打开采集页面")
             stopSelf()
             return
@@ -130,6 +135,8 @@ class RealCollectionService : Service() {
                             RealUploadScheduler.enqueue(applicationContext, sessionId, retry)
                         }
                         override fun isInFlight(sessionId: String) = RealUploadScheduler.isInFlight(sessionId)
+                        override fun canRetryUpload(sessionId: String) =
+                            RealUploadScheduler.canRetryUpload(applicationContext, sessionId)
                         override fun needsLocalReview(sessionId: String) =
                             RealUploadScheduler.queue(applicationContext).needsLocalReview(sessionId)
                         override fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) {
@@ -190,21 +197,10 @@ class RealCollectionService : Service() {
             if (active && !lock.isHeld) lock.acquire()
             if (!active && lock.isHeld) lock.release()
         }
-        val text = when {
-            state.connecting -> "正在连接戒指"
-            !state.connected && active -> "连接中断，正在保留本次记录"
-            state.preservingExisting -> "正在准备戒指"
-            state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
-            state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
-            state.taskPage == CollectionPage.FINISH -> "采集已结束，请选择保存方式"
-            state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
-                "采集已结束，请填写计步器读数" else "结束状态待确认，可先记录读数"
-            state.taskPage == CollectionPage.RING_PENDING -> "本段已保留，可稍后下载并上传"
-            state.taskPage == CollectionPage.DOWNLOADING -> "正在保存戒指数据"
-            state.session?.localData != null -> "记录已保存在手机"
-            else -> "戒指采集准备"
+        val text = collectionForegroundText(state)
+        if (notificationGate.shouldPublish(text)) {
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(text))
         }
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION, notification(text))
     }
 
     private fun notification(text: String): Notification {
@@ -266,6 +262,37 @@ class RealCollectionService : Service() {
             Files.move(tmp.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
             syncDirectory(requireNotNull(file.parentFile))
         }
+    }
+}
+
+/** UI progress can change for every BLE packet; the system notification follows semantic states. */
+internal class CollectionNotificationGate {
+    private var lastText: String? = null
+
+    fun record(text: String) { lastText = text }
+
+    fun shouldPublish(text: String): Boolean {
+        if (text == lastText) return false
+        lastText = text
+        return true
+    }
+}
+
+internal fun collectionForegroundText(state: CollectionFlowState): String {
+    val active = state.session?.let { it.isPending && !it.isRingDeferred } == true || state.preservingExisting
+    return when {
+        state.connecting -> "正在连接戒指"
+        !state.connected && active -> "连接中断，正在保留本次记录"
+        state.preservingExisting -> "正在准备戒指"
+        state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
+        state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
+        state.taskPage == CollectionPage.FINISH -> "采集已结束，请选择保存方式"
+        state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
+            "采集已结束，请填写计步器读数" else "结束状态待确认，可先记录读数"
+        state.taskPage == CollectionPage.RING_PENDING -> "本段已保留，可稍后下载并上传"
+        state.taskPage == CollectionPage.DOWNLOADING -> "正在保存戒指数据"
+        state.session?.localData != null -> "记录已保存在手机"
+        else -> "戒指采集准备"
     }
 }
 

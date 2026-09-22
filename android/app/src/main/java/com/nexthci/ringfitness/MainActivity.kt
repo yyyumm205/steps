@@ -1,5 +1,6 @@
 package com.nexthci.ringfitness
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
@@ -146,6 +147,8 @@ class MainActivity : Activity(), RingCaptureService.UiListener {
         super.onSaveInstanceState(outState)
     }
 
+    // Retained reference activity is excluded from the independent app manifest.
+    @SuppressLint("GestureBackNavigation")
     override fun onBackPressed() {
         when (page) {
             Page.SLEEP_COLLECTION,

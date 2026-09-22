@@ -1,5 +1,6 @@
 package com.nexthci.ringfitness
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
@@ -15,6 +16,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
@@ -94,6 +96,8 @@ abstract class StepCollectionActivity : Activity() {
         super.onSaveInstanceState(outState)
     }
 
+    // API 33+ is handled by the OnBackInvoked callback registered in onCreate.
+    @SuppressLint("GestureBackNavigation")
     @Deprecated("Legacy Android back callback")
     override fun onBackPressed() = back()
 
@@ -136,6 +140,11 @@ abstract class StepCollectionActivity : Activity() {
         }
         state.session?.reference?.let { saved ->
             stepsDraft = saved.steps?.toString().orEmpty()
+        }
+        if (old != null && old.copy(downloadSavedBytes = state.downloadSavedBytes,
+                downloadTotalBytes = state.downloadTotalBytes, downloadFinalizing = state.downloadFinalizing) == state) {
+            updateDownloadProgress(state)
+            return
         }
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
@@ -340,7 +349,19 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(taskCard, task.title, 14f, muted = true)
             ui.gap(taskCard, 8)
             ui.text(taskCard, task.status, 24f, bold = true).tag = "home_task_status"
-            task.hint?.takeIf { it.isNotBlank() }?.let { ui.gap(taskCard, 10); ui.text(taskCard, it) }
+            task.hint?.takeIf { it.isNotBlank() }?.let {
+                ui.gap(taskCard, 10)
+                ui.text(taskCard, it).tag = "home_task_hint"
+            }
+            if (state.taskPage == CollectionPage.DOWNLOADING && state.downloadTotalBytes?.let { it > 0 } == true) {
+                ui.gap(taskCard, 12)
+                taskCard.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+                    tag = "home_download_progress"
+                    max = 1_000
+                    progress = downloadProgress(state)
+                    isIndeterminate = state.downloadSavedBytes == null
+                }, LinearLayout.LayoutParams(-1, ui.dp(8)))
+            }
             val actionLabel = task.action.takeUnless { it.endsWith("…") }
             val localFinishAction = state.session?.isRingDeferred == true || state.canRecordReferenceLocally ||
                 (state.session?.stopConfirmedAtMs != null && state.session.reference == null &&
@@ -416,7 +437,7 @@ abstract class StepCollectionActivity : Activity() {
         records.forEach { record ->
             val card = ui.card(body)
             ui.text(card, listOfNotNull(
-                formatDateTime(record.startedAtMs, record.timeZoneId) ?: "开始时间待核对",
+                formatDateTime(record.displayStartedAtMs, record.timeZoneId) ?: "时间未知",
                 record.activity.label,
             ).joinToString(" · "), 14f, muted = true).tag = "record_time_${record.sessionId}"
             ui.gap(card, 8)
@@ -476,6 +497,7 @@ abstract class StepCollectionActivity : Activity() {
         val label = when {
             record.uploadDeferred -> "上传"
             record.transferStatus == "failed" -> "重试上传"
+            record.uploadRequeueAvailable -> "重试上传"
             else -> return null
         }
         return label to {
@@ -515,7 +537,7 @@ abstract class StepCollectionActivity : Activity() {
             CollectionPage.SAVING -> HomeTask("正在保存步数", "正在保存", "查看进度")
             CollectionPage.DOWNLOADING -> if (state.session.startAbort != null)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
-            else HomeTask("正在下载数据", "步数已保存", "查看下载")
+            else HomeTask("正在保存数据", "步数已保存", "查看下载", downloadHint(state))
             CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
             CollectionPage.ERROR -> when {
                 state.session?.localData != null -> if (state.uploadAvailable)
@@ -531,6 +553,37 @@ abstract class StepCollectionActivity : Activity() {
                 else -> "戒指状态待确认"
             }, "重新检查")
         }
+    }
+
+    private fun updateDownloadProgress(state: CollectionFlowState) {
+        window.decorView.findViewWithTag<TextView>("home_task_hint")?.text = downloadHint(state).orEmpty()
+        window.decorView.findViewWithTag<ProgressBar>("home_download_progress")?.apply {
+            isIndeterminate = state.downloadSavedBytes == null
+            progress = downloadProgress(state)
+        }
+    }
+
+    private fun downloadProgress(state: CollectionFlowState): Int {
+        val saved = state.downloadSavedBytes ?: return 0
+        val total = state.downloadTotalBytes?.takeIf { it > 0 } ?: return 0
+        return ((saved.coerceIn(0, total) * 1_000L) / total).toInt()
+    }
+
+    private fun downloadHint(state: CollectionFlowState): String? {
+        val saved = state.downloadSavedBytes
+        val total = state.downloadTotalBytes?.takeIf { it > 0 }
+        if (state.downloadFinalizing || (saved != null && total != null && saved >= total)) {
+            return "原始数据已接收完成，正在检查并保存文件。"
+        }
+        if (saved == null || total == null) return "正在读取戒指原始数据，可离开页面，后台会继续保存。"
+        val percent = ((saved.coerceIn(0, total) * 100L) / total).toInt()
+        return "原始数据已保存 $percent%（${formatBytes(saved)} / ${formatBytes(total)}），可离开页面，后台会继续。"
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L -> String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0)
+        else -> "$bytes B"
     }
 
     private fun captureSession(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
@@ -950,6 +1003,7 @@ abstract class StepCollectionActivity : Activity() {
         when {
             raw.contains("权限") -> "请允许蓝牙权限后重试。"
             raw.contains("没有进展") -> "接收暂时中断，已保存进度。请将戒指靠近手机后重新连接。"
+            raw.contains("仍在整理") -> "数据仍在整理，已保存当前进度，请稍后点击重试。"
             raw.contains("蓝牙已关闭") -> "请打开手机蓝牙后重试。"
             raw.contains("空间") -> "手机存储空间不足，请清理空间后重试。"
             raw.contains("-16") || raw.contains("充电") -> "请将戒指取出充电盒，等待 10 秒后重新检查。"

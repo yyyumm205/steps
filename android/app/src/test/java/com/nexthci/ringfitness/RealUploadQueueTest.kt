@@ -450,19 +450,19 @@ class RealUploadQueueTest {
         assertEquals(0, f.requests)
     }
 
-    @Test fun preparationFailureIsVisibleAndCanRetryWithoutLosingReference() {
+    @Test fun recoverablePreparationFailureCanRetryWithoutLosingReference() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
         f.failFreeze = true
         assertFalse(f.queue.run(f.id))
         assertEquals(SessionTransferStatus.FAILED, f.store.read(f.id)!!.transfer.status)
         assertEquals("preparation", f.queue.task(f.id)!!.failureStage)
-        assertTrue(f.queue.needsLocalReview(f.id))
+        assertFalse(f.queue.needsLocalReview(f.id))
         assertEquals(0, f.requests)
         assertEquals(0L, f.store.read(f.id)!!.reference!!.steps)
         f.failFreeze = false
         assertTrue(f.queue.enqueue(f.id, link, true))
-        assertTrue(f.queue.needsLocalReview(f.id))
+        assertFalse(f.queue.needsLocalReview(f.id))
         assertFalse(f.queue.run(f.id))
         assertFalse(f.queue.needsLocalReview(f.id))
         assertEquals(SessionTransferStatus.COMPLETE, f.store.read(f.id)!!.transfer.status)
@@ -481,6 +481,7 @@ class RealUploadQueueTest {
 
         assertFalse(f.queue.run(f.id))
         assertEquals(0, f.requests)
+        assertEquals("integrity", f.queue.task(f.id)!!.failureStage)
         assertTrue(f.openQueue().needsLocalReview(f.id))
         assertEquals(SessionTransferStatus.PENDING, f.store.read(f.id)!!.transfer.status)
         assertFalse(raw.exists())
@@ -512,7 +513,7 @@ class RealUploadQueueTest {
 
         assertFalse(f.queue.run(f.id))
         assertEquals(0, f.requests)
-        assertEquals("preparation", f.queue.task(f.id)!!.failureStage)
+        assertEquals("integrity", f.queue.task(f.id)!!.failureStage)
         assertTrue(f.openQueue().needsLocalReview(f.id))
         assertEquals(listOf(second), f.queue.queuedIds())
         assertFalse(f.queue.run(second))
@@ -523,16 +524,16 @@ class RealUploadQueueTest {
         assertEquals(link, f.queue.task(f.id)!!.targetLink)
     }
 
-    @Test fun successfulLocalRecheckClearsReviewEvenWhenTheNetworkAttemptFails() {
+    @Test fun recoverablePreparationRemainsRetryableWhenTheNextNetworkAttemptFails() {
         val f = Fixture()
         f.queue.enqueue(f.id, link, false)
         f.failFreeze = true
         f.queue.run(f.id)
-        assertTrue(f.queue.needsLocalReview(f.id))
+        assertFalse(f.queue.needsLocalReview(f.id))
         f.failFreeze = false
         f.failUpload = true
         f.queue.enqueue(f.id, link, true)
-        assertTrue(f.queue.needsLocalReview(f.id))
+        assertFalse(f.queue.needsLocalReview(f.id))
 
         assertTrue(f.queue.run(f.id))
         assertFalse(f.queue.needsLocalReview(f.id))

@@ -9,6 +9,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ProgressBar
 import android.widget.Spinner
 import android.widget.TextView
 import androidx.lifecycle.Lifecycle
@@ -98,7 +99,8 @@ class CollectionFlowInstrumentedTest {
                     records = listOf(FlowRecordSummary(session.sessionId, session.reference?.steps,
                         session.reference?.status?.wireValue, session.transfer.status.wireValue, true,
                         transferInFlight = inFlight, localReviewRequired = needsReview,
-                        activity = session.activity, uploadDeferred = session.completionPolicy == CompletionPolicy.SAVE_LATER)))
+                        activity = session.activity, uploadDeferred = session.completionPolicy == CompletionPolicy.SAVE_LATER,
+                        uploadRequeueAvailable = session.completionPolicy == CompletionPolicy.SAVE_UPLOAD)))
 
                 screen("catalog_home_unselected", base.copy(canStart = true))
                 screen("catalog_home_walking", base.copy(canStart = true, selectedActivity = SessionActivity.WALKING))
@@ -158,7 +160,8 @@ class CollectionFlowInstrumentedTest {
                 screen("catalog_saving", base.copy(page = CollectionPage.SAVING,
                     taskPage = CollectionPage.SAVING, session = reference, busy = true))
                 screen("catalog_downloading", base.copy(page = CollectionPage.DOWNLOADING,
-                    taskPage = CollectionPage.DOWNLOADING, session = recorded, busy = true))
+                    taskPage = CollectionPage.DOWNLOADING, session = recorded, busy = true,
+                    downloadSavedBytes = 3_145_728, downloadTotalBytes = 12_582_912))
                 screen("catalog_upload_queue", savedState())
                 val uploading = local.copy(transfer = SessionTransfer(SessionTransferStatus.TRANSFERRING, 1))
                 screen("catalog_uploading", savedState(uploading, inFlight = true))
@@ -247,7 +250,7 @@ class CollectionFlowInstrumentedTest {
                     FlowRecordSummary("catalog-history-uploading", 736, "valid", "transferring", true,
                         transferInFlight = true, activity = SessionActivity.RUNNING),
                     FlowRecordSummary("catalog-history-queued", 248, "valid", "pending", true,
-                        activity = SessionActivity.WALKING),
+                        activity = SessionActivity.WALKING, uploadRequeueAvailable = true),
                     FlowRecordSummary("catalog-history-uploaded", 562, "valid", "complete", true,
                         activity = SessionActivity.WALKING))
                 screen("catalog_home_history_top", base.copy(canStart = true, records = history))
@@ -721,6 +724,51 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun longDownloadShowsDurableProgressAndUpdatesWithoutRebuildingThePage() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val now = System.currentTimeMillis()
+            val session = FreeLivingSession("long-download-view", preparation,
+                FreeLivingSessionPhase.AWAITING_REFERENCE, "Asia/Shanghai", 28_800, now - 10_800_000,
+                stopConfirmedAtMs = now - 10_000, completionPolicy = CompletionPolicy.SAVE_UPLOAD,
+                reference = SessionReference(ReferenceStatus.VALID, 20_000, now - 9_000),
+                activity = SessionActivity.WALKING)
+            val initial = CollectionFlowState(page = CollectionPage.DOWNLOADING,
+                taskPage = CollectionPage.DOWNLOADING, isSimulation = false, uploadAvailable = true,
+                hasProfile = true, participantId = preparation.participantId, placement = preparation.placement,
+                session = session, connected = true, busy = true,
+                downloadSavedBytes = 2_621_440, downloadTotalBytes = 10_485_760)
+            val fixture = RenderingFlow(initial)
+            renderFixture(scenario, fixture)
+            var originalStatus: View? = null
+            scenario.onActivity { activity ->
+                originalStatus = tagged<TextView>(activity, "home_task_status")
+                assertEquals("步数已保存", (originalStatus as TextView).text.toString())
+                assertTrue(tagged<TextView>(activity, "home_task_hint").text.contains("25%"))
+                assertEquals(250, tagged<ProgressBar>(activity, "home_download_progress").progress)
+                assertNull(taggedOrNull<Button>(activity, "home_task_action"))
+            }
+
+            fixture.state = initial.copy(downloadSavedBytes = 7_864_320)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertSame(originalStatus, tagged<TextView>(activity, "home_task_status"))
+                assertTrue(tagged<TextView>(activity, "home_task_hint").text.contains("75%"))
+                assertEquals(750, tagged<ProgressBar>(activity, "home_download_progress").progress)
+            }
+
+            fixture.state = initial.copy(downloadSavedBytes = 10_485_760, downloadFinalizing = true)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertSame(originalStatus, tagged<TextView>(activity, "home_task_status"))
+                assertEquals("原始数据已接收完成，正在检查并保存文件。",
+                    tagged<TextView>(activity, "home_task_hint").text.toString())
+                assertEquals(1_000, tagged<ProgressBar>(activity, "home_download_progress").progress)
+            }
+        }
+    }
+
     @Test fun permissionFailureWithoutOwnerHasWorkingToolbarAndSystemBack() = withFlow {
         assumeTrue("A running real owner must be left untouched", !RealCollectionBridge.isRunning())
         listOf(false, true).forEach { systemBack ->
@@ -892,6 +940,32 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun historyUsesPhoneStartWhenTheSampleBoundaryIsUnknown() = withFlow { _ ->
+        val phoneStart = Instant.parse("2026-09-19T01:06:00Z").toEpochMilli()
+        val sampleStart = Instant.parse("2026-09-19T01:08:00Z").toEpochMilli()
+        val fixture = RenderingFlow(CollectionFlowState(isSimulation = false, uploadAvailable = false,
+            hasProfile = true, participantId = "view001", placement = RingPlacement.LEFT_INDEX,
+            connected = true, canStart = true, records = listOf(
+                FlowRecordSummary("phone-time", 12, "valid", "complete", true,
+                    activity = SessionActivity.WALKING, startedAtMs = null,
+                    timeZoneId = "Asia/Shanghai", phoneStartAtMs = phoneStart),
+                FlowRecordSummary("sample-time", 18, "valid", "complete", true,
+                    activity = SessionActivity.RUNNING, startedAtMs = sampleStart,
+                    timeZoneId = "Asia/Shanghai", phoneStartAtMs = phoneStart),
+            )))
+
+        launch().use { scenario ->
+            renderFixture(scenario, fixture)
+            openRecords(scenario)
+            scenario.onActivity {
+                assertEquals("2026-09-19 09:06 · 走路",
+                    tagged<TextView>(it, "record_time_phone-time").text.toString())
+                assertEquals("2026-09-19 09:08 · 跑步",
+                    tagged<TextView>(it, "record_time_sample-time").text.toString())
+            }
+        }
+    }
+
     @Test fun realUploadProgressAndRetryStayInsideTheSavedRecordWithoutReplacingThePrimaryAction() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)
@@ -945,6 +1019,61 @@ class CollectionFlowInstrumentedTest {
                 assertEquals("已上传", tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
                 assertNull(taggedOrNull<View>(activity, "retry_upload_${session.sessionId}"))
             }
+        }
+    }
+
+    @Test fun pendingImmediateUploadCanBeQueuedAgainFromItsSavedRecord() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val session = renderingSession(preparation).copy(
+                reference = SessionReference(ReferenceStatus.VALID, 17, 4_000),
+                localData = SessionLocalData(listOf(SessionRawFile("view.rfbin", 1, 1, "0".repeat(64))), 5_000),
+                completionPolicy = CompletionPolicy.SAVE_UPLOAD)
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME, isSimulation = false,
+                uploadAvailable = true, hasProfile = true, participantId = preparation.participantId,
+                placement = preparation.placement, session = session, connected = true, canStart = true,
+                selectedActivity = SessionActivity.WALKING,
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "pending", true,
+                    uploadRequeueAvailable = true))))
+            renderFixture(scenario, fixture)
+            openRecords(scenario)
+            scenario.onActivity { activity ->
+                assertEquals("已保存，等待上传",
+                    tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("重试上传",
+                    tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+            }
+            click(scenario, "retry_upload_${session.sessionId}")
+            assertEquals(listOf(session.sessionId), fixture.uploadRetries)
+        }
+    }
+
+    @Test fun claimedUploadInterruptedBeforePayloadCanBeQueuedAgainFromItsSavedRecord() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val session = renderingSession(preparation).copy(
+                reference = SessionReference(ReferenceStatus.VALID, 17, 4_000),
+                localData = SessionLocalData(listOf(SessionRawFile("view.rfbin", 1, 1, "0".repeat(64))), 5_000),
+                completionPolicy = CompletionPolicy.SAVE_UPLOAD,
+                transfer = SessionTransfer(SessionTransferStatus.TRANSFERRING, 1))
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME, isSimulation = false,
+                uploadAvailable = true, hasProfile = true, participantId = preparation.participantId,
+                placement = preparation.placement, session = session, connected = true, canStart = true,
+                selectedActivity = SessionActivity.WALKING,
+                records = listOf(FlowRecordSummary(session.sessionId, 17, "valid", "transferring", true,
+                    uploadRequeueAvailable = true))))
+            renderFixture(scenario, fixture)
+            openRecords(scenario)
+            scenario.onActivity { activity ->
+                assertEquals("已保存，等待上传",
+                    tagged<TextView>(activity, "record_status_${session.sessionId}").text.toString())
+                assertEquals("重试上传",
+                    tagged<Button>(activity, "retry_upload_${session.sessionId}").text.toString())
+            }
+            click(scenario, "retry_upload_${session.sessionId}")
+            assertEquals(listOf(session.sessionId), fixture.uploadRetries)
         }
     }
 

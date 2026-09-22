@@ -25,6 +25,15 @@ def ppg(uptime=10040):
     return bytes((0x32, 0x11)) + struct.pack("<HBBBBI", 7, 0, 0, 2, 5, uptime) + struct.pack("<iiii", 100, 200, 101, 201)
 
 
+def ppg_packet(sequence, uptime, count=24):
+    samples = b"".join(struct.pack("<ii", 100 + index, 200 + index) for index in range(count))
+    return (bytes((0x32, 0x11)) + struct.pack("<HBBBBI", sequence, 0, 0, count, 5, uptime) + samples)
+
+
+def vitals_packet(sequence, uptime=10000):
+    return bytes((0x32, 0x10)) + struct.pack("<HHBHIHBB", sequence, 72, 0, 1, uptime, 820, 3, 5)
+
+
 def raw_bytes(packets=None, **overrides):
     packets = packets if packets is not None else [imu(10020), ppg()]
     payload = b"".join(packets)
@@ -298,6 +307,123 @@ def test_large_gap_overlap_rollback_are_preserved(tmp_path):
     assert report["channels"]["imu"]["gaps"] == 1
     assert report["channels"]["imu"]["overlaps"] == 2
     assert report["channels"]["imu"]["rollbacks"] == 1
+
+
+@pytest.mark.parametrize("deviation,previous_count,current_count,expected_gap,expected_overlap", [
+    (39, 10, 2, 0, 0),
+    (40, 10, 2, 1, 0),
+    (-79, 4, 10, 0, 0),
+    (-80, 4, 10, 0, 1),
+])
+def test_packet_timing_uses_adjacent_packet_coverage_boundaries(
+        tmp_path, deviation, previous_count, current_count, expected_gap, expected_overlap):
+    previous_uptime = 10_000 + (previous_count - 1) * 20
+    current_uptime = previous_uptime + 20 + deviation + (current_count - 1) * 20
+    raw = raw_bytes([imu(previous_uptime, previous_count), imu(current_uptime, current_count)])
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw)
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    channel = quality["files"][0]["channels"]["imu"]
+    assert channel["gaps"] == expected_gap
+    assert channel["overlaps"] == expected_overlap
+    assert channel["rollbacks"] == 0
+    assert channel["packet_time_deviation_events"] == 1
+    assert channel["packet_time_deviation_min_ms"] == deviation
+    assert channel["packet_time_deviation_max_ms"] == deviation
+    assert ("raw_timing_discontinuity" in quality["analysis_reasons"]) is bool(
+        expected_gap or expected_overlap)
+
+
+def test_regular_packet_clock_offsets_are_diagnostic_not_missing_data(tmp_path):
+    packets = [imu(10_620, 32), imu(11_268, 32), imu(11_917, 32),
+               ppg_packet(1, 20_000), ppg_packet(2, 21_270),
+               ppg_packet(3, 21_920), ppg_packet(4, 21_920, 10)]
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes(packets))
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    imu_stats = quality["files"][0]["channels"]["imu"]
+    ppg_stats = quality["files"][0]["channels"]["ppg"]
+    assert (imu_stats["gaps"], imu_stats["overlaps"], imu_stats["rollbacks"]) == (0, 0, 0)
+    assert (imu_stats["packet_time_deviation_events"],
+            imu_stats["packet_time_deviation_min_ms"],
+            imu_stats["packet_time_deviation_max_ms"]) == (2, 8, 9)
+    assert (ppg_stats["gaps"], ppg_stats["overlaps"], ppg_stats["rollbacks"]) == (0, 0, 0)
+    assert (ppg_stats["packet_time_deviation_events"],
+            ppg_stats["packet_time_deviation_min_ms"],
+            ppg_stats["packet_time_deviation_max_ms"]) == (3, -400, 310)
+    assert "raw_timing_discontinuity" not in quality["analysis_reasons"]
+
+
+def test_ppg_vitals_shared_sequence_crosses_types_and_wraps(tmp_path):
+    packets = [ppg_packet(0xFFFE, 10_000), vitals_packet(0xFFFF, 10_300),
+               ppg_packet(0, 10_960), vitals_packet(1, 11_200)]
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes(packets))
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    sequence = quality["files"][0]["ppg_vitals_sequence"]
+    assert sequence == {"received_records": 4, "first_sequence": 0xFFFE, "last_sequence": 1,
+                        "gap_events": 0, "missing_records": 0, "duplicates": 0, "rollbacks": 0}
+    assert "raw_timing_discontinuity" not in quality["analysis_reasons"]
+
+
+def test_shared_sequence_finds_small_missing_ppg_record_below_packet_time_threshold(tmp_path):
+    # One omitted 10-sample PPG record adds only 400 ms, below the adjacent 24-sample packet span.
+    packets = [ppg_packet(10, 10_000), vitals_packet(11, 10_300),
+               ppg_packet(13, 11_360)]
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes(packets))
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    report = quality["files"][0]
+    assert report["channels"]["ppg"]["gaps"] == 0
+    assert report["ppg_vitals_sequence"]["gap_events"] == 1
+    assert report["ppg_vitals_sequence"]["missing_records"] == 1
+    assert report["timing_events"] == [{
+        "channel": "ppg_vitals", "packet_index": 2, "record_kind": "ppg",
+        "kind": "sequence_gap", "previous_sequence": 11, "sequence": 13,
+        "missing_records": 1}]
+    assert "raw_timing_discontinuity" in quality["analysis_reasons"]
+
+
+def test_shared_sequence_reports_duplicate_and_rollback_across_record_types(tmp_path):
+    packets = [ppg_packet(10, 10_000), vitals_packet(10, 10_300),
+               ppg_packet(9, 10_960)]
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes(packets))
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    sequence = quality["files"][0]["ppg_vitals_sequence"]
+    assert sequence["gap_events"] == sequence["missing_records"] == 0
+    assert sequence["duplicates"] == 1
+    assert sequence["rollbacks"] == 1
+    assert [event["kind"] for event in quality["files"][0]["timing_events"]] == [
+        "sequence_duplicate", "sequence_rollback"]
+    assert "raw_timing_discontinuity" in quality["analysis_reasons"]
+
+
+def test_timing_event_details_are_bounded_without_losing_counts(tmp_path):
+    packets = [imu(10_020 + index * 100) for index in range(152)]
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes(packets))
+    result = import_archive(source, tmp_path / "out")
+    report = json.loads((Path(result.directory) / "quality.json").read_text())["files"][0]
+    assert report["channels"]["imu"]["gaps"] == 151
+    assert report["timing_event_detail_limit"] == 100
+    assert len(report["timing_events"]) == 100
+
+
+def test_uptime_rollback_remains_a_timing_discontinuity(tmp_path):
+    source = tmp_path / "input.zip"
+    archive_at(source, raw=raw_bytes([imu(10_020), imu(500)]))
+    result = import_archive(source, tmp_path / "out")
+    quality = json.loads((Path(result.directory) / "quality.json").read_text())
+    channel = quality["files"][0]["channels"]["imu"]
+    assert channel["rollbacks"] == 1
+    assert channel["overlaps"] == 1
+    assert "raw_timing_discontinuity" in quality["analysis_reasons"]
 
 
 def test_multiple_files_share_one_reference_and_require_review(tmp_path):

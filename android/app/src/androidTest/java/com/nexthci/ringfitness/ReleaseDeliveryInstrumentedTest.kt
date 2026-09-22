@@ -34,8 +34,8 @@ class ReleaseDeliveryInstrumentedTest {
         val context = instrumentation.targetContext
         assertEquals(0, context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE)
         val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0)
-        assertEquals("0.8.11-compat-recovery", packageInfo.versionName)
-        assertEquals(53L, packageInfo.longVersionCode)
+        assertEquals(BuildConfig.VERSION_NAME, packageInfo.versionName)
+        assertEquals(BuildConfig.VERSION_CODE.toLong(), packageInfo.longVersionCode)
         assertNotNull(context.packageManager.getLaunchIntentForPackage(context.packageName))
         assertThrows(android.content.pm.PackageManager.NameNotFoundException::class.java) {
             context.packageManager.getActivityInfo(ComponentName(context.packageName,

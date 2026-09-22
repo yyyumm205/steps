@@ -11,12 +11,15 @@ $keystore = Join-Path $signingDirectory 'release.jks'
 $passwordFile = Join-Path $signingDirectory 'release-password.txt'
 $lineage = Join-Path $signingDirectory 'release.lineage'
 $previousKeystore = Join-Path $signingDirectory 'previous-debug.keystore'
+function Convert-GradlePath([string]$value) {
+    [regex]::Replace($value, '\\u([0-9a-fA-F]{4})', {
+        param($match) [char][Convert]::ToInt32($match.Groups[1].Value, 16)
+    }).Replace('\:', ':').Replace('\\', '\')
+}
 $properties = Get-Content (Join-Path $androidProject 'local.properties')
 $sdkLine = $properties | Where-Object { $_ -match '^sdk.dir=' } | Select-Object -First 1
 if (!$sdkLine) { throw 'Configure sdk.dir in android/local.properties.' }
-$sdk = [regex]::Replace(($sdkLine -replace '^sdk.dir=', ''), '\\u([0-9a-fA-F]{4})', {
-    param($match) [char][Convert]::ToInt32($match.Groups[1].Value, 16)
-}).Replace('\:', ':').Replace('\\', '\')
+$sdk = Convert-GradlePath ($sdkLine -replace '^sdk.dir=', '')
 $buildTools = Get-ChildItem (Join-Path $sdk 'build-tools') -Directory |
     Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
 if (!$buildTools) { throw 'Android SDK build-tools are required.' }
@@ -24,7 +27,7 @@ $signer = Join-Path $buildTools.FullName 'apksigner.bat'
 $align = Join-Path $buildTools.FullName 'zipalign.exe'
 $jdkLine = Get-Content (Join-Path $androidProject 'gradle.properties') |
     Where-Object { $_ -match '^org.gradle.java.home=' } | Select-Object -First 1
-$jdk = if ($jdkLine) { $jdkLine -replace '^org.gradle.java.home=', '' } else { $env:JAVA_HOME }
+$jdk = if ($jdkLine) { Convert-GradlePath ($jdkLine -replace '^org.gradle.java.home=', '') } else { $env:JAVA_HOME }
 if (!$jdk -or !(Test-Path (Join-Path $jdk 'bin/keytool.exe'))) { throw 'Set JAVA_HOME to the project JDK.' }
 $previousJavaHome = $env:JAVA_HOME
 $env:JAVA_HOME = $jdk

@@ -19,6 +19,7 @@ from .schema import require
 MAGIC = b"RFV2RAW\0"
 HEADER = struct.Struct("<8sHHHHIIqqqQII")
 HEADER_SIZE = 64
+TIMING_EVENT_DETAIL_LIMIT = 100
 
 
 @dataclass(frozen=True)
@@ -87,12 +88,22 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
     channels = {
         "imu": {"samples": 0, "packets": 0, "first_uptime_ms": None, "last_uptime_ms": None,
                 "first_packet_uptime_ms": None, "last_packet_uptime_ms": None,
-                "gaps": 0, "overlaps": 0, "rollbacks": 0},
+                "gaps": 0, "overlaps": 0, "rollbacks": 0,
+                "packet_time_deviation_events": 0,
+                "packet_time_deviation_min_ms": None, "packet_time_deviation_max_ms": None},
         "ppg": {"samples": 0, "packets": 0, "first_uptime_ms": None, "last_uptime_ms": None,
                 "first_packet_uptime_ms": None, "last_packet_uptime_ms": None,
-                "gaps": 0, "overlaps": 0, "rollbacks": 0},
+                "gaps": 0, "overlaps": 0, "rollbacks": 0,
+                "packet_time_deviation_events": 0,
+                "packet_time_deviation_min_ms": None, "packet_time_deviation_max_ms": None},
     }
     events = []
+    previous_counts = {"imu": None, "ppg": None}
+    ppg_vitals_sequence = {
+        "received_records": 0, "first_sequence": None, "last_sequence": None,
+        "gap_events": 0, "missing_records": 0, "duplicates": 0, "rollbacks": 0,
+    }
+    previous_ppg_vitals_sequence = None
     processed = crc = records = 0
     common = ["activity_session_id", "participant_id", "source_file", "device_session_id",
               "timestamp_iso", "timestamp_unix_ms", "ring_uptime_ms", "packet_uptime_ms",
@@ -118,9 +129,23 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
         if stats["last_uptime_ms"] is not None:
             deviation = first - stats["last_uptime_ms"] - interval
             if deviation != 0:
-                kind = "gaps" if deviation > 0 else "overlaps"
-                stats[kind] += 1
-                if len(events) < 1000:
+                stats["packet_time_deviation_events"] += 1
+                minimum = stats["packet_time_deviation_min_ms"]
+                maximum = stats["packet_time_deviation_max_ms"]
+                stats["packet_time_deviation_min_ms"] = deviation if minimum is None else min(minimum, deviation)
+                stats["packet_time_deviation_max_ms"] = deviation if maximum is None else max(maximum, deviation)
+                # HEALTH exposes one uptime value per packet, without promising that it is an
+                # exact sample endpoint. The shared PPG/vitals sequence detects lost records;
+                # IMU has no sequence. Only a whole adjacent packet's offset is therefore
+                # strong packet-time evidence of lost or repeated sample coverage.
+                kind = None
+                if deviation >= count * interval:
+                    kind = "gaps"
+                elif deviation <= -previous_counts[channel] * interval:
+                    kind = "overlaps"
+                if kind is not None:
+                    stats[kind] += 1
+                if kind is not None and len(events) < TIMING_EVENT_DETAIL_LIMIT:
                     events.append({"channel": channel, "packet_index": packet_index,
                                    "kind": kind, "deviation_ms": deviation})
             if packet_uptime < stats["last_packet_uptime_ms"]:
@@ -131,7 +156,42 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
         stats["last_uptime_ms"] = packet_uptime
         stats["last_packet_uptime_ms"] = packet_uptime
         stats["packets"] += 1
+        previous_counts[channel] = count
         return stats
+
+    def note_ppg_vitals_sequence(sequence, packet_index, record_kind):
+        nonlocal previous_ppg_vitals_sequence
+        stats = ppg_vitals_sequence
+        stats["received_records"] += 1
+        if stats["first_sequence"] is None:
+            stats["first_sequence"] = sequence
+        kind = None
+        missing = 0
+        if previous_ppg_vitals_sequence is not None:
+            delta = (sequence - previous_ppg_vitals_sequence) & 0xFFFF
+            if delta == 0:
+                kind = "sequence_duplicate"
+                stats["duplicates"] += 1
+            elif delta == 1:
+                pass
+            elif delta < 0x8000:
+                kind = "sequence_gap"
+                missing = delta - 1
+                stats["gap_events"] += 1
+                stats["missing_records"] += missing
+            else:
+                kind = "sequence_rollback"
+                stats["rollbacks"] += 1
+            if kind is not None and len(events) < TIMING_EVENT_DETAIL_LIMIT:
+                event = {"channel": "ppg_vitals", "packet_index": packet_index,
+                         "record_kind": record_kind, "kind": kind,
+                         "previous_sequence": previous_ppg_vitals_sequence,
+                         "sequence": sequence}
+                if missing:
+                    event["missing_records"] = missing
+                events.append(event)
+        previous_ppg_vitals_sequence = sequence
+        stats["last_sequence"] = sequence
 
     def row_prefix(stats, uptime, packet_uptime, packet_index, sequence):
         anchor_delta = uptime - header.anchor_uptime_ms
@@ -159,6 +219,7 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
                 subcommand = command[1]
                 if subcommand == 0x10:
                     packet = command + read(15)
+                    note_ppg_vitals_sequence(struct.unpack_from("<H", packet, 2)[0], records, "vitals")
                 elif subcommand == 0x12:
                     fixed = read(5)
                     count, uptime = struct.unpack("<BI", fixed)
@@ -181,6 +242,7 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
                     uptime = struct.unpack_from("<I", fixed, 6)[0]
                     samples = read(count * channel_count * 4)
                     packet = command + fixed + samples
+                    note_ppg_vitals_sequence(sequence, records, "ppg")
                     stats = timing("ppg", uptime, count, 40, records)
                     output, cursor = writer("ppg"), 0
                     for index in range(count):
@@ -208,6 +270,7 @@ def decode_to_csv(source_path: Path, destination: Path, manifest: dict,
             for stream in streams.values():
                 stream.close()
     return {"source_file": source_path.name, "header": asdict(header), "parsed_records": records,
-            "channels": channels, "timing_events": events, "timing_event_detail_limit": 1000,
+            "channels": channels, "ppg_vitals_sequence": ppg_vitals_sequence, "timing_events": events,
+            "timing_event_detail_limit": TIMING_EVENT_DETAIL_LIMIT,
             "sample_clock_status": "uncalibrated", "sample_coverage_status": "not_assessed",
             "normalization_applied": False, "csv_files": sorted(Path(stream.name).name for stream in streams.values())}

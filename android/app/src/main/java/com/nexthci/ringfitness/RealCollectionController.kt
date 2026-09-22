@@ -21,6 +21,7 @@ interface RealUploadPort {
     val available: Boolean get() = true
     fun enqueue(sessionId: String, retry: Boolean = false)
     fun isInFlight(sessionId: String): Boolean
+    fun canRetryUpload(sessionId: String): Boolean = false
     fun needsLocalReview(sessionId: String): Boolean = false
     fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) = Unit
 }
@@ -92,12 +93,18 @@ class RealCollectionController(
     private var unknownPreservation: UnknownPreservation? = null
     private var unknownReadGeneration: Long? = null
     private var downloadTimeout = 0L
+    /** One logical watchdog covers the active transfer; stale callbacks are retired by token. */
+    private var transferWatchdogArmed = false
+    private var transferWatchdogToken = 0L
+    private var transferWatchdogLastActivityElapsed: Long? = null
     private data class DownloadRecovery(
         val transferId: String,
         var failures: Int = 0,
         var failedGeneration: Long? = null,
         var durableHighWater: Long = 0L,
         var replayHighWater: Long = 0L,
+        /** Number of post-READ final LIST expansions handled in this transfer. */
+        var finalizationExpansions: Int = 0,
     )
     private var downloadRecovery: DownloadRecovery? = null
     private data class BackupGapRecovery(
@@ -109,6 +116,9 @@ class RealCollectionController(
     private var backupGapRecovery: BackupGapRecovery? = null
     private class DownloadRecoveryLimitException : java.io.IOException(
         "下载多次没有进展，步数与已保存的数据会保留，请重新连接后重试",
+    )
+    private class DownloadFinalizationLimitException : java.io.IOException(
+        "戒指记录仍在整理，已保存当前数据，请稍后重试",
     )
     private var reconnectScheduledGeneration: Long? = null
     private var closed = false
@@ -136,6 +146,9 @@ class RealCollectionController(
     private var recoveryTimeRound: RecoveryTimeRound? = null
     private var recoveredStopClock: Pair<RecoveryTimeRound, Long>? = null
     private var replayDownloadOffset: Long? = null
+    /** Unknown-time checkpoints must replay their durable prefix once per GATT generation. */
+    private var prefixReplaySessionId: String? = null
+    private var prefixReplayGeneration: Long? = null
     private data class Inspection(val id: Long, val attempt: Int = 1,
         val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
@@ -352,10 +365,10 @@ class RealCollectionController(
                     val before = backup.nextOffset
                     backup.append(message)
                     if (backup.nextOffset > before) {
+                        transferWatchdogLastActivityElapsed = clock.nowElapsedMs()
                         backupGapRecovery?.let {
                             rememberTransferProgress(downloadRecoveryFor(it.transferId), backup.nextOffset, null)
                         }
-                        scheduleBackupTimeout()
                     }
                 }
                 is HealthMessage.ReadEnd -> {
@@ -372,7 +385,7 @@ class RealCollectionController(
                             unknownPreservation = UnknownPreservation(record, attempt, completed.file.sha256, generation, savedAtMs)
                             unknownReadGeneration = generation
                         }
-                        backupDownloader = null; backupRecord = null; downloadTimeout++
+                        backupDownloader = null; backupRecord = null; stopTransferWatchdog()
                         unknownBackupAttempt = null
                         backup.close()
                         runCatching { backup.releaseTemporary() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
@@ -409,8 +422,8 @@ class RealCollectionController(
                         replayDownloadOffset = maxOf(offset, message.offset + message.payload.size)
                     } ?: download.append(message)
                     if ((replayDownloadOffset ?: download.nextOffset) > before) {
+                        transferWatchdogLastActivityElapsed = clock.nowElapsedMs()
                         rememberDownloadProgress(download.nextOffset, replayDownloadOffset)
-                        scheduleDownloadTimeout()
                     }
                 }
                 is HealthMessage.ReadEnd -> {
@@ -423,11 +436,13 @@ class RealCollectionController(
                         }
                         download.checkpointReplay(message, offset)
                         if (offset < download.nextOffset) {
+                            publish(CollectionPage.DOWNLOADING)
                             requestWindow(download)
                             return@safely
                         }
                         replayDownloadOffset = null
                         if (!message.done) {
+                            publish(CollectionPage.DOWNLOADING)
                             requestWindow(download)
                             return@safely
                         }
@@ -437,12 +452,15 @@ class RealCollectionController(
                     }
                     if (download.checkpoint(message)) {
                         val completed = download.finish(message)
-                        downloader = null; downloadTimeout++
+                        downloader = null; stopTransferWatchdog()
                         download.close()
                         finalizingDownload = FinalizingDownload(download, completed,
                             requireNotNull(store.readPending()?.deviceRecordEvidence).record)
                         inspect()
-                    } else requestWindow(download)
+                    } else {
+                        publish(CollectionPage.DOWNLOADING)
+                        requestWindow(download)
+                    }
                 }
                 else -> Unit
             }
@@ -922,7 +940,14 @@ class RealCollectionController(
                 it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
                 uploads?.isInFlight(it.sessionId) != true,
             referenceReason = it.reference?.reason,
-            ringDeferred = it.isRingDeferred) }
+            ringDeferred = it.isRingDeferred,
+            uploadRequeueAvailable = isRealLocal(it) &&
+                it.completionPolicy == CompletionPolicy.SAVE_UPLOAD &&
+                uploads?.let { upload ->
+                    upload.available && !upload.isInFlight(it.sessionId) &&
+                        !upload.needsLocalReview(it.sessionId) && upload.canRetryUpload(it.sessionId)
+                } == true,
+            phoneStartAtMs = it.phoneStartAnchorMs()) }
 
     override fun home() = safely {
         browsingHome = !devicePreparationRequired
@@ -1103,7 +1128,8 @@ class RealCollectionController(
         check(port.read(requireNotNull(backupRecord).sessionId, download.nextOffset, READ_WINDOW_BYTES)) {
             "保存中断，请重新连接戒指后继续"
         }
-        scheduleBackupTimeout()
+        transferWatchdogLastActivityElapsed = clock.nowElapsedMs()
+        beginTransferWindow()
     }
 
     private fun continueUnknownArchive(observed: HealthRecordObservation) {
@@ -1255,16 +1281,6 @@ class RealCollectionController(
         inspect() // Use the normal readiness rules, including the multiple-unknown-record guard.
     }
 
-    private fun scheduleBackupTimeout() {
-        val id = ++downloadTimeout
-        scheduler.schedule(30_000) {
-            if (!closed && backupDownloader != null && query == null && id == downloadTimeout) safely {
-                port.disconnect()
-                onDisconnected(generation, "保存中断，请重新连接戒指后继续")
-            }
-        }
-    }
-
     private fun beginDownload(current: FreeLivingSession, observed: HealthRecordObservation) {
         val expected = requireNotNull(current.deviceRecordEvidence) { "本次戒指记录需要核对" }.record
         require(!current.deviceAssociationInvalidated && observed.address == current.preparation.ring?.address)
@@ -1312,10 +1328,14 @@ class RealCollectionController(
             DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
         val next = downloadFactory(directory, current, actual)
         val recovery = downloadRecoveryFor(current.sessionId)
+        recovery.finalizationExpansions = maxOf(recovery.finalizationExpansions,
+            restoredFinalizationExpansions(current.sessionId, actual.sessionId))
         // Reopening an existing checkpoint is not new transfer progress.
         recovery.durableHighWater = maxOf(recovery.durableHighWater, next.nextOffset)
         lastIdle = observed
-        val replay = expected.unixMs == 0L && stopEvidenceGeneration != generation && next.nextOffset > 0
+        val replay = expected.unixMs == 0L &&
+            (prefixReplaySessionId != current.sessionId || prefixReplayGeneration != generation) &&
+            next.nextOffset > 0
         if (next.nextOffset == actual.bytes && !replay) {
             val completed = next.finish(HealthMessage.ReadEnd(actual.bytes, true))
             finalizingDownload = FinalizingDownload(next, completed, actual)
@@ -1323,6 +1343,10 @@ class RealCollectionController(
             return
         }
         downloader = next
+        if (replay) {
+            prefixReplaySessionId = current.sessionId
+            prefixReplayGeneration = generation
+        }
         replayDownloadOffset = if (replay) 0L else null
         publish(CollectionPage.DOWNLOADING)
         requestWindow(next)
@@ -1351,6 +1375,11 @@ class RealCollectionController(
             "下载完成后出现其他记录变化，原始文件已保留"
         }
         if (actual != expected) {
+            val recovery = downloadRecoveryFor(current.sessionId)
+            recovery.finalizationExpansions++
+            if (recovery.finalizationExpansions > MAX_FINALIZATION_EXPANSIONS) {
+                throw DownloadFinalizationLimitException()
+            }
             store.updateDeviceEvidence(current.sessionId,
                 DeviceRecordEvidence(actual, observed.status, observed.statusReceivedAtMs))
             pending.download.extendTo(actual)
@@ -1384,6 +1413,13 @@ class RealCollectionController(
         return currentOthers.all { it in baseline }
     }
 
+    private fun restoredFinalizationExpansions(sessionId: String, deviceSessionId: Int): Int {
+        val prefix = "$sessionId-ring-$deviceSessionId.prefix-"
+        return directory.listFiles()?.count { file ->
+            file.isFile && file.name.startsWith(prefix) && file.name.endsWith(".rfbin")
+        } ?: 0
+    }
+
     private fun requestWindow(download: RealSessionDownload) {
         val id = requireNotNull(store.readPending()?.deviceSessionId)
         val replay = replayDownloadOffset
@@ -1391,18 +1427,42 @@ class RealCollectionController(
         val length = if (replay != null) minOf(READ_WINDOW_BYTES.toLong(), download.nextOffset - replay).toInt() else READ_WINDOW_BYTES
         download.beginRead(offset)
         check(port.read(id, offset, length)) { "下载连接中断，请重试" }
-        scheduleDownloadTimeout()
+        transferWatchdogLastActivityElapsed = clock.nowElapsedMs()
+        beginTransferWindow()
     }
 
-    private fun scheduleDownloadTimeout() {
-        val id = ++downloadTimeout
-        scheduler.schedule(30_000) {
-            if (!closed && downloader != null && id == downloadTimeout) safely {
-                closeDownload()
-                port.disconnect()
-                onDisconnected(generation, "下载中断，已保存的部分将继续保留")
-            }
+    /** [CollectionScheduler] cannot cancel delayed work, so stale callbacks are retired by token. */
+    private fun beginTransferWindow() {
+        if (transferWatchdogArmed || (downloader == null && backupDownloader == null)) return
+        transferWatchdogArmed = true
+        val token = ++transferWatchdogToken
+        transferWatchdogLastActivityElapsed = clock.nowElapsedMs()
+        scheduleTransferWatchdog(token)
+    }
+
+    private fun scheduleTransferWatchdog(token: Long, delayMs: Long = TRANSFER_WATCHDOG_MS) {
+        scheduler.schedule(delayMs) {
+            if (!closed && token == transferWatchdogToken) safely { runTransferWatchdog(token) }
         }
+    }
+
+    private fun runTransferWatchdog(token: Long) {
+        if (closed || token != transferWatchdogToken || (downloader == null && backupDownloader == null)) {
+            if (token == transferWatchdogToken && downloader == null && backupDownloader == null) {
+                transferWatchdogArmed = false
+            }
+            return
+        }
+        val elapsed = transferWatchdogLastActivityElapsed?.let { clock.nowElapsedMs() - it }
+        if (elapsed != null && elapsed > 0L && elapsed < TRANSFER_WATCHDOG_MS) {
+            scheduleTransferWatchdog(token, TRANSFER_WATCHDOG_MS - elapsed)
+            return
+        }
+        transferWatchdogArmed = false
+        val preserving = backupDownloader != null
+        port.disconnect()
+        onDisconnected(generation, if (preserving) "保存中断，请重新连接戒指后继续"
+        else "下载中断，已保存的部分将继续保留")
     }
 
     private fun pendingDownload(): FreeLivingSession? = store.readPending()?.takeIf {
@@ -1420,8 +1480,9 @@ class RealCollectionController(
     }
 
     private fun rememberTransferProgress(recovery: DownloadRecovery, durableOffset: Long, replayOffset: Long?) {
-        if (durableOffset > recovery.durableHighWater ||
-            (replayOffset != null && replayOffset > recovery.replayHighWater)) {
+        val progressed = durableOffset > recovery.durableHighWater ||
+            (replayOffset != null && replayOffset > recovery.replayHighWater)
+        if (progressed) {
             recovery.failures = 0
             recovery.durableHighWater = maxOf(recovery.durableHighWater, durableOffset)
             recovery.replayHighWater = maxOf(recovery.replayHighWater, replayOffset ?: 0L)
@@ -1431,6 +1492,9 @@ class RealCollectionController(
 
     private fun closeDownload() {
         downloadTimeout++
+        transferWatchdogArmed = false
+        transferWatchdogToken++
+        transferWatchdogLastActivityElapsed = null
         replayDownloadOffset = null
         val previous = downloader
         downloader = null
@@ -1442,6 +1506,13 @@ class RealCollectionController(
         try { previous?.close() } finally {
             try { pendingFinalization?.download?.close() } finally { previousBackup?.close() }
         }
+    }
+
+    private fun stopTransferWatchdog() {
+        downloadTimeout++
+        transferWatchdogArmed = false
+        transferWatchdogToken++
+        transferWatchdogLastActivityElapsed = null
     }
 
     fun close() {
@@ -1480,6 +1551,14 @@ class RealCollectionController(
     private fun publish(page: CollectionPage, error: String? = null) {
         val current = visibleCurrentSession()
         val pending = current?.takeIf { it.isPending }
+        val finalizing = finalizingDownload
+        val downloadRecord = finalizing?.record ?: pending?.deviceRecordEvidence?.record
+        val downloadSavedBytes = when {
+            downloader != null -> downloader?.nextOffset
+            finalizing != null -> finalizing.record.bytes
+            else -> null
+        }
+        val downloadTotalBytes = downloadRecord?.bytes?.takeIf { downloadSavedBytes != null }
         // STATUS/LIST checks between READ windows are part of the same visible save operation.
         val task = when {
             backupObservation != null && error == null ->
@@ -1504,6 +1583,9 @@ class RealCollectionController(
             placement = visibleProfile?.placement, session = current,
             connected = connected, connecting = connecting, checkingDevice = checkingDevice,
             preservingExisting = backupObservation != null,
+            downloadSavedBytes = downloadSavedBytes,
+            downloadTotalBytes = downloadTotalBytes,
+            downloadFinalizing = finalizing != null,
             busy = saving || (!localReference && (connecting || query != null || readinessWait != null || timeRound != null || recoveryTimeRound != null || abortWaitOperation != null || backupObservation != null || coordinator.state.settling || coordinator.state.timeoutOperationId != null)) ||
                 (visible != CollectionPage.HOME && visible in setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING)),
             error = if (visible == CollectionPage.HOME) taskError else error,
@@ -1561,7 +1643,8 @@ class RealCollectionController(
             runCatching { closeDownload() }
             query = null; readinessWait = null; lastIdle = null; connecting = false
             val noProgress = error is RealSessionDownload.DownloadNoProgressException ||
-                error is DownloadRecoveryLimitException
+                error is DownloadRecoveryLimitException ||
+                error is DownloadFinalizationLimitException
             if (noProgress) {
                 // Pause until an explicit retry. Retire late replies and reconnect timers as well.
                 val previousGeneration = generation++
@@ -1597,6 +1680,13 @@ class RealCollectionController(
         internal const val RECONNECT_DELAY_MS = 3_000L
         internal const val DOWNLOAD_RECOVERY_LIMIT = 3
         internal const val READ_WINDOW_BYTES = 8 * 1024
+        internal const val TRANSFER_WATCHDOG_MS = 30_000L
+        /**
+         * A stopped ring may expose a small Flash tail while finalising. The tail is allowed to
+         * grow a finite number of times; a continuously changing record must become an explicit
+         * retry state instead of keeping the participant on an endless download page.
+         */
+        internal const val MAX_FINALIZATION_EXPANSIONS = 3
         internal const val READINESS_CHECK_LIMIT = 3
         internal const val READINESS_CHECK_INTERVAL_MS = 1_500L
     }

@@ -64,6 +64,9 @@ data class SessionRawFile(
 
 data class SessionLocalData(val files: List<SessionRawFile>, val completedAtMs: Long)
 
+/** A persisted source no longer matches the session that owns it; retries must not publish it. */
+class SessionSourceIntegrityException(message: String, cause: Throwable? = null) : IOException(message, cause)
+
 enum class SessionTransferStatus(val wireValue: String) {
     PENDING("pending"), TRANSFERRING("transferring"), FAILED("failed"), COMPLETE("complete"),
 }
@@ -893,7 +896,9 @@ class FreeLivingSessionStore internal constructor(
         for (entry in files) {
             val source = File(directory, entry.fileName).canonicalFile
             require(source.parentFile == directory && source.name == entry.fileName && source != file) { "文件位置与采集段不匹配" }
-            if (!source.isFile || source.length() != entry.bytes) throw IOException("采集文件尚未保存完整")
+            if (!source.isFile || source.length() != entry.bytes) {
+                throw SessionSourceIntegrityException("采集文件尚未保存完整")
+            }
             val hash = MessageDigest.getInstance("SHA-256")
             source.inputStream().use { stream ->
                 val buffer = ByteArray(16 * 1024)
@@ -903,7 +908,9 @@ class FreeLivingSessionStore internal constructor(
                     hash.update(buffer, 0, count)
                 }
             }
-            if (hex(hash.digest()) != entry.sha256) throw IOException("采集文件校验失败，已保留原记录")
+            if (hex(hash.digest()) != entry.sha256) {
+                throw SessionSourceIntegrityException("采集文件校验失败，已保留原记录")
+            }
             FileOutputStream(source, true).use { it.fd.sync() }
         }
         syncDirectory(directory)

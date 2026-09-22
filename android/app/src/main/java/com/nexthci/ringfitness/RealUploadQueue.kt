@@ -224,14 +224,16 @@ class RealUploadQueue(
                 paused || automaticRetry -> "queued"
                 else -> "failed"
             }
-            task = task.copy(state = nextState,
-                failureStage = when {
-                    outcomeUncertain -> "outcome"
-                    destinationRejected -> "destination"
-                    error is InterruptedException -> task.failureStage
-                    else -> failureStage
-                }, payloadStarted = if (error is RetryableUploadException) false
-                    else task.payloadStarted)
+            val recordedFailureStage = when {
+                outcomeUncertain -> "outcome"
+                destinationRejected -> "destination"
+                error is InterruptedException -> task.failureStage
+                failureStage == "preparation" &&
+                    (error is SessionSourceIntegrityException || error is IllegalArgumentException) -> "integrity"
+                else -> failureStage
+            }
+            task = task.copy(state = nextState, failureStage = recordedFailureStage,
+                payloadStarted = if (error is RetryableUploadException) false else task.payloadStarted)
             if (paused && transferClaimed && !transportInvoked && task.receipt == null) {
                 store.releaseTransferClaimBeforeDispatch(sessionId, requireNotNull(claimedAttempt))
             }
@@ -268,7 +270,7 @@ class RealUploadQueue(
         if (store.read(sessionId)?.uploadAllowed == false) return false
         try {
             val task = read(sessionId)
-            if (task != null) task.failureStage in setOf("preparation", "outcome", "destination") ||
+            if (task != null) task.failureStage in setOf("integrity", "outcome", "destination") ||
                 requiresOutcomeReview(task, requireNotNull(store.read(sessionId))) ||
                 (task.state == "failed" && task.failureStage == "receipt")
             else store.read(sessionId)?.let { session ->
@@ -303,7 +305,7 @@ class RealUploadQueue(
         require(task.targetSha256 == digest(task.targetLink))
         require(task.archiveSha256 == null || task.archiveSha256.matches(Regex("[a-f0-9]{64}")))
         require(task.failureStage == null || task.failureStage in
-            setOf("preparation", "transport", "receipt", "outcome", "destination"))
+            setOf("preparation", "integrity", "transport", "receipt", "outcome", "destination"))
         require((task.receipt == null) == (task.receivedAtMs == null))
         require(task.receipt == null || (task.archiveSha256 != null && task.receivedAtMs!! > 0 && task.receipt.bytes > 0 &&
             task.receipt.fileId.matches(Regex("[a-fA-F0-9]{40,64}")) && task.receipt.fileName.isNotBlank() &&

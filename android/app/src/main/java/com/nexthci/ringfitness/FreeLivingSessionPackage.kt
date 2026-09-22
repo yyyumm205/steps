@@ -6,6 +6,7 @@ import com.google.gson.JsonParser
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
+import java.io.EOFException
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -23,6 +24,7 @@ import java.util.UUID
 import java.util.zip.CRC32
 import java.util.zip.CheckedInputStream
 import java.util.zip.ZipEntry
+import java.util.zip.ZipException
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
@@ -165,7 +167,7 @@ class FreeLivingSessionPackage internal constructor(
             val evidenceFile = child(directory, raw.file.name.removeSuffix(".rfbin") + ".raw-evidence.json")
             if (!evidenceFile.exists()) listOf(raw) else {
                 require(evidenceFile.isFile && evidenceFile.length() <= MAX_METADATA_BYTES) { "原始文件证据无效" }
-                val evidence = JsonParser.parseString(evidenceFile.readText(Charsets.UTF_8)).asJsonObject
+                val evidence = readJson(evidenceFile)
                 require(evidence.get("session_id")?.asString == sessionId &&
                     evidence.get("device_session_id")?.asInt == raw.manifest.get("device_session_id").asInt &&
                     evidence.get("file_sha256")?.asString == raw.manifest.get("sha256").asString &&
@@ -263,74 +265,92 @@ class FreeLivingSessionPackage internal constructor(
     }
 
     private fun verifyZip(archive: File, snapshot: Snapshot) {
-        ZipFile(archive).use { zip ->
-            val all = zip.entries().asSequence().toList()
-            val expected = snapshot.entries.associateBy { it.file.name }
-            require(all.size == expected.size + 1 && all.map { it.name }.toSet() == expected.keys + "manifest.json" &&
-                all.none { it.isDirectory }) { "上传包文件清单不一致" }
-            val manifest = zip.getEntry("manifest.json")
-            require(manifest.size in 1..MAX_METADATA_BYTES) { "上传包清单长度无效" }
-            val decoded = zip.getInputStream(manifest).use { JsonParser.parseString(it.reader(Charsets.UTF_8).readText()) }
-            require(decoded == snapshot.manifest) { "上传包采集信息校验失败" }
-            for ((name, entry) in expected) {
-                val stored = zip.getEntry(name)
-                require(stored.size == entry.manifest.get("bytes").asLong) { "上传包文件长度不完整" }
-                val result = zip.getInputStream(stored).use(::digest)
-                require(result == entry.manifest.get("sha256").asString) { "上传包文件哈希校验失败" }
+        try {
+            ZipFile(archive).use { zip ->
+                val all = zip.entries().asSequence().toList()
+                val expected = snapshot.entries.associateBy { it.file.name }
+                require(all.size == expected.size + 1 && all.map { it.name }.toSet() == expected.keys + "manifest.json" &&
+                    all.none { it.isDirectory }) { "上传包文件清单不一致" }
+                val manifest = zip.getEntry("manifest.json")
+                require(manifest.size in 1..MAX_METADATA_BYTES) { "上传包清单长度无效" }
+                val decoded = try {
+                    zip.getInputStream(manifest).use { JsonParser.parseString(it.reader(Charsets.UTF_8).readText()) }
+                } catch (error: RuntimeException) {
+                    throw SessionSourceIntegrityException("上传包清单无法解析", error)
+                }
+                require(decoded == snapshot.manifest) { "上传包采集信息校验失败" }
+                for ((name, entry) in expected) {
+                    val stored = zip.getEntry(name)
+                    require(stored.size == entry.manifest.get("bytes").asLong) { "上传包文件长度不完整" }
+                    val result = zip.getInputStream(stored).use(::digest)
+                    require(result == entry.manifest.get("sha256").asString) { "上传包文件哈希校验失败" }
+                }
             }
+        } catch (error: ZipException) {
+            throw SessionSourceIntegrityException("上传包结构不完整", error)
         }
     }
 
     private fun verifyRaw(file: File, deviceSessionId: Int, startedAtMs: Long, endedAtMs: Long): RawHeader {
-        DataInputStream(BufferedInputStream(FileInputStream(file), BUFFER_SIZE)).use { stream ->
-            val raw = ByteArray(64)
-            stream.readFully(raw)
-            require(raw.copyOfRange(0, 8).contentEquals(byteArrayOf(82, 70, 86, 50, 82, 65, 87, 0))) { "原始容器头无效" }
-            val header = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
-            require(header.getShort(8).toInt() == 2 && header.getShort(10).toInt() == 64 &&
-                (header.getShort(12).toInt() and 0xffff) == deviceSessionId &&
-                header.getLong(32) == startedAtMs && header.getLong(40) == endedAtMs) { "原始容器与采集段不一致" }
-            val payloadBytes = header.getLong(48)
-            val crc = header.getInt(56).toLong() and 0xffff_ffffL
-            require(payloadBytes > 0 && payloadBytes == file.length() - 64) { "原始容器长度不完整" }
-            val expectedRecords = header.getInt(16).toLong() and 0xffff_ffffL
-            val actual = CRC32()
-            val packets = DataInputStream(CheckedInputStream(stream, actual))
-            var parsedRecords = 0L
-            while (true) {
-                val command = packets.read()
-                if (command < 0) break
-                require(command == 0x32) { "原始记录头无效" }
-                when (packets.readUnsignedByte()) {
-                    0x10 -> packets.readFully(ByteArray(15))
-                    0x11 -> {
-                        packets.readInt() // sequence, mode and reserved bytes remain unmodified
-                        val count = packets.readUnsignedByte()
-                        val mask = packets.readUnsignedByte()
-                        packets.readInt() // original uptime
-                        require(count > 0 && mask in 1..7) { "PPG 原始记录无效" }
-                        packets.readFully(ByteArray(count * Integer.bitCount(mask) * 4))
-                    }
-                    0x12 -> {
-                        val count = packets.readUnsignedByte()
-                        packets.readInt() // original uptime
-                        require(count > 0) { "IMU 原始记录无效" }
-                        packets.readFully(ByteArray(count * 6))
-                    }
-                    else -> throw IOException("未知原始记录类型")
+        try {
+            DataInputStream(BufferedInputStream(FileInputStream(file), BUFFER_SIZE)).use { stream ->
+                val raw = ByteArray(64)
+                stream.readFully(raw)
+                require(raw.copyOfRange(0, 8).contentEquals(byteArrayOf(82, 70, 86, 50, 82, 65, 87, 0))) {
+                    "原始容器头无效"
                 }
-                parsedRecords++
+                val header = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+                require(header.getShort(8).toInt() == 2 && header.getShort(10).toInt() == 64 &&
+                    (header.getShort(12).toInt() and 0xffff) == deviceSessionId &&
+                    header.getLong(32) == startedAtMs && header.getLong(40) == endedAtMs) {
+                    "原始容器与采集段不一致"
+                }
+                val payloadBytes = header.getLong(48)
+                val crc = header.getInt(56).toLong() and 0xffff_ffffL
+                require(payloadBytes > 0 && payloadBytes == file.length() - 64) { "原始容器长度不完整" }
+                val expectedRecords = header.getInt(16).toLong() and 0xffff_ffffL
+                val actual = CRC32()
+                val packets = DataInputStream(CheckedInputStream(stream, actual))
+                var parsedRecords = 0L
+                while (true) {
+                    val command = packets.read()
+                    if (command < 0) break
+                    require(command == 0x32) { "原始记录头无效" }
+                    when (packets.readUnsignedByte()) {
+                        0x10 -> packets.readFully(ByteArray(15))
+                        0x11 -> {
+                            packets.readInt() // sequence, mode and reserved bytes remain unmodified
+                            val count = packets.readUnsignedByte()
+                            val mask = packets.readUnsignedByte()
+                            packets.readInt() // original uptime
+                            require(count > 0 && mask in 1..7) { "PPG 原始记录无效" }
+                            packets.readFully(ByteArray(count * Integer.bitCount(mask) * 4))
+                        }
+                        0x12 -> {
+                            val count = packets.readUnsignedByte()
+                            packets.readInt() // original uptime
+                            require(count > 0) { "IMU 原始记录无效" }
+                            packets.readFully(ByteArray(count * 6))
+                        }
+                        else -> throw SessionSourceIntegrityException("未知原始记录类型")
+                    }
+                    parsedRecords++
+                }
+                require(parsedRecords > 0 && parsedRecords == expectedRecords) { "原始容器记录数不一致" }
+                require(actual.value == crc) { "原始容器 CRC 校验失败" }
+                return RawHeader(payloadBytes, crc, parsedRecords,
+                    header.getInt(20).toLong() and 0xffff_ffffL, header.getLong(24))
             }
-            require(parsedRecords > 0 && parsedRecords == expectedRecords) { "原始容器记录数不一致" }
-            require(actual.value == crc) { "原始容器 CRC 校验失败" }
-            return RawHeader(payloadBytes, crc, parsedRecords,
-                header.getInt(20).toLong() and 0xffff_ffffL, header.getLong(24))
+        } catch (error: EOFException) {
+            throw SessionSourceIntegrityException("原始容器长度不完整", error)
         }
     }
 
     private fun verifySource(file: File, entry: JsonObject) {
-        require(file.isFile && file.length() == entry.get("bytes").asLong &&
-            digest(file) == entry.get("sha256").asString && !entry.get("simulated").asBoolean) { "原始文件校验失败" }
+        if (!(file.isFile && file.length() == entry.get("bytes").asLong &&
+                digest(file) == entry.get("sha256").asString && !entry.get("simulated").asBoolean)) {
+            throw SessionSourceIntegrityException("原始文件校验失败")
+        }
     }
 
     private fun ensureDirectory(target: File, parent: File) {
@@ -340,8 +360,14 @@ class FreeLivingSessionPackage internal constructor(
     }
 
     private fun readJson(file: File): JsonObject {
-        require(file.isFile && file.length() in 1..MAX_METADATA_BYTES) { "冻结上传包信息缺失" }
-        return JsonParser.parseString(file.readText(Charsets.UTF_8)).asJsonObject
+        if (!(file.isFile && file.length() in 1..MAX_METADATA_BYTES)) {
+            throw SessionSourceIntegrityException("冻结上传包信息缺失")
+        }
+        return try {
+            JsonParser.parseString(file.readText(Charsets.UTF_8)).asJsonObject
+        } catch (error: RuntimeException) {
+            throw SessionSourceIntegrityException("冻结上传包信息无法解析", error)
+        }
     }
 
     private fun writeSynced(file: File, bytes: ByteArray) = FileOutputStream(file).use {

@@ -589,7 +589,8 @@ class DemoFlowController(
                     it.completionPolicy == CompletionPolicy.SAVE_LATER &&
                     it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
                     it.sessionId !in transferring,
-                referenceReason = it.reference?.reason, ringDeferred = it.isRingDeferred) }, fault = fault)
+                referenceReason = it.reference?.reason, ringDeferred = it.isRingDeferred,
+                phoneStartAtMs = it.phoneStartAnchorMs()) }, fault = fault)
         broadcast()
     }
 

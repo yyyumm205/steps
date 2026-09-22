@@ -22,13 +22,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** One persisted network job drains real sessions; BLE ownership remains in the collection service. */
 object RealUploadScheduler {
-    private const val JOB_ID = 741_025
+    internal const val JOB_ID = 741_025
     private val main = Handler(Looper.getMainLooper())
     private val observers = CopyOnWriteArrayList<() -> Unit>()
     private val inFlight = UploadFlightOwners()
     private val coordination = UploadJobCoordination()
     private val enqueueWorker by lazy { Executors.newSingleThreadExecutor() }
     private val restoring = AtomicBoolean(false)
+    private val schedulingFailed = AtomicBoolean(false)
 
     /** Upload recovery is independent of preparation permissions and BLE service ownership. */
     fun restore(context: Context) {
@@ -87,12 +88,40 @@ object RealUploadScheduler {
                     check(scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS) { "上传排队失败，请重试" }
                     coordination.scheduled()
                 }
-            }.onFailure { Log.e("RingFitnessUpload", "Persisted upload task could not be scheduled", it) }
+            }.onSuccess { schedulingFailed.set(false) }
+                .onFailure {
+                    schedulingFailed.set(true)
+                    Log.e("RingFitnessUpload", "Persisted upload task could not be scheduled", it)
+                }
             notifyChanged()
         }
     }
 
     fun isInFlight(sessionId: String): Boolean = inFlight.isInFlight(sessionId)
+    /** True when durable immediate-upload work exists but Android owns no job that can run it. */
+    fun canRetryUpload(context: Context, sessionId: String): Boolean {
+        if (inFlight.isInFlight(sessionId)) return false
+        val taskResult = runCatching { queue(context).task(sessionId) }
+        if (taskResult.isFailure) return false
+        val task = taskResult.getOrNull()
+        if (task == null) {
+            val directory = File(context.filesDir, "collection-real")
+            return runCatching { FreeLivingSessionStore(File(directory, "session.json")).read(sessionId) }
+                .getOrNull()?.let { session ->
+                    session.uploadAllowed && session.localData != null &&
+                        session.transfer.status == SessionTransferStatus.PENDING
+                } == true
+        }
+        if (task.receipt != null || task.receivedAtMs != null ||
+            task.failureStage in setOf("outcome", "destination") || task.payloadStarted == true) return false
+        val safelyReplayable = task.state == "queued" ||
+            (task.version == 3 && task.state == "sending" && task.payloadStarted == false)
+        if (!safelyReplayable) return false
+        if (schedulingFailed.get()) return true
+        return runCatching {
+            context.getSystemService(JobScheduler::class.java).getPendingJob(JOB_ID) == null
+        }.getOrDefault(true)
+    }
     fun observe(listener: () -> Unit): AutoCloseable {
         observers += listener
         return AutoCloseable { observers -= listener }
@@ -101,7 +130,10 @@ object RealUploadScheduler {
         val directory = File(context.filesDir, "collection-real")
         return RealUploadQueue(directory, FreeLivingSessionStore(File(directory, "session.json")), changed = ::notifyChanged)
     }
-    internal fun started(owner: Any) { coordination.started(owner) }
+    internal fun started(owner: Any) {
+        schedulingFailed.set(false)
+        coordination.started(owner)
+    }
     internal fun finished(owner: Any, retry: Boolean): Boolean? = coordination.finished(owner, retry)
     internal fun stopped(owner: Any) { coordination.stopped(owner) }
     internal fun uploading(sessionId: String, owner: Any, active: Boolean) {
