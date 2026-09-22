@@ -58,6 +58,22 @@ class RealCollectionControllerTest {
         }
     }
 
+    @Test fun unassignedIdleRecordIsIgnoredForFreshParticipantFlow() {
+        Fixture(preserveUnassignedExisting = false).use { f ->
+            f.owner.initialize(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertTrue("A fresh participant must reach the activity chooser", f.owner.state.canStart)
+            assertFalse(f.owner.state.preservingExisting)
+            assertTrue(f.port.reads.isEmpty())
+            f.startSelected()
+            f.observe(stopped(), listOf(finalRecord))
+            val newRecord = initialRecord.copy(sessionId = 8, uptimeMs = 2_000, unixMs = epoch + 60_000)
+            f.observe(collecting().copy(sessionId = 8), listOf(finalRecord, newRecord))
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertEquals(1, f.port.count("start"))
+        }
+    }
+
     @Test fun zeroClockOriginalIsFullyRereadOnEachConnectionAndCanStartAfterClockSync() = Fixture(syncClock = true).use { f ->
         val old = finalRecord.copy(unixMs = 0)
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
@@ -2610,6 +2626,7 @@ class RealCollectionControllerTest {
 
     private inner class Fixture(private val uploads: RealUploadPort? = null,
         private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false,
+        private val preserveUnassignedExisting: Boolean = true,
         profileLabel: String = "owner001",
         identityType: PreparationIdentityType = PreparationIdentityType.RESEARCH_ID) : AutoCloseable {
         val directory = temporary.newFolder()
@@ -2648,7 +2665,8 @@ class RealCollectionControllerTest {
                         throw IOException("注入已保存后的清理同步失败")
                     }
                 }) }, uploads = uploads,
-            backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}), syncClockBeforeStart = syncClock,
+            backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}),
+            preserveUnassignedExisting = preserveUnassignedExisting, syncClockBeforeStart = syncClock,
             saveClockEvidence = { evidence, sessionId ->
                 if (failClockEvidence) throw IOException("校时证据保存失败")
                 clockEvidence += evidence to sessionId

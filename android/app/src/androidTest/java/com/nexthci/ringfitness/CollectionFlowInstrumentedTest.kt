@@ -663,7 +663,7 @@ class CollectionFlowInstrumentedTest {
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertEquals("步数采集", tagged<TextView>(activity, "flow_heading").text.toString())
-                assertEquals("正在保存已有数据", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertEquals("请稍候", tagged<TextView>(activity, "home_task_status").text.toString())
                 assertNull(taggedOrNull<Button>(activity, "flow_primary"))
                 assertNull(taggedOrNull<Button>(activity, "home_task_action"))
             }
@@ -692,7 +692,7 @@ class CollectionFlowInstrumentedTest {
             var savingView: View? = null
             scenario.onActivity { activity ->
                 savingView = tagged<TextView>(activity, "home_task_status")
-                assertEquals("正在保存已有数据", tagged<TextView>(activity, "home_device_status").text.toString())
+                    assertEquals("正在准备", tagged<TextView>(activity, "home_device_status").text.toString())
             }
             repeat(8) {
                 fixture.state = saving.copy()

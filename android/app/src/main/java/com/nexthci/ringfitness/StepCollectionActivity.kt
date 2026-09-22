@@ -499,7 +499,7 @@ abstract class StepCollectionActivity : Activity() {
             if (state.preservingExisting || state.taskPage == CollectionPage.DOWNLOADING)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
             else HomeTask("数据待保存", "戒指已停止", "继续保存", displayError(state.error))
-        state.preservingExisting -> HomeTask("准备戒指", "正在保存已有数据", "保存中…", "保存完成后即可开始。")
+        state.preservingExisting -> HomeTask("正在准备戒指", "请稍候", "保存中…", "完成后即可选择走路或跑步。")
         state.checkingDevice -> HomeTask("设备", "正在检查戒指", "检查中…")
         state.canStopUnconfirmedStart -> HomeTask("当前记录", "需要结束戒指记录", "结束并保存可用数据", "数据会保留在手机。")
         state.canStart -> HomeTask("开始这一段", "可以开始", "开始采集", "佩戴好设备，站定后将计步器清零。")
@@ -915,7 +915,7 @@ abstract class StepCollectionActivity : Activity() {
     private fun connectionLabel(state: CollectionFlowState): String = when {
         state.connecting -> "正在连接"
         !state.connected -> "未连接"
-        state.preservingExisting -> "正在保存已有数据"
+        state.preservingExisting -> "正在准备"
         state.checkingDevice -> "正在检查"
         state.session?.isPending == true -> "已连接"
         state.canStart -> "可以开始"

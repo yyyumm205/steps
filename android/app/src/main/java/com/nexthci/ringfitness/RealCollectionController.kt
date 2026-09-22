@@ -43,6 +43,12 @@ class RealCollectionController(
     },
     private val uploads: RealUploadPort? = null,
     private val backups: DeviceRecordBackupStore = DeviceRecordBackupStore(File(directory, "device-backups")),
+    /**
+     * Historical unassigned ring records belong to an earlier phone/user and are not part of
+     * the current participant flow. Keep the preservation path available for explicit recovery
+     * tests and an already-owned session, but do not make a fresh participant wait for it.
+     */
+    private val preserveUnassignedExisting: Boolean = false,
     private val syncClockBeforeStart: Boolean = false,
     private val saveClockEvidence: (PhoneClockSyncEvidence, String?) -> Unit = { evidence, sessionId ->
         PhoneClockSync.save(directory, evidence, sessionId)
@@ -1013,7 +1019,7 @@ class RealCollectionController(
             val canBackUpBeforeStart = !hasUnresolvedDiscard &&
                 observed.records.count { it.unixMs == 0L } <= 1 &&
                 observed.records.all { it.uptimeMs > 0 && it.bytes > 0 && it.records > 0 }
-            if (canBackUpBeforeStart && observed.records.isNotEmpty() &&
+            if (preserveUnassignedExisting && canBackUpBeforeStart && observed.records.isNotEmpty() &&
                 !hasPreserved(observed.address, observed.records)) {
                 val approved = authorizedExisting()
                 if (approved?.ringAddress != observed.address || approved.status != observed.status ||

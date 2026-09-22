@@ -1079,3 +1079,18 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 当前未验证范围：华为／小米具体型号、三星真实设备复测、戒指真实BLE下载与重连、锁屏／进程／整机重启、网络变化下的后台上传、接近10小时采集，以及云盘端新包自动读回。以上项目不能由模拟器或合成设备证据替代。
 
 正式签名包：`android/dist/0.8.11-compat-recovery/RingFitness-Steps-0.8.11-compat-recovery.apk`；SHA-256：`2f9a9d00151bb72649b6677ab2c29e1b471c6e76be0c4ad0352eef113ae34bc6`。模拟器从0.8.10原位升级后，版本53、正式入口、无演示入口及私有文件保持检查通过；崩溃缓冲区为空。
+
+## E39：忽略无归属历史记录，直接进入当前采集（2026-09-22）
+
+本轮根据项目负责人确认收敛首次连接流程：戒指中无法归属于当前手机用户的历史 Flash 记录不再触发自动下载或“正在保存已有数据”门禁。正式服务显式关闭 `preserveUnassignedExisting`；当前手机已有未完成 session、停止后的本段文件和参考步数继续由本地账本恢复。该选择意味着无归属历史数据不纳入当前用户，也不保证其在戒指端后续仍可恢复。
+
+| 验证项 | 结果 | 证据与边界 |
+| --- | --- | --- |
+| 新用户连接旧戒指 | 新增 JVM 回归 `unassignedIdleRecordIsIgnoredForFreshParticipantFlow`：戒指返回已有记录时不发送 READ，不进入 preservingExisting，直接开放活动选择；开始后仍只建立新的 session | 已通过；替身验证状态机和 START 次数。真实戒指上的旧记录覆盖行为、固件存储容量和新记录边界仍需真机短采确认 |
+| 正式界面 | preservingExisting 的兼容恢复文案改为“正在准备／请稍候”，完成后提示选择走路或跑步；正式入口不再触发该状态 | `CollectionFlowInstrumentedTest` 相关渲染断言已更新；没有可执行动作时不显示假按钮 |
+| 数据隔离 | 新 session 仍保存当前用户名、活动、佩戴位置、参考步数和原始文件；手机中已有 session 继续恢复，历史戒指记录不生成当前用户备份或上传包 | Controller、session store 与上传回归保持通过；未删除旧手机文件或历史冻结包 |
+| 构建与自动检查 | Android JVM 全量 649 项通过；新增旧记录忽略回归通过；AndroidTest 编译通过；工作区 `git diff --check` 通过 | 本轮尚未连接真实手机/戒指，华为/小米兼容、断连、锁屏后台、网络变化、整机重启和接近10小时采集仍待实测 |
+
+本轮新包构建完成后更新本节的版本号和 SHA-256；上一版 E38 包仍作为可回退基线保留。
+
+正式签名包：`android/dist/0.8.12-unassigned-history/RingFitness-Steps-0.8.12-unassigned-history.apk`；SHA-256：`654d6c85db7de1c8e37faae0b7166d3c166eaf49973888093e9f054f52a9635b`。签名校验通过；本包尚未连接真实手机或戒指。

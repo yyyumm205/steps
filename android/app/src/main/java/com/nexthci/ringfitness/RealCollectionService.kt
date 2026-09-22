@@ -117,6 +117,7 @@ class RealCollectionService : Service() {
                         if (BuildConfig.DEBUG && file.isFile) Gson().fromJson(file.readText(), ExistingRecordAuthorization::class.java)
                         else null
                     }, notifyObserver = { action -> main.post { if (!destroyed) action() } },
+                    preserveUnassignedExisting = false,
                     recordObservation = { observation ->
                         trace("observation generation=${observation.connectionGeneration} status=${observation.status} records=${observation.records}")
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
@@ -192,7 +193,7 @@ class RealCollectionService : Service() {
         val text = when {
             state.connecting -> "正在连接戒指"
             !state.connected && active -> "连接中断，正在保留本次记录"
-            state.preservingExisting -> "正在保存戒指中的已有数据"
+            state.preservingExisting -> "正在准备戒指"
             state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
             state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
             state.taskPage == CollectionPage.FINISH -> "采集已结束，请选择保存方式"
