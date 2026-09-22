@@ -72,6 +72,160 @@ class RealSessionDownloadTest {
         }
     }
 
+    @Test fun threeReadWindowsWithoutDataStopAndKeepTheEmptyCheckpoint() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { download ->
+            repeat(2) {
+                download.beginRead()
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(0, false)))
+            }
+            download.beginRead()
+            assertThrows(RealSessionDownload.DownloadNoProgressException::class.java) {
+                download.checkpoint(HealthMessage.ReadEnd(0, false))
+            }
+            assertEquals(0L, download.nextOffset)
+            assertTrue(part(directory).isFile)
+            assertFalse(final(directory).exists())
+        }
+        adapter(directory).use { assertEquals(0L, it.nextOffset) }
+    }
+
+    @Test fun duplicateOnlyWindowsStopAndResumeFromThePreservedPartial() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { it.append(HealthMessage.DataChunk(0, payload.copyOf(13))) }
+        adapter(directory).use { download ->
+            repeat(2) {
+                download.beginRead()
+                download.append(HealthMessage.DataChunk(0, payload.copyOf(13)))
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(13, false)))
+            }
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            assertThrows(RealSessionDownload.DownloadNoProgressException::class.java) {
+                download.checkpoint(HealthMessage.ReadEnd(13, false))
+            }
+            assertArrayEquals(payload.copyOf(13), part(directory).readBytes())
+            assertFalse(final(directory).exists())
+        }
+        adapter(directory).use { resumed ->
+            assertEquals(13L, resumed.nextOffset)
+            resumed.beginRead()
+            resumed.append(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+            assertEquals(2L, resumed.finish(end()).evidence.records)
+        }
+    }
+
+    @Test fun newBytesResetTheWindowBudgetWhileRepeatedBytesKeepCounting() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { download ->
+            repeat(2) {
+                download.beginRead()
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(0, false)))
+            }
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(12)))
+            assertFalse(download.checkpoint(HealthMessage.ReadEnd(12, false)))
+            repeat(2) {
+                download.beginRead()
+                download.append(HealthMessage.DataChunk(0, payload.copyOf(12)))
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(12, false)))
+            }
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(12)))
+            assertThrows(RealSessionDownload.DownloadNoProgressException::class.java) {
+                download.checkpoint(HealthMessage.ReadEnd(12, false))
+            }
+            assertArrayEquals(payload.copyOf(12), part(directory).readBytes())
+        }
+    }
+
+    @Test fun doneAtAnAlreadyDownloadedEndCanCompleteWithoutAnotherDataChunk() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { it.append(HealthMessage.DataChunk(0, payload)) }
+        adapter(directory).use { resumed ->
+            repeat(2) {
+                resumed.beginRead()
+                assertFalse(resumed.checkpoint(HealthMessage.ReadEnd(record.bytes, false)))
+            }
+            resumed.beginRead()
+            assertTrue(resumed.checkpoint(end()))
+            val completed = resumed.finish(end())
+            assertEquals(completed, resumed.finish(end()))
+            assertArrayEquals(payload, part(directory).readBytes())
+        }
+    }
+
+    @Test fun replayProgressResetsTheBudgetWhileTheDownloadedPrefixStaysFixed() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { it.append(HealthMessage.DataChunk(0, payload.copyOf(18))) }
+        adapter(directory).use { download ->
+            for (offset in listOf(0L, 6L, 12L)) {
+                repeat(2) {
+                    download.beginRead(offset)
+                    download.checkpointReplay(HealthMessage.ReadEnd(offset, false), offset)
+                }
+                download.beginRead(offset)
+                val endOffset = offset + 6
+                download.append(HealthMessage.DataChunk(offset, payload.copyOfRange(offset.toInt(), endOffset.toInt())))
+                download.checkpointReplay(HealthMessage.ReadEnd(endOffset, false), endOffset)
+                assertEquals(18L, download.nextOffset)
+            }
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(18, payload.copyOfRange(18, payload.size)))
+            assertEquals(2L, download.finish(end()).evidence.records)
+        }
+    }
+
+    @Test fun replayWithOnlyAlreadyVerifiedBytesStopsAndPreservesTheWholePartial() {
+        val directory = temporary.newFolder()
+        adapter(directory).use { it.append(HealthMessage.DataChunk(0, payload.copyOf(18))) }
+        adapter(directory).use { download ->
+            download.beginRead(0)
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(6)))
+            download.checkpointReplay(HealthMessage.ReadEnd(6, false), 6)
+            repeat(2) {
+                download.beginRead(6)
+                download.append(HealthMessage.DataChunk(0, payload.copyOf(6)))
+                download.checkpointReplay(HealthMessage.ReadEnd(6, false), 6)
+            }
+            download.beginRead(6)
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(6)))
+            assertThrows(RealSessionDownload.DownloadNoProgressException::class.java) {
+                download.checkpointReplay(HealthMessage.ReadEnd(6, false), 6)
+            }
+            assertEquals(18L, download.nextOffset)
+            assertArrayEquals(payload.copyOf(18), part(directory).readBytes())
+        }
+        adapter(directory).use { assertEquals(18L, it.nextOffset) }
+    }
+
+    @Test fun oldRecordBackupRetainsItsPartialAfterThreeEmptyWindows() {
+        val directory = File(temporary.newFolder(), "device-backups")
+        val backups = DeviceRecordBackupStore(directory) {}
+        backups.open(ring, record).use { download ->
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload.copyOf(13)))
+            assertFalse(download.checkpoint(HealthMessage.ReadEnd(13, false)))
+            repeat(2) {
+                download.beginRead()
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(13, false)))
+            }
+            download.beginRead()
+            assertThrows(RealSessionDownload.DownloadNoProgressException::class.java) {
+                download.checkpoint(HealthMessage.ReadEnd(13, false))
+            }
+        }
+        assertFalse(backups.isPreserved(ring, record))
+        backups.open(ring, record).use { resumed ->
+            assertEquals(13L, resumed.nextOffset)
+            resumed.beginRead()
+            resumed.append(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+            val completed = resumed.finish(end())
+            backups.accept(ring, record, completed, record.unixMs + 1000)
+        }
+        assertTrue(backups.isPreserved(ring, record))
+    }
+
     @Test fun matchingDuplicateChunkIsIdempotentButConflictingOverlapPreservesOriginal() {
         val directory = temporary.newFolder()
         adapter(directory).use { download ->
@@ -250,6 +404,28 @@ class RealSessionDownloadTest {
 
         assertFalse(prefixContainer.contentEquals(final(directory).readBytes()))
         assertFalse(directory.listFiles()!!.any { it.name.contains(".prefix-") })
+    }
+
+    @Test fun completedPrefixCanExtendAfterTemporaryEmptyReadsAndIgnoreItsDelayedEnd() {
+        val directory = temporary.newFolder()
+        val tail = imu(1, 1_120)
+        val grown = record.copy(bytes = payload.size + tail.size.toLong(), records = 3)
+        adapter(directory).use { download ->
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(0, payload))
+            download.finish(end())
+            download.close()
+            download.extendTo(grown)
+            assertTrue(download.isDelayedCompletedPrefix(end()))
+            repeat(2) {
+                download.beginRead()
+                assertFalse(download.checkpoint(HealthMessage.ReadEnd(record.bytes, false)))
+            }
+            download.beginRead()
+            download.append(HealthMessage.DataChunk(record.bytes, tail))
+            assertEquals(3L, download.finish(HealthMessage.ReadEnd(grown.bytes, true)).evidence.records)
+            assertArrayEquals(payload + tail, part(directory).readBytes())
+        }
     }
 
     @Test fun invalidSessionOrUnassociatedFilesCannotBeOverwritten() {

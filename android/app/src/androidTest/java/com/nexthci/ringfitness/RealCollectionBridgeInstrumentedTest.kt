@@ -90,6 +90,45 @@ class RealCollectionBridgeInstrumentedTest {
         assertFalse(RealCollectionBridge.isRunning())
     }
 
+    @Test fun permissionFailureBeforeNewOwnerDoesNotExposeThePreviousIdentity() = withIdleBridge {
+        val token = Any()
+        RealCollectionBridge.ensureStarted(FakeStartContext(), pageLease)
+        RealCollectionBridge.begin(token)
+        val previous = CollectionFlowState(isSimulation = false, hasProfile = true,
+            participantId = "alice01", participantLabel = "alice01", savedSteps = 73,
+            records = listOf(FlowRecordSummary("alice-history", 73, "valid", "uploaded", true)))
+        RealCollectionBridge.publish(token, previous)
+        RealCollectionBridge.detach(token)
+        RealCollectionBridge.fail("请允许蓝牙权限后继续")
+        val failure = RealCollectionBridge.state
+        assertEquals(CollectionPage.ERROR, failure.page)
+        assertEquals("请允许蓝牙权限后继续", failure.error)
+        assertEquals("", failure.participantId)
+        assertEquals("", failure.participantLabel)
+        assertTrue(failure.records.isEmpty())
+        assertNull(failure.savedSteps)
+        assertNull(failure.session)
+        assertTrue("The existing registration must not become an inert registration form", failure.hasProfile)
+        assertFalse(failure.busy)
+    }
+
+    @Test fun failureWhileAnOwnerIsActiveKeepsItsIdentityAndSavedRecords() = withIdleBridge {
+        val token = Any()
+        RealCollectionBridge.ensureStarted(FakeStartContext(), pageLease)
+        RealCollectionBridge.begin(token)
+        val active = CollectionFlowState(isSimulation = false, hasProfile = true,
+            participantId = "bob02", savedSteps = 0,
+            records = listOf(FlowRecordSummary("bob-history", 0, "valid", "queued", true)))
+        RealCollectionBridge.publish(token, active)
+        RealCollectionBridge.fail("请允许蓝牙权限后继续")
+        val failure = RealCollectionBridge.state
+        assertEquals(active.participantId, failure.participantId)
+        assertEquals(active.records, failure.records)
+        assertEquals(active.savedSteps, failure.savedSteps)
+        assertTrue(RealCollectionBridge.isRunning())
+        RealCollectionBridge.detach(token)
+    }
+
     @Test fun leavingDuringInitializationRequestsReleaseAndReopeningCancelsThatRequest() = withIdleBridge {
         val context = FakeStartContext()
         val token = Any()

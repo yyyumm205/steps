@@ -677,6 +677,69 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun backupProgressKeepsItsViewsAndPausedDownloadOffersAWorkingReconnect() = withFlow {
+        launch().use { scenario ->
+            val saving = CollectionFlowState(page = CollectionPage.HOME, taskPage = CollectionPage.HOME,
+                isSimulation = false, hasProfile = true, participantId = "p001",
+                placement = RingPlacement.RIGHT_INDEX, preservingExisting = true, connected = true, busy = true)
+            val fixture = RenderingFlow(saving)
+            renderFixture(scenario, fixture)
+            var savingView: View? = null
+            scenario.onActivity { activity ->
+                savingView = tagged<TextView>(activity, "home_task_status")
+                assertEquals("正在保存已有数据", tagged<TextView>(activity, "home_device_status").text.toString())
+            }
+            repeat(8) {
+                fixture.state = saving.copy()
+                renderFixture(scenario, fixture)
+                scenario.onActivity { activity ->
+                    assertSame("Unchanged download state must keep the existing view", savingView,
+                        tagged<TextView>(activity, "home_task_status"))
+                    assertNull(taggedOrNull<Button>(activity, "home_task_action"))
+                }
+            }
+            captureReviewScreen(scenario, "stable_existing_backup")
+            fixture.state = saving.copy(taskPage = CollectionPage.RECOVERY, preservingExisting = false,
+                connected = false, busy = false, canRetry = true,
+                error = RealSessionDownload.DownloadNoProgressException().message)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                val reconnect = tagged<Button>(activity, "home_reconnect")
+                assertEquals("重新连接", reconnect.text.toString())
+                assertTrue(reconnect.isEnabled)
+                assertTrue(visibleTexts(activity.window.decorView).contains(
+                    "接收暂时中断，已保存进度。请将戒指靠近手机后重新连接。"))
+                reconnect.performClick()
+            }
+            assertEquals(1, fixture.reconnects)
+            captureReviewScreen(scenario, "stalled_download_reconnect")
+        }
+    }
+
+    @Test fun permissionFailureWithoutOwnerHasWorkingToolbarAndSystemBack() = withFlow {
+        assumeTrue("A running real owner must be left untouched", !RealCollectionBridge.isRunning())
+        listOf(false, true).forEach { systemBack ->
+            val monitor = instrumentation.addMonitor(StepPreparationActivity::class.java.name, null, true)
+            try {
+                launch().use { scenario ->
+                    val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.ERROR,
+                        isSimulation = false, uploadAvailable = false, hasProfile = true,
+                        connected = false, error = "请允许蓝牙权限后继续"))
+                    renderFixture(scenario, fixture)
+                    scenario.onActivity { activity ->
+                        assertNull(taggedOrNull<View>(activity, "flow_participant"))
+                        assertNull(taggedOrNull<View>(activity, "open_records"))
+                        assertNotNull(taggedOrNull<Button>(activity, "recovery_settings"))
+                        if (systemBack) activity.onBackPressed()
+                        else tagged<Button>(activity, "flow_back").performClick()
+                        assertTrue(activity.isFinishing)
+                    }
+                    assertEquals("Return must reach user/device settings", 1, monitor.hits)
+                }
+            } finally { instrumentation.removeMonitor(monitor) }
+        }
+    }
+
     @Test fun endStartAttemptRequiresConfirmationAndWaitsForTheOwnerResult() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)

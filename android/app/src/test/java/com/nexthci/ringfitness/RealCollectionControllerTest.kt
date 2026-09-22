@@ -566,6 +566,107 @@ class RealCollectionControllerTest {
         assertEquals(0, f.port.count("start"))
     }
 
+    @Test fun existingRecordWindowsKeepOneStableSavingState() = Fixture().use { f ->
+        val bytes = ByteArrayOutputStream().apply {
+            repeat(1_400) { write(imu(3, 1_000L + it * 60)) }
+        }.toByteArray()
+        val record = finalRecord.copy(bytes = bytes.size.toLong(), records = 1_400)
+        val status = stopped().copy(bytes = record.bytes, records = record.records)
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(status, listOf(record))
+        val savingState = f.owner.state
+        assertTrue(savingState.preservingExisting)
+        assertFalse(savingState.checkingDevice)
+        assertTrue(savingState.busy)
+        val observedStates = mutableListOf<CollectionFlowState>()
+        f.owner.observe { observedStates += it }.use {
+            repeat(2) { window ->
+                val start = window * 16_384
+                val end = start + 16_384
+                f.health(HealthMessage.DataChunk(start.toLong(), bytes.copyOfRange(start, end)))
+                f.health(HealthMessage.ReadEnd(end.toLong(), false))
+                assertEquals(savingState, f.owner.state)
+                f.observe(status, listOf(record))
+                assertEquals(savingState, f.owner.state)
+                assertEquals(end.toLong(), f.port.reads.last().offset)
+            }
+        }
+        assertTrue(observedStates.isNotEmpty())
+        assertTrue(observedStates.all { it == savingState })
+        assertNull(f.store.read())
+    }
+
+    @Test fun stalledBackupStopsAfterThreeEmptyWindowsAndRetriesFromItsSavedPrefix() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        f.observe(stopped(), listOf(finalRecord))
+        val retired = f.port.generation
+        repeat(3) { attempt ->
+            f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+            if (attempt < 2) f.observe(stopped(), listOf(finalRecord))
+        }
+        assertEquals(4, f.port.reads.size)
+        assertFalse(f.owner.state.busy)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.preservingExisting)
+        assertFalse(f.owner.state.connected)
+        val part = File(f.directory, "device-backups").walkTopDown().single { it.extension == "part" }
+        assertArrayEquals(firstPacket, part.readBytes())
+        assertNull(f.store.read())
+        f.owner.onDisconnected(retired, "迟到的断开通知")
+        repeat(6) { f.owner.onHealth(retired, SensorPacket.Health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false), ++f.clock.now)) }
+        f.runAllDelays(30_000)
+        assertEquals(4, f.port.reads.size)
+        assertEquals(0, f.waitCount(3_000))
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(firstPacket.size.toLong(), f.port.reads.last().offset)
+        f.health(HealthMessage.DataChunk(firstPacket.size.toLong(), payload.copyOfRange(firstPacket.size, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        assertTrue(f.store.hasPreservedDeviceRecords(ring.address, listOf(finalRecord)))
+        assertEquals(0, f.port.count("start"))
+    }
+
+    @Test fun stalledSessionDownloadKeepsReferenceAndPausesUntilManualRetry() = Fixture().use { f ->
+        f.reachReference(); f.saveReference("0", "valid", "")
+        f.observe(stopped(), listOf(finalRecord))
+        val saved = f.store.readPending()!!
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false))
+        repeat(3) { f.health(HealthMessage.ReadEnd(firstPacket.size.toLong(), false)) }
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertEquals(saved.sessionId, f.store.readPending()!!.sessionId)
+        assertEquals(saved.reference, f.store.readPending()!!.reference)
+        assertNull(f.store.readPending()!!.localData)
+        assertArrayEquals(firstPacket, f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(firstPacket.size.toLong(), f.port.reads.last().offset)
+        f.health(HealthMessage.DataChunk(firstPacket.size.toLong(), payload.copyOfRange(firstPacket.size, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(finalRecord))
+        assertNotNull(f.store.read()!!.localData)
+        assertEquals(0L, f.store.read()!!.reference!!.steps)
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun duplicateBackupChunksDoNotPostponeTheNoDataTimeout() = Fixture().use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        f.health(HealthMessage.DataChunk(0, firstPacket))
+        val timers = f.waitCount(30_000)
+        repeat(20) { f.health(HealthMessage.DataChunk(0, firstPacket)) }
+        assertEquals(timers, f.waitCount(30_000))
+        f.runAllDelays(30_000)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.preservingExisting)
+        assertArrayEquals(firstPacket, File(f.directory, "device-backups").walkTopDown().single { it.extension == "part" }.readBytes())
+    }
+
     @Test fun changedRecordDuringBackupCannotBeMixedIntoAnotherWindow() = Fixture().use { f ->
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
         f.observe(stopped(), listOf(finalRecord))
@@ -1315,6 +1416,59 @@ class RealCollectionControllerTest {
         f.observe(stopped(), listOf(finalRecord.copy(unixMs = 0)))
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(73L, f.store.read()!!.reference!!.steps)
+    }
+
+    @Test fun stalledReplayStopsAfterThreeWindowsAndRechecksTheSavedPrefixOnManualRetry() = Fixture().use { f ->
+        val record = finalRecord.copy(unixMs = 0)
+        val prefix = payload.copyOf(13)
+        f.reachReference(unixMs = 0); f.saveReference("73", "valid", "")
+        val startClock = f.seedRecoveryClock()
+        f.observe(stopped(), listOf(record))
+        f.health(HealthMessage.DataChunk(0, prefix))
+        val saved = f.store.readPending()!!
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(record))
+        f.recoveryTimeReply(startClock)
+        f.observe(stopped(), listOf(record))
+        assertEquals(Read(7, 0, 13), f.port.reads.last())
+        val readsBeforeStall = f.port.reads.size
+        val retired = f.port.generation
+        repeat(3) { f.health(HealthMessage.ReadEnd(0, false)) }
+        assertEquals(readsBeforeStall + 2, f.port.reads.size)
+        assertEquals(CollectionPage.RECOVERY, f.owner.state.page)
+        assertTrue(f.owner.state.canRetry)
+        assertFalse(f.owner.state.busy)
+        assertFalse(f.owner.state.connected)
+        assertEquals(saved.sessionId, f.store.readPending()!!.sessionId)
+        assertEquals(saved.reference, f.store.readPending()!!.reference)
+        assertNull(f.store.readPending()!!.localData)
+        assertArrayEquals(prefix, f.directory.listFiles()!!.single { it.extension == "part" }.readBytes())
+        val connectionsAfterStall = f.port.count("connect")
+        val pausedState = f.owner.state
+        f.owner.onDisconnected(retired, "迟到的断开通知")
+        f.owner.onHealth(retired, SensorPacket.Health(HealthMessage.ReadEnd(0, false), ++f.clock.now))
+        f.runAllDelays(30_000)
+        // The completed recovery clock query also leaves a retired three-second timer.
+        f.runAllDelays(3_000)
+        assertEquals(readsBeforeStall + 2, f.port.reads.size)
+        assertEquals(connectionsAfterStall, f.port.count("connect"))
+        assertEquals(pausedState, f.owner.state)
+
+        f.owner.retry(); f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(record))
+        f.recoveryTimeReply(startClock)
+        f.observe(stopped(), listOf(record))
+        assertEquals(Read(7, 0, 13), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(0, prefix))
+        f.health(HealthMessage.ReadEnd(13, false))
+        assertEquals(Read(7, 13, 16_384), f.port.reads.last())
+        f.health(HealthMessage.DataChunk(13, payload.copyOfRange(13, payload.size)))
+        f.health(HealthMessage.ReadEnd(payload.size.toLong(), true))
+        f.observe(stopped(), listOf(record))
+        assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
+        assertEquals(saved.sessionId, f.store.read()!!.sessionId)
+        assertEquals(saved.reference, f.store.read()!!.reference)
+        assertEquals(1, f.port.count("start"))
     }
 
     @Test fun unknownClockChangedPrefixCannotBeMergedOrOverwriteSavedBytes() = Fixture().use { f ->

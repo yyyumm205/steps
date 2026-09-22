@@ -53,6 +53,10 @@ class RealSessionDownload internal constructor(
     data class Completed(val file: SessionRawFile, val evidence: HealthPayloadEvidence,
         val evidenceFileName: String)
 
+    class DownloadNoProgressException : IOException(
+        "下载连续 $MAX_NO_PROGRESS_WINDOWS 轮没有进展，已保存的部分会保留，请重新连接后重试",
+    )
+
     private val directory = directory.canonicalFile
     private var record = record
     private val prefix = "$sessionId-ring-${record.sessionId}"
@@ -76,6 +80,8 @@ class RealSessionDownload internal constructor(
     private var completed: Completed? = null
     private val completedPrefixOffsets = mutableSetOf<Long>()
     private val prefixDigest = MessageDigest.getInstance("SHA-256")
+    private var readWindowStart = 0L
+    private var consecutiveEmptyWindows = 0
     var nextOffset: Long = 0L
         private set
 
@@ -117,6 +123,14 @@ class RealSessionDownload internal constructor(
             output = null
             throw error
         }
+        readWindowStart = nextOffset
+    }
+
+    /** The owner records each READ's cursor, including a replay cursor within the saved prefix. */
+    fun beginRead(offset: Long = nextOffset) {
+        check(completed == null && output != null) { "下载已关闭或完成" }
+        require(offset in 0..nextOffset) { "下载起始位置超出已保存片段" }
+        readWindowStart = offset
     }
 
     /** Duplicate bytes may be replayed; a gap, changed overlap or bytes past LIST is rejected. */
@@ -145,7 +159,24 @@ class RealSessionDownload internal constructor(
         require(end.nextOffset == nextOffset) { "下载结束位置与已保存片段不一致" }
         require(!end.done || nextOffset == record.bytes) { "戒指提前结束下载，原始片段已保留" }
         persistCheckpoint()
+        checkReadProgress(nextOffset, end.done)
         return end.done
+    }
+
+    /** Replay advances a verified cursor while the saved payload's nextOffset stays unchanged. */
+    fun checkpointReplay(end: HealthMessage.ReadEnd, replayOffset: Long) {
+        require(replayOffset in readWindowStart..nextOffset && end.nextOffset == replayOffset &&
+            (!end.done || replayOffset == nextOffset)) {
+            "重连后的下载位置不一致，已保留原始数据"
+        }
+        checkReadProgress(replayOffset, end.done)
+    }
+
+    private fun checkReadProgress(offset: Long, done: Boolean) {
+        if (offset > readWindowStart) consecutiveEmptyWindows = 0
+        else if (!done) consecutiveEmptyWindows++
+        readWindowStart = offset
+        if (!done && consecutiveEmptyWindows >= MAX_NO_PROGRESS_WINDOWS) throw DownloadNoProgressException()
     }
 
     fun finish(end: HealthMessage.ReadEnd): Completed {
@@ -308,6 +339,8 @@ class RealSessionDownload internal constructor(
     }
 
     companion object {
+        private const val MAX_NO_PROGRESS_WINDOWS = 3
+
         /** Remove only restart leftovers belonging to a durably completed real session. */
         internal fun cleanupCommittedTemporary(
             directory: File,

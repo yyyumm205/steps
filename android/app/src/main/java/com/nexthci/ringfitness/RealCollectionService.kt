@@ -389,8 +389,17 @@ object RealCollectionBridge : CollectionFlow {
         state = next
         observers.forEach { it(next) }
     }
-    internal fun fail(message: String) = publish(state.copy(page = CollectionPage.ERROR, busy = false,
-        connecting = false, connected = false, canStart = false, canStop = false, canRetry = false, canEndStartAttempt = false, error = message))
+    internal fun fail(message: String) {
+        // After an idle identity change, the retired owner's view is no longer authoritative.
+        // Permission/start failures can happen before a new controller loads the current profile.
+        val current = synchronized(ownershipLock) {
+            if (owner == null) CollectionFlowState(isSimulation = false, uploadAvailable = false, hasProfile = true)
+            else state
+        }
+        publish(current.copy(page = CollectionPage.ERROR, busy = false,
+            connecting = false, connected = false, canStart = false, canStop = false, canRetry = false,
+            canStopUnconfirmedStart = false, canEndStartAttempt = false, error = message))
+    }
     override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
         observers += observer
         main.post { if (observer in observers) observer(state) }

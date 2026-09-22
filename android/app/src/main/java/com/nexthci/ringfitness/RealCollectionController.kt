@@ -300,7 +300,11 @@ class RealCollectionController(
         val backup = backupDownloader
         if (backup != null && query == null) {
             when (val message = packet.message) {
-                is HealthMessage.DataChunk -> { backup.append(message); scheduleBackupTimeout() }
+                is HealthMessage.DataChunk -> {
+                    val before = backup.nextOffset
+                    backup.append(message)
+                    if (backup.nextOffset > before) scheduleBackupTimeout()
+                }
                 is HealthMessage.ReadEnd -> {
                     if (backup.checkpoint(message)) {
                         val completed = backup.finish(message)
@@ -339,6 +343,7 @@ class RealCollectionController(
         if (download != null) {
             when (val message = packet.message) {
                 is HealthMessage.DataChunk -> {
+                    val before = replayDownloadOffset ?: download.nextOffset
                     replayDownloadOffset?.let { offset ->
                         require(message.offset in 0..offset && message.payload.size.toLong() <= download.nextOffset - message.offset) {
                             "重连后的片段不一致，已保留原始数据"
@@ -346,13 +351,14 @@ class RealCollectionController(
                         download.append(message) // Compare the entire durable prefix before appending a new tail.
                         replayDownloadOffset = maxOf(offset, message.offset + message.payload.size)
                     } ?: download.append(message)
-                    scheduleDownloadTimeout()
+                    if ((replayDownloadOffset ?: download.nextOffset) > before) scheduleDownloadTimeout()
                 }
                 is HealthMessage.ReadEnd -> {
                     replayDownloadOffset?.let { offset ->
                         require(message.nextOffset == offset && (!message.done || offset == download.nextOffset)) {
                             "重连后的下载位置不一致，已保留原始数据"
                         }
+                        download.checkpointReplay(message, offset)
                         if (offset < download.nextOffset) {
                             requestWindow(download)
                             return@safely
@@ -364,7 +370,6 @@ class RealCollectionController(
                         }
                     }
                     if (download.isDelayedCompletedPrefix(message)) {
-                        scheduleDownloadTimeout()
                         return@safely
                     }
                     if (download.checkpoint(message)) {
@@ -1018,7 +1023,9 @@ class RealCollectionController(
         browsingHome = onlyRecord == null
         taskPage = null; taskError = null
         publish(if (onlyRecord == null) CollectionPage.HOME else CollectionPage.DOWNLOADING)
-        check(port.read(requireNotNull(backupRecord).sessionId, requireNotNull(backupDownloader).nextOffset, 16_384)) {
+        val download = requireNotNull(backupDownloader)
+        download.beginRead()
+        check(port.read(requireNotNull(backupRecord).sessionId, download.nextOffset, 16_384)) {
             "保存中断，请重新连接戒指后继续"
         }
         scheduleBackupTimeout()
@@ -1304,6 +1311,7 @@ class RealCollectionController(
         val replay = replayDownloadOffset
         val offset = replay ?: download.nextOffset
         val length = if (replay != null) minOf(8192L, download.nextOffset - replay).toInt() else 16_384
+        download.beginRead(offset)
         check(port.read(id, offset, length)) { "下载连接中断，请重试" }
         scheduleDownloadTimeout()
     }
@@ -1370,12 +1378,19 @@ class RealCollectionController(
     private fun publish(page: CollectionPage, error: String? = null) {
         val current = visibleCurrentSession()
         val pending = current?.takeIf { it.isPending }
-        val task = if (page == CollectionPage.RECOVERY) pendingReferencePage() ?: page else page
+        // STATUS/LIST checks between READ windows are part of the same visible save operation.
+        val task = when {
+            backupObservation != null && error == null ->
+                if (pending == null) CollectionPage.HOME else CollectionPage.DOWNLOADING
+            page == CollectionPage.RECOVERY -> pendingReferencePage() ?: page
+            else -> page
+        }
         if (task != CollectionPage.HOME) { taskPage = task; taskError = error }
         val visible = if (browsingHome) CollectionPage.HOME else task
         val localReference = pending?.stopConfirmedAtMs != null && pending.reference == null && pending.startAbort == null
         val idle = lastIdle
-        val checkingDevice = pending == null && connected && (query != null || readinessWait != null || timeRound != null)
+        val checkingDevice = pending == null && backupObservation == null && connected &&
+            (query != null || readinessWait != null || timeRound != null)
         val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null
         val visibleProfile = pending?.preparation ?: profile
         val participantLabel = localProfile?.takeIf {
@@ -1425,9 +1440,18 @@ class RealCollectionController(
             reportError(error)
             runCatching { closeDownload() }
             query = null; readinessWait = null; lastIdle = null; connecting = false
+            val noProgress = error is RealSessionDownload.DownloadNoProgressException
+            if (noProgress) {
+                // Pause until an explicit retry. Retire late replies and reconnect timers as well.
+                val previousGeneration = generation++
+                connected = false
+                reconnectScheduledGeneration = null
+                runCatching { coordinator.onDisconnected(previousGeneration) }
+                runCatching { port.disconnect() }
+            }
             val message = error.message?.takeIf { it.length < 70 && it.any { c -> c.code > 127 } }
                 ?: "暂时无法完成，本次记录已保留"
-            try { publish(failurePage, message) } catch (_: Exception) {
+            try { publish(if (noProgress) CollectionPage.RECOVERY else failurePage, message) } catch (_: Exception) {
                 state = state.copy(page = CollectionPage.ERROR, busy = false, canStart = false, canStop = false,
                     connecting = false, error = "记录读取失败，请检查身份与戒指设置", canRetry = false, canEndStartAttempt = false)
                 observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }

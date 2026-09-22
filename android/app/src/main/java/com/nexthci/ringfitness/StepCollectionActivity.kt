@@ -104,6 +104,9 @@ abstract class StepCollectionActivity : Activity() {
                 showingRecords = false
                 redraw()
             }
+            state?.isSimulation == false && state.session == null &&
+                state.page in setOf(CollectionPage.RECOVERY, CollectionPage.ERROR) &&
+                !RealCollectionBridge.isRunning() -> openPreparationSettings()
             state?.let(::usesHomeSurface) == true -> finish()
             else -> flow.home()
         }
@@ -490,7 +493,8 @@ abstract class StepCollectionActivity : Activity() {
             HomeTask("采集已结束", "待保存本段", "继续收尾")
         else HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
         state.connecting -> HomeTask("设备", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
-        !state.connected -> HomeTask("设备", "戒指未连接", "重新连接", "将戒指靠近手机后重试。")
+        !state.connected -> HomeTask("设备", "戒指未连接", "重新连接",
+            displayError(state.error) ?: "将戒指靠近手机后重试。")
         state.session?.startAbort?.stoppedObservation != null && state.session.isPending ->
             if (state.preservingExisting || state.taskPage == CollectionPage.DOWNLOADING)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
@@ -911,8 +915,8 @@ abstract class StepCollectionActivity : Activity() {
     private fun connectionLabel(state: CollectionFlowState): String = when {
         state.connecting -> "正在连接"
         !state.connected -> "未连接"
+        state.preservingExisting -> "正在保存已有数据"
         state.checkingDevice -> "正在检查"
-        state.preservingExisting -> "正在保存戒指数据"
         state.session?.isPending == true -> "已连接"
         state.canStart -> "可以开始"
         else -> "需要检查"
@@ -943,6 +947,7 @@ abstract class StepCollectionActivity : Activity() {
     private fun displayError(message: String?): String? = message?.let { raw ->
         when {
             raw.contains("权限") -> "请允许蓝牙权限后重试。"
+            raw.contains("没有进展") -> "接收暂时中断，已保存进度。请将戒指靠近手机后重新连接。"
             raw.contains("蓝牙已关闭") -> "请打开手机蓝牙后重试。"
             raw.contains("空间") -> "手机存储空间不足，请清理空间后重试。"
             raw.contains("-16") || raw.contains("充电") -> "请将戒指取出充电盒，等待 10 秒后重新检查。"

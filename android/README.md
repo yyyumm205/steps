@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前版本：**步数采集 0.8.9-upload-guard（versionCode 51）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，实际通过范围见[验证记录E36](../specs/independent-step-collection/validation.md#e36上传结果边界与研究库加固2026-09-21)。
+当前工作版本：**步数采集 0.8.10-save-recovery（versionCode 52）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，本轮实际结果与待验范围见[验证记录E37](../specs/independent-step-collection/validation.md#e37保存恢复与用户记录隔离2026-09-22)。
 
 ## 当前流程
 
@@ -70,6 +70,8 @@ Debug APK位于`app/build/outputs/apk/debug/app-debug.apk`。`assembleRelease`�
 - 原始文件为无损`.rfbin` v2，上传包按走路／跑步和`session_id`独立冻结。
 - 参考步数、处理选择、设备记录锚和恢复状态先写入应用私有账本。
 - 下载采用同一戒指、同一记录证据和断点校验；重复片段须一致，缺口或替换保持隔离。
+- 连续3轮读取无进展后保留已保存部分并提供重试；相同重复片段不延长超时。旧记录保全的内部检查保持保存状态。
+- 首页与记录页按当前用户名展示历史；旧用户已获准上传的记录仍按采集时冻结的ID在后台处理。
 - 放弃只处理本段手机任务并保存排除标记；已核对协议没有单段Flash物理删除命令。
 - 原位升级用于保留数据。卸载或清除应用数据会删除尚未外部保全的记录，不作为恢复步骤。
 - 上传链接、凭据、被试数据、APK、日志和截图不进入Git。
