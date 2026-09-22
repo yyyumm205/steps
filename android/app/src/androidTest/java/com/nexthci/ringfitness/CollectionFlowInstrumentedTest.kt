@@ -672,6 +672,11 @@ class CollectionFlowInstrumentedTest {
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertEquals("步数采集", tagged<TextView>(activity, "flow_heading").text.toString())
+                // Completing the automatic backup must return to the usable activity chooser.
+                // A green progress card without these actions is a dead-end for participants.
+                assertTrue(tagged<Button>(activity, "activity_walking").isShown)
+                assertTrue(tagged<Button>(activity, "activity_running").isShown)
+                assertEquals("开始采集", tagged<Button>(activity, "flow_primary").text.toString())
                 assertTrue(tagged<Button>(activity, "flow_primary").isEnabled)
             }
         }
