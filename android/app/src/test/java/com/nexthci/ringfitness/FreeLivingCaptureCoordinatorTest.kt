@@ -694,6 +694,11 @@ class FreeLivingCaptureCoordinatorTest {
         f.coordinator.requestStop()
         f.health(stopped())
         f.health(record(bytes = 64, records = 4))
+        f.health(HealthMessage.ListEnd(1))
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        assertNull(f.store.read()!!.stopConfirmedAtMs)
+        f.health(stopped())
+        f.health(record(bytes = 64, records = 4))
         f.failSyncAfterCommit = true
         f.health(HealthMessage.ListEnd(1))
         assertEquals(CaptureControlPhase.STORAGE_ERROR, f.coordinator.state.phase)

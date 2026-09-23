@@ -113,20 +113,26 @@ class FreeLivingStopTimingTest {
         val initialQueries = f.count("status")
         val initialLists = f.count("list")
         f.coordinator.requestStop()
-        var snapshots = 0
+        f.advance(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS)
+        assertEquals(initialQueries + 1, f.count("status"))
+        f.observe(stopped, finalRecord)
+        assertEquals(initialLists + 1, f.count("list"))
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+
+        var rechecks = 0
         while (f.coordinator.state.phase == CaptureControlPhase.STOPPING &&
-            snapshots < FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT) {
-            f.advance(if (snapshots == 0) FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS
-                else FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
-            assertEquals(initialQueries + snapshots + 1, f.count("status"))
-            val bytes = 64L + snapshots.toLong() * 16L
-            val samples = 4L + snapshots.toLong()
+            rechecks < FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT) {
+            f.advance(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
+            assertEquals(initialQueries + rechecks + 2, f.count("status"))
+            val bytes = 64L + (rechecks + 1L) * 16L
+            val samples = 4L + rechecks + 1L
             f.observe(stopped.copy(bytes = bytes, records = samples),
                 finalRecord.copy(bytes = bytes, records = samples))
-            assertEquals(initialLists + snapshots + 1, f.count("list"))
-            snapshots++
+            assertEquals(initialLists + rechecks + 2, f.count("list"))
+            rechecks++
         }
-        assertTrue(snapshots in 2..FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT)
+        assertEquals(FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT, rechecks)
         assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
         assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, f.coordinator.state.issue)
         assertEquals(1, f.count("stop"))
