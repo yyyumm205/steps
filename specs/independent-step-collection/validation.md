@@ -1149,7 +1149,7 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 | 同页停止与收尾 | 点击结束后立即显示步数输入；STOP确认期间保持同一输入控件、文本、焦点和光标；确认完成后原位显示三个处理动作 | API31 `CollectionFlowInstrumentedTest`共47项到达`OK (47 tests)`，0失败；其中界面目录导出按显式开关条件跳过。覆盖确认中断、继续确认、确认后动作显示、空输入提示及0步保存 |
 | 草稿恢复 | 未确认结束时输入只写入独立草稿，不提前成为研究参考值；草稿使用原子替换与SHA-256校验，App／服务重开后恢复，正式保存或放弃后清除 | JVM覆盖重开、损坏、超长、非法输入、替换失败及跨session清理；历史`STOP_REQUESTED`兼容路由继续等待真实停止确认 |
 | 自动验证与构建 | Android JVM 671项通过，失败0、错误0、跳过0；Recovery QA在API31模拟器及三星适用项0失败，权限恢复定向检查两端各4项通过；Release、`lintVitalRelease`、Debug及AndroidTest构建通过 | 页面测试使用合成设备回复；真实戒指开始／停止耗时及本版完整收尾仍需短采测量 |
-| 正式包 | `android/dist/0.8.16/RingFitness-Steps-0.8.16.apk`，包名`com.nexthci.ringfitness.steps`，versionCode 58，Release不可调试，v3签名有效 | SHA-256为`0d9158526d19309a1b1832b4d3c2745235140d77346f85f99f291def67572bfb`，证书主题为`CN=RingFitness Steps` |
+| 正式包 | `android/dist/0.8.16/RingFitness-Steps-0.8.16.apk`，包名`com.nexthci.ringfitness.steps`，versionCode 58，Release不可调试，v3签名有效 | SHA-256为`ed124108d2b563bc7ec10b5c2ea1e6b8aeac3ae7e912e4bf571a607728c2e6b0`，证书主题为`CN=RingFitness Steps` |
 | 三星净安装 | 三星SM-F7310（Android 14）卸载旧正式版后安装0.8.16；`firstInstallTime`与`lastUpdateTime`均为`2026-09-23 20:55:00`，启动后停在全新的“开始使用”页，崩溃缓冲为空 | 旧正式版应用私有数据已随卸载删除；电脑与云盘历史研究文件保持原样。本轮尚未代填用户名、选择戒指或产生新真实记录 |
 
 本版已经完成可分发APK与三星净安装。下一次真实短采用于记录0.8.16的开始确认、结束确认和完整收尾耗时；该测量补充实物性能证据，不改变本轮软件回归与净安装结果。
