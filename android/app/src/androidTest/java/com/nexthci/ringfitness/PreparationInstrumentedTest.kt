@@ -19,6 +19,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -92,7 +93,7 @@ class PreparationInstrumentedTest {
     }
 
     private fun withIsolatedFiles(test: () -> Unit) {
-        assertTrue(
+        assumeTrue(
             Build.FINGERPRINT.contains("generic") || Build.FINGERPRINT.contains("emulator") ||
                 Build.MODEL.contains("Android SDK") || Build.PRODUCT.contains("sdk"),
         )

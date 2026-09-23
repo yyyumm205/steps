@@ -444,6 +444,7 @@ object RealCollectionBridge : CollectionFlow {
     override fun enterFinish() { dispatch?.invoke { it.enterFinish() } }
     override fun discardSession() { dispatch?.invoke { it.discardSession() } }
     override fun enterReference() { dispatch?.invoke { it.enterReference() } }
+    override fun updateReferenceDraft(stepsText: String) { dispatch?.invoke { it.updateReferenceDraft(stepsText) } }
     override fun saveReference(stepsText: String, status: String, reason: String) { dispatch?.invoke { it.saveReference(stepsText, status, reason) } }
     override fun retry() { dispatch?.invoke { it.retry() } }
     override fun endStartAttempt(reason: String) { dispatch?.invoke { it.endStartAttempt(reason) } }

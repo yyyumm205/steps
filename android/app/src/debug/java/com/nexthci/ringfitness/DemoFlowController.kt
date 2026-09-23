@@ -26,6 +26,7 @@ class DemoFlowController(
     private val observers = CopyOnWriteArrayList<(CollectionFlowState) -> Unit>()
     private val preparation: PreparationStore
     private val store: FreeLivingSessionStore
+    private val referenceDrafts: ReferenceDraftStore
     private val device: DemoDeviceStore
     private var coordinator: FreeLivingCaptureCoordinator? = null
     private var connected = true
@@ -53,6 +54,7 @@ class DemoFlowController(
             syncDirectory(requireNotNull(this.directory.parentFile))
         }
         preparation = PreparationStore(File(this.directory, "profile"))
+        referenceDrafts = ReferenceDraftStore(File(this.directory, "reference-draft.json"))
         store = FreeLivingSessionStore(File(this.directory, "session.json"), { source, target ->
             if (failNextReferenceCommit) {
                 failNextReferenceCommit = false
@@ -156,6 +158,7 @@ class DemoFlowController(
                     try {
                         failNextReferenceCommit = consume(FlowTestFault.SAVE_FAILURE)
                         val saved = store.finalizeStoppedSession(current.sessionId, policy, reference)
+                        referenceDrafts.clear(current.sessionId)
                         val persisted = requireNotNull(store.read(current.sessionId))
                         check(persisted.completionPolicy == saved.completionPolicy && persisted.reference == saved.reference)
                         if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING) else download(saved.sessionId)
@@ -171,6 +174,7 @@ class DemoFlowController(
         val current = requireNotNull(store.readPending())
         require(!savingReference && current.sessionId !in transferring)
         store.discardStoppedSession(current.sessionId, clock.nowEpochMs())
+        referenceDrafts.clear(current.sessionId)
         val cleaned = runCatching { store.cleanupDiscardedSession(current.sessionId) }.isSuccess
         operationEpoch++
         coordinator?.close(); coordinator = null
@@ -211,6 +215,14 @@ class DemoFlowController(
         publish(if (current.stopConfirmedAtMs != null && current.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE)
     }
 
+    override fun updateReferenceDraft(stepsText: String) = safely {
+        val current = requireNotNull(store.readPending())
+        require(current.reference == null && current.startAbort == null) { "本段无需填写步数" }
+        require(stepsText.isEmpty() || stepsText.matches(Regex("[0-9]{1,19}"))) { "请输入计步器上的整数" }
+        referenceDrafts.save(current.sessionId, stepsText)
+        publish(state.page, state.error)
+    }
+
     override fun saveReference(stepsText: String, status: String, reason: String) = safely(CollectionPage.REFERENCE) {
         browsingHome = false
         if (savingReference) { publish(CollectionPage.SAVING); return@safely }
@@ -228,6 +240,7 @@ class DemoFlowController(
                 try {
                     failNextReferenceCommit = consume(FlowTestFault.SAVE_FAILURE)
                     val saved = store.saveReference(current.sessionId, reference)
+                    referenceDrafts.clear(current.sessionId)
                     check(store.read(current.sessionId)?.reference == saved.reference)
                     if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
                     else if (saved.stopConfirmedAtMs != null) download(saved.sessionId)
@@ -560,6 +573,9 @@ class DemoFlowController(
         val profile = preparation.read()
         val session = store.read()?.takeUnless { it.isDiscarded }
         val reference = session?.reference
+        val referenceDraft = session?.takeIf { it.reference == null }?.let {
+            referenceDrafts.read(it.sessionId)?.stepsText
+        }
         if (page != CollectionPage.HOME) {
             taskPage = page
             taskError = error
@@ -578,7 +594,7 @@ class DemoFlowController(
             canStop = !busy && connected && session?.phase == FreeLivingSessionPhase.COLLECTING &&
                 (recoveryOwner || coordinator?.state?.phase == CaptureControlPhase.COLLECTING),
             canRetry = !busy && (taskPage != null || session != null || !connected),
-            selectedActivity = selectedActivity,
+            selectedActivity = selectedActivity, referenceDraft = referenceDraft,
             records = store.listSessions().filterNot { it.isDiscarded }.map { FlowRecordSummary(it.sessionId, it.reference?.steps,
                 it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null,
                 transferInFlight = it.sessionId in transferring, activity = it.activity,

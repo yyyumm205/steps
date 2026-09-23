@@ -2809,9 +2809,73 @@ class RealCollectionControllerTest {
         assertEquals(connections, f.port.count("connect"))
     }
 
+    @Test fun stopReferenceDraftSurvivesOwnerRestartWithoutBecomingResearchData() = Fixture().use { f ->
+        f.beginCollecting()
+        f.owner.stop()
+        assertEquals(CollectionPage.STOPPING, f.owner.state.page)
+        f.owner.updateReferenceDraft("42")
+        val id = f.store.readPending()!!.sessionId
+        assertEquals("42", f.owner.state.referenceDraft)
+        assertNull(f.store.readPending()!!.reference)
+
+        f.reopen()
+        assertEquals("42", f.owner.state.referenceDraft)
+        assertEquals(id, f.store.readPending()!!.sessionId)
+        assertNull(f.store.readPending()!!.reference)
+
+        f.owner.onConnected(f.port.generation)
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertEquals("42", f.owner.state.referenceDraft)
+        f.owner.finalizeSession(false, "42", "valid", "")
+        assertEquals(42L, f.store.read(id)!!.reference!!.steps)
+        assertEquals(ReferenceStatus.VALID, f.store.read(id)!!.reference!!.status)
+        assertNull(f.owner.state.referenceDraft)
+        assertFalse(File(f.directory, "reference-draft.json").exists())
+    }
+
+    @Test fun discardingAStoppedSessionClearsItsReferenceDraft() = Fixture().use { f ->
+        f.beginCollecting()
+        f.owner.stop()
+        f.owner.updateReferenceDraft("0")
+        f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        f.owner.discardSession()
+        assertNull(f.owner.state.referenceDraft)
+        assertFalse(File(f.directory, "reference-draft.json").exists())
+    }
+
+    @Test fun failedReferenceDraftReplacementNeverClaimsTheNewValueIsDurable() {
+        var failReplacement = false
+        Fixture(referenceDraftCommit = { source, target ->
+            if (failReplacement) throw IOException("simulated draft replacement failure")
+            replace(source, target)
+        }).use { f ->
+            f.beginCollecting()
+            f.owner.stop()
+            f.owner.updateReferenceDraft("4")
+            assertEquals("4", f.owner.state.referenceDraft)
+
+            failReplacement = true
+            f.owner.updateReferenceDraft("42")
+            assertEquals("4", f.owner.state.referenceDraft)
+            assertEquals("步数还没有保存在手机，请重新保存", f.owner.state.referenceDraftError)
+
+            f.reopen()
+            assertEquals("4", f.owner.state.referenceDraft)
+            assertNull(f.owner.state.referenceDraftError)
+
+            failReplacement = false
+            f.owner.updateReferenceDraft("42")
+            assertEquals("42", f.owner.state.referenceDraft)
+            assertNull(f.owner.state.referenceDraftError)
+        }
+    }
+
     private inner class Fixture(private val uploads: RealUploadPort? = null,
         private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false,
         private val preserveUnassignedExisting: Boolean = true,
+        private val referenceDraftCommit: (File, File) -> Unit = { source, target -> replace(source, target) },
         profileLabel: String = "owner001",
         identityType: PreparationIdentityType = PreparationIdentityType.RESEARCH_ID) : AutoCloseable {
         val directory = temporary.newFolder()
@@ -2851,6 +2915,8 @@ class RealCollectionControllerTest {
                     }
                 }) }, uploads = uploads,
             backups = DeviceRecordBackupStore(File(directory, "device-backups"), {}),
+            referenceDrafts = ReferenceDraftStore(File(directory, "reference-draft.json"),
+                referenceDraftCommit, {}),
             preserveUnassignedExisting = preserveUnassignedExisting, syncClockBeforeStart = syncClock,
             saveClockEvidence = { evidence, sessionId ->
                 if (failClockEvidence) throw IOException("校时证据保存失败")

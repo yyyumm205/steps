@@ -66,6 +66,10 @@ data class CollectionFlowState(
     val records: List<FlowRecordSummary> = emptyList(),
     val fault: FlowTestFault = FlowTestFault.NONE,
     val selectedActivity: SessionActivity? = null,
+    /** Recoverable UI input. It is not research reference data until stop confirmation. */
+    val referenceDraft: String? = null,
+    /** Set when the visible input has not yet replaced the last durable draft. */
+    val referenceDraftError: String? = null,
 ) {
     val canRecordReferenceLocally: Boolean get() = session?.let {
         it.isPending && it.stopConfirmedAtMs != null && it.reference == null && it.startAbort == null
@@ -85,6 +89,7 @@ interface CollectionFlow {
     fun enterFinish() = Unit
     fun discardSession() = Unit
     fun enterReference()
+    fun updateReferenceDraft(stepsText: String) = Unit
     fun saveReference(stepsText: String, status: String = "valid", reason: String = "")
     fun retry()
     fun endStartAttempt(reason: String) = Unit

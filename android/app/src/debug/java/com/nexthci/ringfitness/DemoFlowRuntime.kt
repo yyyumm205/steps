@@ -62,6 +62,9 @@ object DemoFlowRuntime {
             override fun enterFinish() { executor.execute { controller.enterFinish() } }
             override fun discardSession() { executor.execute { controller.discardSession() } }
             override fun enterReference() { executor.execute { controller.enterReference() } }
+            override fun updateReferenceDraft(stepsText: String) {
+                executor.execute { controller.updateReferenceDraft(stepsText) }
+            }
             override fun saveReference(stepsText: String, status: String, reason: String) { executor.execute { controller.saveReference(stepsText, status, reason) } }
             override fun retry() { executor.execute { controller.retry() } }
             override fun retryUpload(sessionId: String) { executor.execute { controller.retryUpload(sessionId) } }

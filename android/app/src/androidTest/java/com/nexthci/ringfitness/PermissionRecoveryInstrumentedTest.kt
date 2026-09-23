@@ -63,6 +63,8 @@ class PermissionRecoveryInstrumentedTest {
                 }
                 instrumentation.waitForIdleSync()
                 scenario.onActivity { tagged<Button>(it, "primary").performClick() }
+                awaitDevicePage(scenario)
+                scenario.onActivity { tagged<Button>(it, "primary").performClick() }
                 awaitSettings(monitor)
                 scenario.onActivity { activity ->
                     val primary = tagged<Button>(activity, "primary")
@@ -132,7 +134,7 @@ class PermissionRecoveryInstrumentedTest {
     }
 
     private fun settingsMonitor() = Instrumentation.ActivityMonitor(
-        IntentFilter(Settings.ACTION_APPLICATION_DETAILS_SETTINGS),
+        IntentFilter(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply { addDataScheme("package") },
         Instrumentation.ActivityResult(Activity.RESULT_CANCELED, Intent()), true,
     ).also(instrumentation::addMonitor)
 

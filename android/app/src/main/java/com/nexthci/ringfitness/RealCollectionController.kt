@@ -44,6 +44,7 @@ class RealCollectionController(
     },
     private val uploads: RealUploadPort? = null,
     private val backups: DeviceRecordBackupStore = DeviceRecordBackupStore(File(directory, "device-backups")),
+    private val referenceDrafts: ReferenceDraftStore = ReferenceDraftStore(File(directory, "reference-draft.json")),
     /**
      * Historical unassigned ring records belong to an earlier phone/user and are not part of
      * the current participant flow. Keep the preservation path available for explicit recovery
@@ -123,6 +124,8 @@ class RealCollectionController(
     private var reconnectScheduledGeneration: Long? = null
     private var closed = false
     private var saving = false
+    private var referenceDraft: String? = null
+    private var referenceDraftError: String? = null
     private var selectedActivity: SessionActivity? = null
     private var requestedActivity: SessionActivity? = null
     private var stopEvidenceGeneration: Long? = null
@@ -238,6 +241,13 @@ class RealCollectionController(
         require(profile?.ring != null && profile?.placement != null) { "请先选择戒指与佩戴位置" }
         coordinator.restore()
         val current = store.read()
+        val pending = current?.takeIf { it.isPending }
+        referenceDraft = pending?.takeIf { it.reference == null }?.let { referenceDrafts.read(it.sessionId)?.stepsText }
+        if (pending == null || pending.reference != null ||
+            (referenceDraft == null && File(directory, "reference-draft.json").exists())) {
+            runCatching { referenceDrafts.clearAll() }
+                .onFailure { error -> reportError(error as? Exception ?: Exception(error)) }
+        }
         browsingHome = current == null || !current.isPending
         enqueueSavedRecords()
         if (current?.isRingDeferred == true) publish(CollectionPage.RING_PENDING) else connect()
@@ -617,6 +627,7 @@ class RealCollectionController(
         if (!state.canStart || connecting || query != null || readinessWait != null || timeRound != null || downloader != null || backupObservation != null || saving) return@safely
         requestedActivity = requireNotNull(selectedActivity) { "请选择本次活动" }
         selectedActivity = null
+        clearReferenceDraft()
         if (syncClockBeforeStart || unknownPreservation != null) {
             val before = requireNotNull(lastIdle)
             require(!before.status.collecting && store.readPending() == null)
@@ -769,6 +780,7 @@ class RealCollectionController(
                     check(persisted.completionPolicy == it.completionPolicy && persisted.reference == it.reference)
                 }
             } finally { saving = false }
+            clearReferenceDraft(current.sessionId)
             if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
             else if (connected) inspect()
             else publish(CollectionPage.RECOVERY, "记录已保存，请重新连接以下载数据")
@@ -780,6 +792,7 @@ class RealCollectionController(
         require(current.stopConfirmedAtMs != null)
         val atMs = clock.nowEpochMs()
         store.discardStoppedSession(current.sessionId, atMs, preservationOwnerId, generation)
+        clearReferenceDraft(current.sessionId)
         closeDownload()
         query = null; readinessWait = null; selectedActivity = null; requestedActivity = null
         val cleaned = runCatching { store.cleanupDiscardedSession(current.sessionId) }
@@ -798,6 +811,26 @@ class RealCollectionController(
         publish(if (current.stopConfirmedAtMs != null && current.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE)
     }
 
+    override fun updateReferenceDraft(stepsText: String) {
+        if (closed) return
+        val result = runCatching {
+            val current = requireNotNull(store.readPending())
+            require(current.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE) &&
+                current.reference == null && current.startAbort == null) { "本段无需填写步数" }
+            require(stepsText.isEmpty() || stepsText.matches(Regex("[0-9]{1,19}"))) { "请输入计步器上的整数" }
+            referenceDrafts.save(current.sessionId, stepsText)?.stepsText
+        }
+        result.onSuccess { persisted ->
+            referenceDraft = persisted
+            referenceDraftError = null
+        }.onFailure { error ->
+            reportError(error as? Exception ?: Exception(error))
+            referenceDraftError = "步数还没有保存在手机，请重新保存"
+        }
+        state = state.copy(referenceDraft = referenceDraft, referenceDraftError = referenceDraftError)
+        observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
+    }
+
     override fun saveReference(stepsText: String, status: String, reason: String) = safely(CollectionPage.REFERENCE) {
         if (saving || downloader != null) return@safely
         browsingHome = false
@@ -812,6 +845,7 @@ class RealCollectionController(
                 check(store.read(current.sessionId)?.reference == it.reference)
             }
         } finally { saving = false }
+        clearReferenceDraft(current.sessionId)
         if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
         else if (saved.stopConfirmedAtMs == null) publish(CollectionPage.RECOVERY, "读数已保存，请重新检查戒指")
         else if (connected) inspect() else publish(CollectionPage.RECOVERY, "读数已保存，请重新连接以下载数据")
@@ -1600,10 +1634,19 @@ class RealCollectionController(
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,
             records = recordSummaries(), selectedActivity = selectedActivity,
+            referenceDraft = referenceDraft, referenceDraftError = referenceDraftError,
             canStopUnconfirmedStart = connected && !connecting && query == null && abortWaitOperation == null &&
                 !abortCandidateInvalidated && pending?.phase == FreeLivingSessionPhase.START_REQUESTED && pending.startAbort == null &&
                 coordinator.state.unconfirmedStartStopCandidate?.connectionGeneration == generation)
         observers.forEach { observer -> notifyObserver { if (observer in observers) observer(state) } }
+    }
+
+    private fun clearReferenceDraft(sessionId: String? = null) {
+        referenceDraft = null
+        referenceDraftError = null
+        runCatching {
+            if (sessionId == null) referenceDrafts.clearAll() else referenceDrafts.clear(sessionId)
+        }.onFailure { error -> reportError(error as? Exception ?: Exception(error)) }
     }
 
     private fun safely(failurePage: CollectionPage = CollectionPage.ERROR, action: () -> Unit) {

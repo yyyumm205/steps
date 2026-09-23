@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputFilter
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -136,7 +137,10 @@ abstract class StepCollectionActivity : Activity() {
         resolveReferenceRevision(state)
         if (state.session?.sessionId != null && draftSessionId != state.session.sessionId) {
             draftSessionId = state.session.sessionId
-            stepsDraft = ""
+            stepsDraft = state.referenceDraft.orEmpty()
+        }
+        if (state.session?.reference == null && state.referenceDraft != null && stepsDraft.isBlank() && stepsInput == null) {
+            stepsDraft = state.referenceDraft
         }
         state.session?.reference?.let { saved ->
             stepsDraft = saved.steps?.toString().orEmpty()
@@ -148,9 +152,16 @@ abstract class StepCollectionActivity : Activity() {
         }
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
+        if (old != null && isPendingStopForm(old) &&
+            old.session?.sessionId == state.session?.sessionId &&
+            (isPendingStopForm(state) || isConfirmedFinishForm(state))) {
+            updateFinishFormState(state)
+            return
+        }
         if (state.page in setOf(CollectionPage.FINISH, CollectionPage.REFERENCE) && old?.page == state.page &&
             old.copy(records = state.records, fault = state.fault, connected = state.connected,
-                connecting = state.connecting, canRetry = state.canRetry, error = state.error) == state) {
+                connecting = state.connecting, canRetry = state.canRetry, error = state.error,
+                referenceDraft = state.referenceDraft, referenceDraftError = state.referenceDraftError) == state) {
             window.decorView.findViewWithTag<TextView>("flow_error")?.apply {
                 text = displayError(state.error).orEmpty()
                 visibility = if (state.error == null) View.GONE else View.VISIBLE
@@ -248,6 +259,7 @@ abstract class StepCollectionActivity : Activity() {
         val session = state.session
         when {
             usesHomeSurface(state) -> if (showingRecords) records(body, state) else home(body, footer, state)
+            isPendingStopForm(state) -> finishSession(body, state)
             state.page in setOf(CollectionPage.STARTING, CollectionPage.COLLECTING, CollectionPage.STOPPING) ->
                 captureSession(body, footer, state)
             state.page == CollectionPage.SAVING -> saving(body, state)
@@ -681,6 +693,21 @@ abstract class StepCollectionActivity : Activity() {
         ui.gap(summary, 14)
         detail(summary, "开始时间", startDateTime(state.session))
 
+        val confirmation = ui.column(summary).apply { tag = "stop_confirmation" }
+        ui.gap(confirmation, 18)
+        confirmation.addView(ui.progress().apply { tag = "stop_confirmation_progress" },
+            LinearLayout.LayoutParams(ui.dp(32), ui.dp(32)).apply { gravity = Gravity.CENTER })
+        ui.gap(confirmation, 12)
+        ui.text(confirmation, "", 15f, bold = true).apply {
+            tag = "stop_confirmation_status"
+            gravity = Gravity.CENTER
+        }
+        ui.gap(confirmation, 8)
+        ui.text(confirmation, "", 14f, muted = true).apply {
+            tag = "stop_confirmation_hint"
+            gravity = Gravity.CENTER
+        }
+
         val input = ui.card(body)
         val savedReference = state.session?.reference
         if (savedReference != null) {
@@ -697,7 +724,12 @@ abstract class StepCollectionActivity : Activity() {
             ui.text(input, "无法提供本次步数时，可放弃本段。", 14f, muted = true).tag = "no_reference_hint"
         }
 
-        val actions = ui.column(body)
+        val recovery = ui.button(body, "继续确认结束", primary = true, tag = "finish_stop_recovery") {
+            current?.let { latest -> if (latest.connected) flow.retry() else flow.reconnect() }
+        }
+        recovery.visibility = View.GONE
+
+        val actions = ui.column(body).apply { tag = "finish_actions" }
         val fixedPolicy = state.session?.completionPolicy
         when {
             !state.uploadAvailable -> action(actions, "保存到手机", !state.busy) {
@@ -721,6 +753,7 @@ abstract class StepCollectionActivity : Activity() {
             background = ui.linkBackground()
             minHeight = ui.dp(48); minimumHeight = ui.dp(48)
         }
+        updateFinishFormState(state)
     }
 
     private fun submitFinish(uploadNow: Boolean) {
@@ -742,18 +775,97 @@ abstract class StepCollectionActivity : Activity() {
     private fun referenceInput(parent: LinearLayout) {
         ui.text(parent, "计步器总步数", 14f, muted = true)
         ui.gap(parent, 10)
-        stepsInput = ui.input(parent, "填写步数", "flow_steps", numeric = true).apply { setText(stepsDraft) }
+        stepsInput = ui.input(parent, "填写步数", "flow_steps", numeric = true).apply {
+            filters = arrayOf(InputFilter.LengthFilter(19))
+            setText(stepsDraft)
+        }
         finishInputError = ui.text(parent, "", 14f).apply {
             tag = "finish_input_error"
             setTextColor(ui.error)
             visibility = View.GONE
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
+        ui.text(parent, "", 14f).apply {
+            tag = "draft_save_error"
+            setTextColor(ui.error)
+            visibility = View.GONE
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        ui.button(parent, "重新保存步数", tag = "draft_save_retry") {
+            flow.updateReferenceDraft(stepsDraft)
+        }.apply {
+            background = ui.linkBackground()
+            minHeight = ui.dp(48); minimumHeight = ui.dp(48)
+            visibility = View.GONE
+        }
         stepsInput?.doAfterTextChanged {
+            stepsDraft = it?.toString().orEmpty()
             if (!it.isNullOrBlank()) {
                 finishInputError?.visibility = View.GONE
             }
+            val latest = current
+            if (latest?.session?.sessionId == draftSessionId && latest?.session?.reference == null &&
+                latest?.referenceDraft.orEmpty() != stepsDraft) {
+                flow.updateReferenceDraft(stepsDraft)
+            }
         }
+        current?.let(::updateReferenceDraftFeedback)
+    }
+
+    private fun isPendingStopForm(state: CollectionFlowState): Boolean = state.session?.let { session ->
+        session.phase == FreeLivingSessionPhase.STOP_REQUESTED && session.stopConfirmedAtMs == null &&
+            session.reference == null && state.page in setOf(
+                CollectionPage.STOPPING, CollectionPage.RECOVERY, CollectionPage.ERROR,
+            )
+    } == true
+
+    private fun isConfirmedFinishForm(state: CollectionFlowState): Boolean = state.session?.let { session ->
+        session.stopConfirmedAtMs != null && session.reference == null &&
+            state.page in setOf(CollectionPage.FINISH, CollectionPage.REFERENCE)
+    } == true
+
+    private fun updateFinishFormState(state: CollectionFlowState) {
+        updateReferenceDraftFeedback(state)
+        val pending = isPendingStopForm(state)
+        window.decorView.findViewWithTag<View>("stop_confirmation")?.visibility =
+            if (pending) View.VISIBLE else View.GONE
+        window.decorView.findViewWithTag<View>("stop_confirmation_progress")?.visibility =
+            if (pending && (state.busy || state.connecting)) View.VISIBLE else View.GONE
+        window.decorView.findViewWithTag<TextView>("stop_confirmation_status")?.text = when {
+            state.connecting -> "正在重新连接戒指"
+            !state.connected -> "戒指连接已中断"
+            state.canRetry && !state.busy -> "等待继续确认结束"
+            else -> "正在结束采集"
+        }
+        window.decorView.findViewWithTag<TextView>("stop_confirmation_hint")?.text = when {
+            state.connecting -> "可以先填写计步器读数，连接恢复后继续确认。"
+            !state.connected -> "请将戒指靠近手机，已填写内容会保留。"
+            state.canRetry && !state.busy -> "继续确认后即可选择保存方式。"
+            else -> "可以先填写计步器读数，确认完成后选择保存方式。"
+        }
+        val recovery = window.decorView.findViewWithTag<Button>("finish_stop_recovery")
+        val canRecover = pending && state.canRetry && !state.busy && !state.connecting
+        recovery?.apply {
+            text = if (state.connected) "继续确认结束" else "重新连接"
+            isEnabled = canRecover
+            visibility = if (canRecover) View.VISIBLE else View.GONE
+        }
+        window.decorView.findViewWithTag<View>("finish_actions")?.visibility =
+            if (pending) View.GONE else View.VISIBLE
+        val actionsEnabled = !pending && !state.busy
+        listOf("flow_primary", "finish_defer", "finish_discard").forEach { tag ->
+            window.decorView.findViewWithTag<Button>(tag)?.isEnabled = actionsEnabled
+        }
+    }
+
+    private fun updateReferenceDraftFeedback(state: CollectionFlowState) {
+        val message = state.referenceDraftError
+        window.decorView.findViewWithTag<TextView>("draft_save_error")?.apply {
+            text = message.orEmpty()
+            visibility = if (message == null) View.GONE else View.VISIBLE
+        }
+        window.decorView.findViewWithTag<Button>("draft_save_retry")?.visibility =
+            if (message == null) View.GONE else View.VISIBLE
     }
 
     private fun showRequiredFinishInput(field: EditText?, message: String) {
