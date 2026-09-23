@@ -161,11 +161,26 @@ class FreeLivingCaptureCoordinator(
     }
 
     fun requestStart(preparation: PreparationSnapshot, allowedExisting: ExistingRecordAuthorization? = null,
-        activity: SessionActivity = SessionActivity.FREE_LIVING) = dispatch {
+        activity: SessionActivity = SessionActivity.FREE_LIVING,
+        verifiedPreflight: HealthRecordObservation? = null) = dispatch {
         if (!ensureRestored() || round != null || intent != null || session != null) return@dispatch
         if (!connectedTo(preparation.ring?.address)) return@dispatch
         intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting, activity)
-        beginRound(Purpose.PREFLIGHT)
+        if (verifiedPreflight == null) {
+            beginRound(Purpose.PREFLIGHT)
+            return@dispatch
+        }
+        val ageMs = clock.nowEpochMs() - verifiedPreflight.statusReceivedAtMs
+        if (verifiedPreflight.address != address || verifiedPreflight.connectionGeneration != generation ||
+            verifiedPreflight.status.errorCode != 0 || ageMs !in 0..VERIFIED_PREFLIGHT_MAX_AGE_MS) {
+            intent = null
+            review(CaptureControlIssue.INVALID_OBSERVATION, verifiedPreflight)
+            return@dispatch
+        }
+        // The owner has just completed this STATUS/LIST round after clock synchronization on the
+        // same serial connection. Reuse it; the 500 ms guard still watches unsolicited changes.
+        publish(CaptureControlPhase.CHECKING, observed = verifiedPreflight)
+        completeRound(Purpose.PREFLIGHT, verifiedPreflight)
     }
 
     fun requestStop() = dispatch {
@@ -366,9 +381,8 @@ class FreeLivingCaptureCoordinator(
                     if (message != evidence.status && save { store.updateDeviceEvidence(current.sessionId,
                             evidence.copy(status = message, observedAtMs = packet.receivedEpochMs)) } == null) return@dispatch
                     lastStatus = message
-                    if (firstStoppedObservation == null) {
+                    if (firstStoppedObservation == null && message.collecting) {
                         round = null
-                        stopPollCount++
                         val snapshot = HealthRecordObservation(
                             address = requireNotNull(address),
                             connectionGeneration = connectionGeneration,
@@ -377,13 +391,7 @@ class FreeLivingCaptureCoordinator(
                             records = current.startBaseline?.records.orEmpty()
                                 .filter { it.sessionId != evidence.record.sessionId } + evidence.record,
                         )
-                        if (message.collecting) {
-                            waitForStop(STOP_POLL_INTERVAL_MS, snapshot)
-                        } else {
-                            firstStoppedObservation = snapshot
-                            stopListRetryCount = 0
-                            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, snapshot)
-                        }
+                        retryStopStatus(snapshot)
                         return@dispatch
                     }
                     if (message.collecting) {
@@ -500,13 +508,17 @@ class FreeLivingCaptureCoordinator(
         ownership = identity(candidate)
         lastRecord = candidate
         lastStatus = latest
-        stopPollCount++
         if (!latest.collecting && candidate.bytes == latest.bytes && candidate.records == latest.records) {
+            stopPollCount++
+            if (stopPollCount >= STOP_RECOVERY_POLL_LIMIT) {
+                review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, latestObserved)
+                return
+            }
             firstStoppedObservation = latestObserved
             stopListRetryCount = 0
             waitForStop(STOP_FLASH_SETTLE_DELAY_MS, latestObserved)
         } else {
-            waitForStop(STOP_POLL_INTERVAL_MS, latestObserved)
+            retryStopStatus(latestObserved)
         }
     }
 
@@ -730,8 +742,7 @@ class FreeLivingCaptureCoordinator(
                     DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
             lastRecord = candidate
             lastStatus = observed.status
-            stopPollCount++
-            waitForStop(STOP_POLL_INTERVAL_MS, observed)
+            retryStopStatus(observed)
             return
         }
         if (candidate.bytes < observed.status.bytes || candidate.records < observed.status.records) {
@@ -744,17 +755,33 @@ class FreeLivingCaptureCoordinator(
             lastRecord = candidate
             lastStatus = observed.status
             firstStoppedObservation = null
-            waitForStop(STOP_POLL_INTERVAL_MS, observed)
+            retryStopStatus(observed)
             return
         }
         if (firstStoppedObservation == null) {
+            if (save { store.updateDeviceEvidence(current.sessionId,
+                    DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
+            stopPollCount++
+            if (stopPollCount >= STOP_RECOVERY_POLL_LIMIT) {
+                review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
+                return
+            }
+            firstStoppedObservation = observed
+            stopListRetryCount = 0
+            lastRecord = candidate
+            lastStatus = observed.status
+            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, observed)
+            return
+        }
+        val firstStopped = requireNotNull(firstStoppedObservation)
+        if (observed.status != firstStopped.status || observed.records.toSet() != firstStopped.records.toSet()) {
             if (save { store.updateDeviceEvidence(current.sessionId,
                     DeviceRecordEvidence(candidate, observed.status, observed.statusReceivedAtMs)) } == null) return
             firstStoppedObservation = observed
             stopListRetryCount = 0
             lastRecord = candidate
             lastStatus = observed.status
-            waitForStop(STOP_FLASH_SETTLE_DELAY_MS, observed)
+            retryStopStatus(observed)
             return
         }
         if (save { store.confirmStop(current.sessionId, observed.address, observed.status, observed.statusReceivedAtMs,
@@ -768,6 +795,15 @@ class FreeLivingCaptureCoordinator(
         if (stopListRetryCount < STOP_LIST_RETRY_LIMIT) {
             stopListRetryCount++
             waitForStop(STOP_LIST_RETRY_INTERVAL_MS, observed)
+        } else {
+            review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
+        }
+    }
+
+    private fun retryStopStatus(observed: HealthRecordObservation) {
+        stopPollCount++
+        if (stopPollCount < STOP_RECOVERY_POLL_LIMIT) {
+            waitForStop(STOP_POLL_INTERVAL_MS, observed)
         } else {
             review(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, observed)
         }
@@ -790,30 +826,12 @@ class FreeLivingCaptureCoordinator(
                         return@callback
                     }
                     stopWait = null
-                    if (firstStoppedObservation == null) beginRound(Purpose.STOP)
-                    else beginStopListRound()
+                    beginRound(Purpose.STOP)
                 }
             }
         } catch (_: Exception) {
             invalidateRound(CaptureControlIssue.COMMAND_NOT_ACCEPTED)
         }
-    }
-
-    private fun beginStopListRound() {
-        val connection = generation ?: return
-        val stopped = firstStoppedObservation ?: return
-        val latest = session?.deviceRecordEvidence
-        if (tainted) { review(CaptureControlIssue.RECONNECT_REQUIRED); return }
-        round = Round(
-            id = ++operation,
-            generation = connection,
-            purpose = Purpose.STOP,
-            startedAtElapsedMs = clock.nowElapsedMs(),
-            status = SensorPacket.Health(latest?.status ?: stopped.status,
-                latest?.observedAtMs ?: stopped.statusReceivedAtMs),
-        )
-        publish(CaptureControlPhase.STOPPING)
-        send(port::queryRecords)
     }
 
     private fun allowedBaseline(observed: HealthRecordObservation, authorization: ExistingRecordAuthorization?): Boolean {
@@ -959,6 +977,7 @@ class FreeLivingCaptureCoordinator(
             } else {
                 stopPollCount = 0
                 stopListRetryCount = 0
+                stopPollCount++
                 firstStoppedObservation = observed
                 waitForStop(STOP_FLASH_SETTLE_DELAY_MS, observed)
             }
@@ -1095,13 +1114,14 @@ class FreeLivingCaptureCoordinator(
 
     companion object {
         const val QUERY_TIMEOUT_MS = 30_000L
+        const val VERIFIED_PREFLIGHT_MAX_AGE_MS = 30_000L
         const val START_SETTLE_DELAY_MS = 500L
         const val START_FIRST_POLL_DELAY_MS = 1_000L
         const val START_POLL_INTERVAL_MS = 1_500L
         const val START_POLL_LIMIT = 3
         const val STOP_FIRST_POLL_DELAY_MS = 500L
         const val STOP_POLL_INTERVAL_MS = 1_000L
-        const val STOP_FLASH_SETTLE_DELAY_MS = 5_000L
+        const val STOP_FLASH_SETTLE_DELAY_MS = 1_000L
         const val STOP_LIST_RETRY_INTERVAL_MS = 2_000L
         const val STOP_LIST_RETRY_LIMIT = 30
         const val STOP_RECOVERY_POLL_LIMIT = 30

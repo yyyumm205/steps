@@ -35,6 +35,10 @@ class FreeLivingRepeatedStopStatusTest {
         f.nextDelay()
         f.health(higher)
         f.list(128, 8)
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        f.nextDelay()
+        f.health(higher)
+        f.list(128, 8)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
         assertEquals(1, f.count("stop"))
 

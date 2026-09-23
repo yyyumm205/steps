@@ -132,7 +132,7 @@ class FreeLivingStopTimingTest {
             assertEquals(initialLists + rechecks + 2, f.count("list"))
             rechecks++
         }
-        assertEquals(FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT, rechecks)
+        assertEquals(FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT - 1, rechecks)
         assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
         assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, f.coordinator.state.issue)
         assertEquals(1, f.count("stop"))

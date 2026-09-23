@@ -319,7 +319,7 @@ class RealCollectionControllerTest {
         f.owner.stop(); f.owner.retry()
         assertEquals(queries, f.port.count("status"))
         assertEquals(1, f.port.count("stop"))
-        f.runDelay(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
+        f.runDelay(RealCollectionController.UNCONFIRMED_START_ABORT_SETTLE_DELAY_MS)
         repeat(3) { attempt ->
             f.observe(collecting, listOf(initial))
             if (attempt < 2) f.runDelay(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)

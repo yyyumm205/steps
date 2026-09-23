@@ -680,7 +680,8 @@ class RealCollectionController(
             generation, unknownEvidence)
         browsingHome = false; lastIdle = null
         coordinator.refresh()
-        coordinator.requestStart(requireNotNull(profile), allowed, requireNotNull(requestedActivity))
+        coordinator.requestStart(requireNotNull(profile), allowed, requireNotNull(requestedActivity),
+            verifiedPreflight = before.takeIf { startingClockEvidence != null && it.status.errorCode == 0 })
     }
 
     private fun beginClockSync(before: HealthRecordObservation) {
@@ -1180,7 +1181,7 @@ class RealCollectionController(
         abortStopPollCount = 0
         abortHighWater = observed
         require(port.stop()) { "停止请求未发送，请保留戒指并重新检查" }
-        scheduleAbortStopCheck(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
+        scheduleAbortStopCheck(UNCONFIRMED_START_ABORT_SETTLE_DELAY_MS)
     }
 
     /** Keep every observed counter across incomplete or rejected STOP query rounds. */
@@ -1689,5 +1690,6 @@ class RealCollectionController(
         internal const val MAX_FINALIZATION_EXPANSIONS = 3
         internal const val READINESS_CHECK_LIMIT = 3
         internal const val READINESS_CHECK_INTERVAL_MS = 1_500L
+        internal const val UNCONFIRMED_START_ABORT_SETTLE_DELAY_MS = 5_000L
     }
 }

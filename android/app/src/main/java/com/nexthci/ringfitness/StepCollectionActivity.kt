@@ -626,7 +626,13 @@ abstract class StepCollectionActivity : Activity() {
                 gravity = Gravity.CENTER
             })
             ui.gap(card, 18)
-            ui.text(card, if (state.connected) "正在核对戒指状态" else "记录已保留，正在重新连接",
+            val progress = when {
+                !state.connected -> "记录已保留，正在重新连接"
+                phase == FreeLivingSessionPhase.START_REQUESTED -> "正在启动戒指"
+                phase == FreeLivingSessionPhase.STOP_REQUESTED -> "正在保存最后数据"
+                else -> "正在核对戒指状态"
+            }
+            ui.text(card, progress,
                 16f, bold = true).gravity = Gravity.CENTER
         }
         ui.gap(card, 18)
