@@ -50,6 +50,75 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(FreeLivingSessionPhase.START_REQUESTED, f.store.read()!!.phase)
     }
 
+    @Test fun verifiedPreflightSkipsTheDuplicateQueryButKeepsBothStartDelays() {
+        val f = Fixture(immediateSchedule = false)
+        f.connect()
+        val observed = HealthRecordObservation(address, 1, idle(), epoch, emptyList())
+        val allowed = ExistingRecordAuthorization(address, observed.status, observed.records, 1)
+
+        f.coordinator.requestStart(preparation, allowedExisting = allowed, verifiedPreflight = observed)
+
+        assertTrue(f.port.calls.isEmpty())
+        assertEquals(listOf(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS), f.pendingDelays())
+        assertEquals(FreeLivingSessionPhase.START_REQUESTED, f.store.readPending()!!.phase)
+
+        f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+        assertEquals(listOf("start"), f.port.calls)
+        assertEquals(listOf(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS), f.pendingDelays())
+
+        f.runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+        assertEquals(listOf("start", "status"), f.port.calls)
+        f.observe(collecting(), listOf(record()))
+        assertEquals(CaptureControlPhase.COLLECTING, f.coordinator.state.phase)
+    }
+
+    @Test fun invalidVerifiedPreflightIsRejectedWithoutIssuingADeviceCommand() {
+        val allowedStatus = idle()
+        val allowed = ExistingRecordAuthorization(address, allowedStatus, emptyList(), 1)
+        val candidates = listOf(
+            HealthRecordObservation(address, 2, allowedStatus, epoch, emptyList()),
+            HealthRecordObservation(address, 1, allowedStatus.copy(errorCode = -16), epoch, emptyList()),
+            HealthRecordObservation(address, 1, allowedStatus,
+                epoch - FreeLivingCaptureCoordinator.VERIFIED_PREFLIGHT_MAX_AGE_MS - 1, emptyList()),
+        )
+
+        candidates.forEach { observed ->
+            val f = Fixture(immediateSchedule = false)
+            f.connect()
+            f.coordinator.requestStart(preparation, allowedExisting = allowed, verifiedPreflight = observed)
+
+            assertTrue(f.port.calls.isEmpty())
+            assertNull(f.store.readPending())
+            assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
+            assertEquals(CaptureControlIssue.INVALID_OBSERVATION, f.coordinator.state.issue)
+        }
+    }
+
+    @Test fun verifiedPreflightStillLimitsIdleStartConfirmationToThreePolls() {
+        val f = Fixture(immediateSchedule = false)
+        f.connect()
+        val observed = HealthRecordObservation(address, 1, idle(), epoch, emptyList())
+        val allowed = ExistingRecordAuthorization(address, observed.status, observed.records, 1)
+        f.coordinator.requestStart(preparation, allowedExisting = allowed, verifiedPreflight = observed)
+        f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+        f.runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+
+        repeat(3) { poll ->
+            f.observe(idle())
+            if (poll < 2) {
+                assertEquals(listOf(FreeLivingCaptureCoordinator.START_POLL_INTERVAL_MS), f.pendingDelays())
+                f.runDelay(FreeLivingCaptureCoordinator.START_POLL_INTERVAL_MS)
+            }
+        }
+
+        assertEquals(1, f.port.count("start"))
+        assertEquals(3, f.port.count("status"))
+        assertEquals(3, f.port.count("list"))
+        assertTrue(f.pendingDelays().isEmpty())
+        assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.RECORD_ORIGIN_UNCERTAIN, f.coordinator.state.issue)
+    }
+
     @Test fun theDurableStartRequestExistsBeforeTheTransportReceivesStart() {
         val f = Fixture()
         f.port.accept = { command ->
@@ -152,7 +221,7 @@ class FreeLivingCaptureCoordinatorTest {
         assertEquals(saved, f.store.read())
     }
 
-    @Test fun stopWaitsFromTheFirstStoppedReplyBeforeFinalFlashConfirmation() {
+    @Test fun stopRequiresTwoEarlyMatchingSnapshotsBeforeFinalConfirmation() {
         val f = Fixture(immediateSchedule = false)
         f.connect()
         f.coordinator.requestStart(preparation)
@@ -166,8 +235,8 @@ class FreeLivingCaptureCoordinatorTest {
         f.runDelay(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS)
         f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
         assertNull(f.store.read()!!.stopConfirmedAtMs)
-        assertEquals(listOf(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS), f.pendingDelays())
-        f.runDelay(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
+        assertEquals(listOf(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS), f.pendingDelays())
+        f.runDelay(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
         f.observe(stopped(), listOf(record(bytes = 64, records = 4)))
         assertNotNull(f.store.read()!!.stopConfirmedAtMs)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
@@ -1195,8 +1264,8 @@ class FreeLivingCaptureCoordinatorTest {
             health(status, connection)
             records.forEach { health(it, connection) }
             health(HealthMessage.ListEnd(records.size), connection)
-            // The production flow performs one final STATUS/LIST round after the five-second
-            // Flash settle interval. This fixture executes scheduled waits immediately.
+            // The production flow requires two matching stopped STATUS/LIST snapshots.
+            // This fixture executes the short stability wait immediately.
             if (!status.collecting && coordinator.state.phase == CaptureControlPhase.STOPPING &&
                 coordinator.state.timeoutOperationId != null) {
                 health(status, connection)

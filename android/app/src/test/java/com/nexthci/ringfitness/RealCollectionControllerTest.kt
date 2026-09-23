@@ -74,6 +74,35 @@ class RealCollectionControllerTest {
         }
     }
 
+    @Test fun clockSyncedObservationIsReusedWithoutASecondCoordinatorPreflightQuery() =
+        Fixture(deferCaptureWaits = true, syncClock = true, preserveUnassignedExisting = false).use { f ->
+            f.connectReady()
+            f.port.calls.clear()
+
+            f.startSelected()
+            assertEquals(listOf("status"), f.port.calls)
+            f.observe(idle())
+            assertEquals(listOf("status", "list", "time"), f.port.calls)
+            f.timeReply()
+            assertEquals(listOf("status", "list", "time", "status"), f.port.calls)
+
+            f.observe(idle())
+
+            assertEquals(listOf("status", "list", "time", "status", "list"), f.port.calls)
+            assertEquals(FreeLivingSessionPhase.START_REQUESTED, f.store.readPending()!!.phase)
+            assertEquals(1, f.waitCount(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS))
+            assertEquals(0, f.port.count("start"))
+
+            f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+            assertEquals(1, f.port.count("start"))
+            assertEquals(1, f.waitCount(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS))
+
+            f.runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+            f.observe(collecting(), listOf(initialRecord))
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertEquals(0, f.waitCount(FreeLivingCaptureCoordinator.START_POLL_INTERVAL_MS))
+        }
+
     @Test fun zeroClockOriginalIsFullyRereadOnEachConnectionAndCanStartAfterClockSync() = Fixture(syncClock = true).use { f ->
         val old = finalRecord.copy(unixMs = 0)
         f.owner.initialize(); f.owner.onConnected(f.port.generation)
@@ -828,7 +857,9 @@ class RealCollectionControllerTest {
         f.battery()
         assertTrue(f.owner.state.canStart)
         assertNull(f.store.read())
+        val statusChecksBeforeStart = f.port.count("status")
         f.startSelected()
+        assertEquals(statusChecksBeforeStart + 1, f.port.count("status"))
         f.observe(idle().copy(errorCode = -16), reason = 1)
         assertEquals(2, f.port.count("battery"))
         assertEquals(0, f.port.count("start"))
