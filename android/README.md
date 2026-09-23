@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前工作版本：**步数采集 0.8.16（versionCode 58）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，长时真实链路见[验证记录E41](../specs/independent-step-collection/validation.md#e41华为长时真实链路与恢复收口2026-09-23)，开始／结束时序见E42，同页收尾与净安装交付见E43。
+当前工作版本：**步数采集 0.8.17（versionCode 59）**，应用ID为`com.nexthci.ringfitness.steps`。本版以原版Android 0.5.3为实验设计和设备行为的默认参考；现行需求见[功能规格](../specs/independent-step-collection/requirements.md)，实施顺序见[执行计划](../specs/independent-step-collection/plan.md)，长时真实链路见[验证记录E41](../specs/independent-step-collection/validation.md#e41华为长时真实链路与恢复收口2026-09-23)，开始／结束时序见E42，同页收尾见E43，充电检查与断线页面修复见E44。
 
 ## 当前流程
 
@@ -8,7 +8,7 @@
 
 1. 首次填写研究者分配的用户名，选择佩戴位置和戒指；日常打开恢复已保存信息。
 2. 每段重新选择走路或跑步，佩戴设备、清零计步器，再开始采集。
-3. 戒指确认开始后显示“正在采集”；点击结束后立即在同一收尾页填写非负整数总步数，`0`有效，STOP及Flash记录确认在后台继续。
+3. 开始前核对戒指未充电；当前连接确认采集后显示“正在采集”。断线时原位显示“采集状态待确认”和稳定重连入口，恢复只查询同一段。点击结束后立即在同一收尾页填写非负整数总步数，`0`有效，STOP及Flash记录确认在后台继续。
 4. 戒指确认结束后，在原页选择：
    - **保存并上传：** 先保存参考值，再下载并校验原始文件；手机保存完整后由后台上传。
    - **暂存到戒指：** 先保存参考值，原始文件保留在戒指，不自动下载或上传；用户稍后从首页或记录中执行“下载并上传”。

@@ -2704,13 +2704,13 @@ class RealCollectionControllerTest {
                 if (it == "connect" && attempt % 2 == 1) throw SecurityException("Injected permission loss")
                 it != "connect"
             }
-            f.runDelay(3_000)
+            f.runDelay(if (attempt < RealCollectionController.FAST_RECONNECT_ATTEMPTS) 3_000 else 60_000)
             assertFalse(f.owner.state.connecting)
             assertTrue(f.owner.state.canRetry)
             assertEquals(original.sessionId, f.store.readPending()!!.sessionId)
         }
         f.port.accept = { true }
-        f.runDelay(3_000)
+        f.runDelay(60_000)
         f.owner.onConnected(f.port.generation)
         f.observe(collecting(), listOf(initialRecord))
         assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
@@ -2723,15 +2723,15 @@ class RealCollectionControllerTest {
         f.beginCollecting()
         val id = f.store.readPending()!!.sessionId
         f.owner.onDisconnected(f.port.generation, "戒指暂时不在附近")
-        repeat(6) {
-            f.runDelay(3_000)
+        repeat(6) { attempt ->
+            f.runDelay(if (attempt < RealCollectionController.FAST_RECONNECT_ATTEMPTS) 3_000 else 60_000)
             assertTrue(f.owner.state.connecting)
             f.runAllDelays(30_000)
             assertFalse(f.owner.state.connected)
             assertFalse(f.owner.state.connecting)
             assertEquals(id, f.store.readPending()!!.sessionId)
         }
-        f.runDelay(3_000)
+        f.runDelay(60_000)
         f.owner.onConnected(f.port.generation)
         f.observe(collecting(), listOf(initialRecord))
         assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
@@ -2872,8 +2872,100 @@ class RealCollectionControllerTest {
         }
     }
 
+    @Test fun productionReadinessRequiresFreshExplicitNotChargingReply() {
+        listOf<Int?>(1, 2, null).forEach { charge ->
+            Fixture(requireBattery = true, preserveUnassignedExisting = false).use { f ->
+                f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(idle())
+                assertFalse(f.owner.state.canStart)
+                assertEquals(1, f.port.count("battery"))
+                f.battery(charge)
+                assertFalse(f.owner.state.canStart)
+                assertTrue(f.owner.state.canRetry)
+                assertNull(f.store.readPending())
+                assertEquals(0, f.port.count("start"))
+                f.owner.reconnect(); f.owner.onConnected(f.port.generation); f.observe(idle()); f.battery(0)
+                assertTrue(f.owner.state.canStart)
+                assertNull(f.store.readPending())
+            }
+        }
+    }
+
+    @Test fun staleOrPreviousConnectionBatteryCannotAuthorizeStart() = Fixture(requireBattery = true).use { f ->
+        f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(idle())
+        f.owner.onBattery(f.port.generation - 1, SensorPacket.Battery(4100, 100, 0, ++f.clock.now))
+        assertFalse(f.owner.state.canStart)
+        f.clock.elapsed += 5_001
+        f.battery(0)
+        assertFalse(f.owner.state.canStart)
+        assertNull(f.store.readPending())
+        assertEquals(0, f.port.count("start"))
+    }
+
+    @Test fun releaseStartRechecksBatteryAfterClockSyncAndBlocksReentryIntoCaseDuringGuard() {
+        listOf(false, true).forEach { reenterCase ->
+            Fixture(requireBattery = true, syncClock = true, deferCaptureWaits = true,
+                preserveUnassignedExisting = false).use { f ->
+                f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(idle()); f.battery(0)
+                f.startSelected(); f.observe(idle()); f.battery(0); f.timeReply(); f.observe(idle())
+                assertEquals(0, f.port.count("start"))
+                f.battery(0)
+                if (reenterCase) f.battery(1)
+                f.runDelay(500)
+                assertEquals(if (reenterCase) 0 else 1, f.port.count("start"))
+                if (!reenterCase) {
+                    f.runDelay(1_000); f.observe(collecting(), listOf(initialRecord))
+                    assertTrue(f.owner.state.canStop)
+                } else {
+                    assertNull(f.store.readPending()!!.startConfirmedAtMs)
+                    assertNull(f.store.readPending()!!.startCommandDispatch)
+                    assertTrue(f.owner.state.canRetry)
+                    assertTrue(f.owner.state.error!!.contains("充电盒"))
+                    f.owner.retry(); f.owner.onConnected(f.port.generation); f.observe(idle())
+                    assertNull(f.store.readPending())
+                    f.owner.retry(); f.owner.onConnected(f.port.generation); f.observe(idle()); f.battery(0)
+                    assertTrue(f.owner.state.canStart)
+                    assertEquals(0, f.port.count("start"))
+                }
+            }
+        }
+    }
+
+    @Test fun failedGattBeforeReadyImmediatelyEnablesRetryAndRetiresTheThirtySecondTimeout() = Fixture().use { f ->
+        f.owner.initialize()
+        assertTrue(f.owner.state.connecting)
+        f.owner.onDisconnected(f.port.generation, "戒指连接已断开")
+        assertFalse(f.owner.state.connecting)
+        assertTrue(f.owner.state.canRetry)
+        val connections = f.port.count("connect")
+        f.runAllDelays(30_000)
+        assertEquals(connections, f.port.count("connect"))
+        assertFalse(f.owner.state.connecting)
+        assertNull(f.store.readPending())
+    }
+
+    @Test fun manualReconnectInterruptsBackoffAndOldTimerCannotCreateAnotherConnection() = Fixture().use { f ->
+        f.beginCollecting()
+        f.owner.onDisconnected(f.port.generation, "连接中断")
+        f.port.accept = { it != "connect" }
+        repeat(RealCollectionController.FAST_RECONNECT_ATTEMPTS) { f.runDelay(3_000) }
+        assertEquals(1, f.waitCount(60_000))
+        f.port.accept = { true }
+        f.owner.reconnect()
+        val connections = f.port.count("connect")
+        f.runDelay(60_000)
+        assertEquals(connections, f.port.count("connect"))
+        f.owner.onConnected(f.port.generation)
+        assertFalse(f.owner.state.canStop)
+        f.observe(collecting(), listOf(initialRecord))
+        assertTrue(f.owner.state.canStop)
+        assertEquals(1, f.port.count("start"))
+        f.owner.onDisconnected(f.port.generation, "再次中断")
+        assertEquals(1, f.waitCount(3_000))
+    }
+
     private inner class Fixture(private val uploads: RealUploadPort? = null,
         private val deferCaptureWaits: Boolean = false, private val syncClock: Boolean = false,
+        private val requireBattery: Boolean = false,
         private val preserveUnassignedExisting: Boolean = true,
         private val referenceDraftCommit: (File, File) -> Unit = { source, target -> replace(source, target) },
         profileLabel: String = "owner001",
@@ -2918,6 +3010,7 @@ class RealCollectionControllerTest {
             referenceDrafts = ReferenceDraftStore(File(directory, "reference-draft.json"),
                 referenceDraftCommit, {}),
             preserveUnassignedExisting = preserveUnassignedExisting, syncClockBeforeStart = syncClock,
+            requireBatteryBeforeStart = requireBattery,
             saveClockEvidence = { evidence, sessionId ->
                 if (failClockEvidence) throw IOException("校时证据保存失败")
                 clockEvidence += evidence to sessionId

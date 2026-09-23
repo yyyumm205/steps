@@ -1763,6 +1763,130 @@ class CollectionFlowInstrumentedTest {
         }
     }
 
+    @Test fun disconnectedCollectionDoesNotClaimLiveCaptureAndKeepsRecoveryActionInPlace() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val collecting = renderingSession(preparation).copy(
+                phase = FreeLivingSessionPhase.COLLECTING, stopRequestedAtMs = null, stopConfirmedAtMs = null)
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.RECOVERY,
+                taskPage = CollectionPage.RECOVERY, isSimulation = false, hasProfile = true,
+                participantId = preparation.participantId, placement = preparation.placement,
+                session = collecting, connected = false, canRetry = true))
+            renderFixture(scenario, fixture)
+            lateinit var recoveryAction: Button
+            lateinit var heading: TextView
+            scenario.onActivity { activity ->
+                heading = tagged(activity, "flow_heading")
+                assertEquals("采集状态待确认", heading.text.toString())
+                assertNull("An old start time must not keep a live capture timer running",
+                    taggedOrNull<TextView>(activity, "flow_elapsed"))
+                assertEquals("连接已中断", tagged<TextView>(activity, "flow_detail_戒指").text.toString())
+                recoveryAction = tagged(activity, "flow_primary")
+                assertEquals("重新连接", recoveryAction.text.toString())
+                assertTrue(recoveryAction.isEnabled)
+            }
+            repeat(3) {
+                fixture.state = fixture.state.copy(connecting = true, busy = true, canRetry = false,
+                    error = "正在连接戒指")
+                renderFixture(scenario, fixture)
+                scenario.onActivity { activity ->
+                    assertSame("A transport retry must retain the visible recovery action", recoveryAction,
+                        tagged<Button>(activity, "flow_primary"))
+                    assertSame(heading, tagged<TextView>(activity, "flow_heading"))
+                    assertEquals("连接中…", recoveryAction.text.toString())
+                    assertFalse(recoveryAction.isEnabled)
+                    assertNull(taggedOrNull<TextView>(activity, "flow_elapsed"))
+                }
+                fixture.state = fixture.state.copy(connecting = false, busy = false, canRetry = true,
+                    error = "连接超时，请唤醒戒指后重试")
+                renderFixture(scenario, fixture)
+                scenario.onActivity { activity ->
+                    assertSame(recoveryAction, tagged<Button>(activity, "flow_primary"))
+                    assertEquals("重新连接", recoveryAction.text.toString())
+                    assertTrue(recoveryAction.isEnabled)
+                }
+            }
+            captureReviewScreen(scenario, "real_collecting_disconnected")
+            click(scenario, "flow_primary")
+            assertEquals(1, fixture.reconnects)
+
+            // GATT connected alone is insufficient: wait for the current STATUS to confirm.
+            fixture.state = fixture.state.copy(connected = true, busy = true, canRetry = false, error = null)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("采集状态待确认", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertNull(taggedOrNull<TextView>(activity, "flow_elapsed"))
+                assertNull(taggedOrNull<Button>(activity, "flow_primary"))
+            }
+            fixture.state = fixture.state.copy(busy = false, canRetry = true,
+                error = "暂未收到确认，请重新检查戒指")
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("重新检查", tagged<Button>(activity, "flow_primary").text.toString())
+                assertTrue(tagged<Button>(activity, "flow_primary").isEnabled)
+            }
+            click(scenario, "flow_primary")
+            assertEquals(1, fixture.retries)
+            fixture.state = fixture.state.copy(page = CollectionPage.COLLECTING, taskPage = CollectionPage.COLLECTING,
+                canStop = true, busy = false, error = null)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("正在采集", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertNotNull(taggedOrNull<TextView>(activity, "flow_elapsed"))
+                assertEquals("结束采集", tagged<Button>(activity, "flow_primary").text.toString())
+            }
+            assertEquals(collecting, fixture.state.session)
+
+            fixture.state = fixture.state.copy(page = CollectionPage.RECOVERY, taskPage = CollectionPage.RECOVERY,
+                session = collecting.copy(phase = FreeLivingSessionPhase.START_REQUESTED, startConfirmedAtMs = null),
+                connected = false, connecting = true, canStop = false, busy = true, canRetry = false)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertEquals("开始状态待确认", tagged<TextView>(activity, "flow_heading").text.toString())
+                assertNull(taggedOrNull<TextView>(activity, "flow_elapsed"))
+                assertEquals("连接中…", tagged<Button>(activity, "flow_primary").text.toString())
+            }
+        }
+    }
+
+    @Test fun disconnectedCollectionHomeKeepsOneStableRecoveryAction() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val collecting = renderingSession(preparation).copy(
+                phase = FreeLivingSessionPhase.COLLECTING, stopRequestedAtMs = null, stopConfirmedAtMs = null)
+            val fixture = RenderingFlow(CollectionFlowState(page = CollectionPage.HOME,
+                taskPage = CollectionPage.RECOVERY, isSimulation = false, hasProfile = true,
+                participantId = preparation.participantId, placement = preparation.placement,
+                session = collecting, connected = false, canRetry = true))
+            renderFixture(scenario, fixture)
+            lateinit var action: Button
+            scenario.onActivity { activity ->
+                action = tagged(activity, "home_reconnect")
+                assertEquals("连接已中断", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertEquals("连接已中断", tagged<TextView>(activity, "home_device_status").text.toString())
+                assertNull(taggedOrNull<Button>(activity, "home_task_action"))
+            }
+            fixture.state = fixture.state.copy(connecting = true, busy = true, canRetry = false)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertSame(action, tagged<Button>(activity, "home_reconnect"))
+                assertEquals("连接中…", action.text.toString())
+                assertFalse(action.isEnabled)
+                assertEquals("连接已中断", tagged<TextView>(activity, "home_task_status").text.toString())
+                assertNull(taggedOrNull<Button>(activity, "home_task_action"))
+            }
+            fixture.state = fixture.state.copy(connecting = false, busy = false, canRetry = true)
+            renderFixture(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertSame(action, tagged<Button>(activity, "home_reconnect"))
+                assertTrue(action.isEnabled)
+                assertEquals("重新连接", action.text.toString())
+            }
+        }
+    }
+
     @Test fun disconnectAndReconnectKeepTheSameCollectingTaskAndRestoreItsStopAction() = withFlow { handle ->
         launch().use { scenario ->
             register(scenario)
@@ -1770,13 +1894,13 @@ class CollectionFlowInstrumentedTest {
             awaitHeading(scenario, "正在采集")
             val original = session(handle)
             handle.flow.disconnect()
-            awaitHeading(scenario, "正在采集")
+            awaitHeading(scenario, "采集状态待确认")
             captureReviewScreen(scenario, "disconnected")
             assertEquals(original, session(handle))
             click(scenario, "flow_back")
             awaitHeading(scenario, "步数采集")
             scenario.onActivity {
-                assertEquals("戒指未连接", tagged<TextView>(it, "home_task_status").text.toString())
+                assertEquals("连接已中断", tagged<TextView>(it, "home_task_status").text.toString())
                 assertEquals("重新连接", tagged<Button>(it, "home_reconnect").text.toString())
                 assertNull("The disconnected home has one reconnect action",
                     taggedOrNull<Button>(it, "home_task_action"))

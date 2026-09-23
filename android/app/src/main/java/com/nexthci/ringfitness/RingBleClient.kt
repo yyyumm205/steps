@@ -36,6 +36,8 @@ class RingBleClient(
         fun onRingsFound(rings: List<ScannedRing>)
         fun onSensorPacket(packet: SensorPacket)
         fun onBleError(message: String)
+        /** A connection attempt or active link ended, including before service readiness. */
+        fun onBleDisconnected(message: String) = Unit
     }
 
     private val appContext = context.applicationContext
@@ -275,6 +277,7 @@ class RingBleClient(
         gatt = null
         currentGatt?.close()
         listener.onBleState("手机蓝牙不可用，正在等待恢复…", false)
+        if (!stopped) listener.onBleDisconnected("手机蓝牙不可用，请开启蓝牙后重试")
         if (autoReconnect) scheduleReconnect()
     }
 
@@ -495,6 +498,7 @@ class RingBleClient(
             if (autoReconnect) "$message，正在等待自动重连…" else message,
             false,
         )
+        if (!stopped) listener.onBleDisconnected(message)
         if (autoReconnect) scheduleReconnect()
     }
 

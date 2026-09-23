@@ -52,6 +52,8 @@ class RealCollectionController(
      */
     private val preserveUnassignedExisting: Boolean = false,
     private val syncClockBeforeStart: Boolean = false,
+    /** Release builds verify that the ring is out of its charging case before START. */
+    private val requireBatteryBeforeStart: Boolean = false,
     private val saveClockEvidence: (PhoneClockSyncEvidence, String?) -> Unit = { evidence, sessionId ->
         PhoneClockSync.save(directory, evidence, sessionId)
     },
@@ -122,6 +124,11 @@ class RealCollectionController(
         "戒指记录仍在整理，已保存当前数据，请稍后重试",
     )
     private var reconnectScheduledGeneration: Long? = null
+    /** Short recovery bursts back off while the ring is away; manual retry remains immediate. */
+    private var automaticReconnectAttempts = 0
+    private data class BatteryObservation(val generation: Long, val packet: SensorPacket.Battery, val elapsedMs: Long)
+    private var latestBattery: BatteryObservation? = null
+    private var startBatteryBlocked = false
     private var closed = false
     private var saving = false
     private var referenceDraft: String? = null
@@ -156,6 +163,7 @@ class RealCollectionController(
         val errorBaseline: HealthRecordObservation? = null, var status: SensorPacket.Health? = null,
         val records: MutableList<HealthMessage.ListItem> = mutableListOf(),
         var batteryRequestedAtMs: Long? = null, var observation: HealthRecordObservation? = null,
+        var batteryRequestedElapsedMs: Long? = null,
         val startedAtElapsedMs: Long)
 
     @Volatile override var state = CollectionFlowState(isSimulation = false, uploadAvailable = uploadAvailable,
@@ -165,6 +173,15 @@ class RealCollectionController(
     private val coordinator: FreeLivingCaptureCoordinator = FreeLivingCaptureCoordinator(store,
         object : HealthControlPort by port {
             override fun start(): Boolean {
+                if (requireBatteryBeforeStart) {
+                    val battery = latestBattery
+                    if (battery == null || battery.generation != generation || battery.packet.chargeStatus != 0 ||
+                        clock.nowElapsedMs() - battery.elapsedMs !in 0..ChargingStartCompatibility.FRESHNESS_MS ||
+                        clock.nowEpochMs() - battery.packet.receivedEpochMs !in 0..ChargingStartCompatibility.FRESHNESS_MS) {
+                        startBatteryBlocked = true
+                        return false
+                    }
+                }
                 if (syncClockBeforeStart || unknownPreservation != null) requireFreshClockEvidence(requireNotNull(boundClockEvidence))
                 unknownPreservation?.let { proof ->
                     require(proof.generation == generation &&
@@ -193,7 +210,10 @@ class RealCollectionController(
                 }
                 publish(CollectionPage.STARTING)
             }
-            CaptureControlPhase.COLLECTING -> publish(CollectionPage.COLLECTING)
+            CaptureControlPhase.COLLECTING -> {
+                automaticReconnectAttempts = 0
+                publish(CollectionPage.COLLECTING)
+            }
             CaptureControlPhase.STOPPING -> publish(CollectionPage.STOPPING)
             CaptureControlPhase.AWAITING_REFERENCE -> {
                 if (control.observation != null) stopEvidenceGeneration = generation
@@ -210,6 +230,8 @@ class RealCollectionController(
                 CaptureControlIssue.CONNECTION_LOST, CaptureControlIssue.NOT_CONNECTED -> "连接中断，请将戒指放在手机附近"
                 CaptureControlIssue.START_ARCHIVE_BLOCKED -> "请先完成本次记录的数据保全"
                 CaptureControlIssue.DEVICE_ERROR -> "戒指返回异常，请重新连接后再试"
+                CaptureControlIssue.COMMAND_NOT_ACCEPTED -> if (startBatteryBlocked)
+                    "请将戒指取出充电盒后重新检查" else "戒指暂未接受操作，请重新检查"
                 else -> "暂未收到确认，请重新检查戒指"
             })
             CaptureControlPhase.STORAGE_ERROR -> publish(CollectionPage.ERROR, "暂时无法保存，请检查手机空间后重试")
@@ -326,7 +348,9 @@ class RealCollectionController(
             reconnectScheduledGeneration == generation) return
         val failedGeneration = generation
         reconnectScheduledGeneration = failedGeneration
-        scheduler.schedule(RECONNECT_DELAY_MS) {
+        val delay = if (automaticReconnectAttempts < FAST_RECONNECT_ATTEMPTS) RECONNECT_DELAY_MS else RECONNECT_BACKOFF_MS
+        automaticReconnectAttempts = minOf(automaticReconnectAttempts + 1, FAST_RECONNECT_ATTEMPTS)
+        scheduler.schedule(delay) {
             if (!closed && generation == failedGeneration && reconnectScheduledGeneration == failedGeneration) safely {
                 reconnectScheduledGeneration = null
                 if (!connected && !connecting && (store.readPending() != null || backupGapRecovery != null)) connect()
@@ -575,11 +599,13 @@ class RealCollectionController(
                 } else if (current == null) {
                     if (backupObservation != null) {
                         continueExistingBackup(observation)
-                    } else if (ChargingStartCompatibility.isCandidate(observation.status, statusPacket.statusErrorReason)) {
+                    } else if ((requireBatteryBeforeStart && !observation.status.collecting && observation.status.errorCode == 0) ||
+                        ChargingStartCompatibility.isCandidate(observation.status, statusPacket.statusErrorReason)) {
                         query = round
                         round.observation = observation
                         round.batteryRequestedAtMs = clock.nowEpochMs()
-                        check(port.queryBattery()) { "未能读取充电状态，请重新连接" }
+                        round.batteryRequestedElapsedMs = clock.nowElapsedMs()
+                        check(port.queryBattery()) { "充电状态尚未确认，请重新连接" }
                     } else finishReadinessInspection(round, observation)
                 } else if (current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.reference != null &&
                     current.completionPolicy != null && !current.isRingDeferred) {
@@ -593,6 +619,7 @@ class RealCollectionController(
 
     fun onBattery(connection: Long, packet: SensorPacket.Battery) = safely {
         if (closed || connection != generation || !connected) return@safely
+        latestBattery = BatteryObservation(connection, packet, clock.nowElapsedMs())
         val round = query
         val observed = round?.observation
         if (observed == null) {
@@ -604,9 +631,18 @@ class RealCollectionController(
             return@safely
         }
         query = null
-        val recovery = ChargingStartCompatibility.evidence(requireNotNull(round.status), packet, connection,
+        val status = requireNotNull(round.status)
+        val recovery = ChargingStartCompatibility.evidence(status, packet, connection,
             requireNotNull(round.batteryRequestedAtMs), clock.nowEpochMs())
-        if (recovery == null || clock.nowElapsedMs() - round.startedAtElapsedMs !in 0..ChargingStartCompatibility.FRESHNESS_MS) {
+        val batteryConfirmedIdle = packet.chargeStatus == 0 &&
+            packet.receivedEpochMs >= requireNotNull(round.batteryRequestedAtMs) &&
+            clock.nowEpochMs() - packet.receivedEpochMs in 0..ChargingStartCompatibility.FRESHNESS_MS &&
+            clock.nowElapsedMs() - requireNotNull(round.batteryRequestedElapsedMs) in 0..ChargingStartCompatibility.FRESHNESS_MS
+        val regularBatteryCheckPassed = requireBatteryBeforeStart &&
+            (status.message as HealthMessage.Status).errorCode == 0 && batteryConfirmedIdle
+        val freshChargingRecovery = recovery != null &&
+            clock.nowElapsedMs() - round.startedAtElapsedMs in 0..ChargingStartCompatibility.FRESHNESS_MS
+        if (!regularBatteryCheckPassed && !freshChargingRecovery) {
             timeRound = null
             lastIdle = null
             publish(CollectionPage.RECOVERY, if (packet.chargeStatus != null && packet.chargeStatus != 0)
@@ -625,6 +661,7 @@ class RealCollectionController(
 
     override fun start() = safely {
         if (!state.canStart || connecting || query != null || readinessWait != null || timeRound != null || downloader != null || backupObservation != null || saving) return@safely
+        startBatteryBlocked = false
         requestedActivity = requireNotNull(selectedActivity) { "请选择本次活动" }
         selectedActivity = null
         clearReferenceDraft()
@@ -992,6 +1029,7 @@ class RealCollectionController(
     override fun disconnect() = Unit // A page cannot tear down the collection connection.
     override fun reconnect() = safely {
         browsingHome = false
+        automaticReconnectAttempts = 0
         if (pendingDownload() != null || backupGapRecovery != null) downloadRecovery = null
         backupGapRecovery = null
         if (store.readPending()?.isRingDeferred == true) publish(CollectionPage.RING_PENDING) else connect()
@@ -1090,6 +1128,7 @@ class RealCollectionController(
                 }
             }
             lastIdle = observed
+            automaticReconnectAttempts = 0
             timeRound?.let { timing ->
                 val evidence = timing.evidence
                 if (evidence == null) { beginClockSync(observed); return }
@@ -1518,6 +1557,7 @@ class RealCollectionController(
         val progressed = durableOffset > recovery.durableHighWater ||
             (replayOffset != null && replayOffset > recovery.replayHighWater)
         if (progressed) {
+            automaticReconnectAttempts = 0
             recovery.failures = 0
             recovery.durableHighWater = maxOf(recovery.durableHighWater, durableOffset)
             recovery.replayHighWater = maxOf(recovery.replayHighWater, replayOffset ?: 0L)
@@ -1722,6 +1762,8 @@ class RealCollectionController(
 
     companion object {
         internal const val RECONNECT_DELAY_MS = 3_000L
+        internal const val FAST_RECONNECT_ATTEMPTS = 3
+        internal const val RECONNECT_BACKOFF_MS = 60_000L
         internal const val DOWNLOAD_RECOVERY_LIMIT = 3
         internal const val READ_WINDOW_BYTES = 8 * 1024
         internal const val TRANSFER_WATCHDOG_MS = 30_000L

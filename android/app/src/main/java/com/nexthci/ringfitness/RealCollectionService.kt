@@ -33,7 +33,6 @@ class RealCollectionService : Service() {
     private var controller: RealCollectionController? = null
     private var client: RingBleClient? = null // Accessed exclusively on main, like the GATT queue.
     @Volatile private var clientGeneration = 0L
-    private var clientWasReady = false
     @Volatile private var destroyed = false
     private var wakeLock: PowerManager.WakeLock? = null
     private var subscription: AutoCloseable? = null
@@ -66,20 +65,19 @@ class RealCollectionService : Service() {
                 val port = object : RealCollectionPort {
                     override fun connect(ring: PreparedRing, generation: Long): Boolean = onMain {
                         clientGeneration = generation
-                        clientWasReady = false
                         val next = RingBleClient(this@RealCollectionService, object : RingBleClient.Listener {
                             private fun active() = !destroyed && generation == clientGeneration
                             override fun onBleState(message: String, ready: Boolean) {
                                 if (!active()) return
                                 if (ready) {
                                     trace("connected generation=$generation")
-                                    clientWasReady = true
                                     submit { it.onConnected(generation) }
-                                } else if (clientWasReady) {
-                                    trace("disconnected generation=$generation")
-                                    clientWasReady = false
-                                    submit { it.onDisconnected(generation, "连接中断，请将戒指放在手机附近") }
                                 }
+                            }
+                            override fun onBleDisconnected(message: String) {
+                                if (!active()) return
+                                trace("disconnected generation=$generation")
+                                submit { it.onDisconnected(generation, message) }
                             }
                             override fun onSensorPacket(packet: SensorPacket) {
                                 if (!active()) return
@@ -127,7 +125,7 @@ class RealCollectionService : Service() {
                         trace("observation generation=${observation.connectionGeneration} status=${observation.status} records=${observation.records}")
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
                     }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
-                    syncClockBeforeStart = true, uploads = object : RealUploadPort {
+                    syncClockBeforeStart = true, requireBatteryBeforeStart = true, uploads = object : RealUploadPort {
                         override val available: Boolean = runCatching {
                             SeafileSessionTransport.validateLink(BuildConfig.ACTIVITY_UPLOAD_LINK.trim())
                         }.isSuccess
@@ -224,7 +222,6 @@ class RealCollectionService : Service() {
 
     private fun closeClient() {
         clientGeneration = -1
-        clientWasReady = false
         val previous = client
         client = null
         runCatching { previous?.stop() }
@@ -284,7 +281,10 @@ internal fun collectionForegroundText(state: CollectionFlowState): String {
         state.connecting -> "正在连接戒指"
         !state.connected && active -> "连接中断，正在保留本次记录"
         state.preservingExisting -> "正在准备戒指"
-        state.taskPage == CollectionPage.COLLECTING -> "正在采集，点此查看或结束"
+        state.taskPage == CollectionPage.COLLECTING ||
+            state.session?.phase == FreeLivingSessionPhase.COLLECTING ->
+            if (state.connected && state.canStop) "正在采集，点此查看或结束"
+            else "采集状态待确认，点此重新检查"
         state.taskPage == CollectionPage.STOPPING -> "正在确认结束"
         state.taskPage == CollectionPage.FINISH -> "采集已结束，请选择保存方式"
         state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)

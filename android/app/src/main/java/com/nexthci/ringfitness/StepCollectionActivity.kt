@@ -152,6 +152,16 @@ abstract class StepCollectionActivity : Activity() {
         }
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
+        // Transport retries update the existing recovery view in place. Rebuilding the whole
+        // Activity every time a GATT attempt begins/ends caused the reconnect action to flicker.
+        if (old != null && disconnectedCapture(old) && disconnectedCapture(state) &&
+            old.session?.sessionId == state.session?.sessionId &&
+            usesHomeSurface(old) == usesHomeSurface(state) &&
+            old.copy(connecting = state.connecting, busy = state.busy, canRetry = state.canRetry,
+                error = state.error) == state) {
+            updateCaptureRecoveryState(state)
+            return
+        }
         if (old != null && isPendingStopForm(old) &&
             old.session?.sessionId == state.session?.sessionId &&
             (isPendingStopForm(state) || isConfirmedFinishForm(state))) {
@@ -342,6 +352,14 @@ abstract class StepCollectionActivity : Activity() {
             state.placement?.displayName ?: "待选择佩戴位置",
         ).filter { it.isNotBlank() }.joinToString(" · "), 14f, muted = true).tag = "home_profile_summary"
         when {
+            disconnectedCapture(state) -> ui.button(deviceRow, "重新连接", tag = "home_reconnect") {
+                flow.reconnect()
+            }.apply {
+                isEnabled = !state.connecting && state.canRetry
+                text = if (state.connecting) "连接中…" else "重新连接"
+                layoutParams = LinearLayout.LayoutParams(-2, -2)
+                minimumHeight = ui.dp(48); minHeight = ui.dp(48)
+            }
             state.connecting || state.checkingDevice -> deviceRow.addView(ui.progress(),
                 LinearLayout.LayoutParams(ui.dp(28), ui.dp(28)))
             !state.connected && state.canRetry && state.session?.isRingDeferred != true -> ui.button(deviceRow, "重新连接", tag = "home_reconnect") {
@@ -526,6 +544,8 @@ abstract class StepCollectionActivity : Activity() {
         state.canRecordReferenceLocally -> if (state.session?.completionPolicy == null)
             HomeTask("采集已结束", "待保存本段", "继续收尾")
         else HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
+        disconnectedCapture(state) -> HomeTask("本次采集", "连接已中断", "重新连接",
+            "请将戒指取出充电盒并靠近手机。")
         state.connecting -> HomeTask("设备", "正在连接戒指", "连接中…", "请将戒指放在手机附近。")
         !state.connected -> HomeTask("设备", "戒指未连接", "重新连接",
             displayError(state.error) ?: "将戒指靠近手机后重试。")
@@ -540,7 +560,9 @@ abstract class StepCollectionActivity : Activity() {
         state.session == null -> HomeTask("设备", "戒指暂未就绪", "重新检查", displayError(state.error))
         else -> when (state.taskPage) {
             CollectionPage.STARTING -> HomeTask("本次采集", "正在确认开始", "查看进度", "请站定等候。")
-            CollectionPage.COLLECTING -> HomeTask("采集进行中", "正在采集", "查看采集")
+            CollectionPage.COLLECTING -> if (state.connected && state.canStop)
+                HomeTask("采集进行中", "正在采集", "查看采集")
+            else HomeTask("本次采集", "采集状态待确认", "重新检查")
             CollectionPage.STOPPING -> HomeTask("本次采集", "正在确认结束", "查看进度", "请站定等候。")
             CollectionPage.FINISH -> HomeTask("采集已结束", "待保存本段", "继续收尾")
             CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
@@ -607,14 +629,22 @@ abstract class StepCollectionActivity : Activity() {
                 FreeLivingSessionPhase.COLLECTING
             else -> FreeLivingSessionPhase.START_REQUESTED
         }
+        // A persisted session phase alone does not prove that the ring is still collecting.
+        // The production screen may claim "正在采集" only while the controller has a live
+        // connection and the ring has explicitly confirmed the collecting state.
+        val confirmedCollecting = phase == FreeLivingSessionPhase.COLLECTING && state.connected && state.canStop
         val heading = when (phase) {
-            FreeLivingSessionPhase.START_REQUESTED -> if (state.canStopUnconfirmedStart) "需要结束本次记录" else "正在开始"
-            FreeLivingSessionPhase.COLLECTING -> "正在采集"
+            FreeLivingSessionPhase.START_REQUESTED -> when {
+                state.canStopUnconfirmedStart -> "需要结束本次记录"
+                !state.connected -> "开始状态待确认"
+                else -> "正在开始"
+            }
+            FreeLivingSessionPhase.COLLECTING -> if (confirmedCollecting) "正在采集" else "采集状态待确认"
             FreeLivingSessionPhase.STOP_REQUESTED -> "正在结束"
             else -> "本次采集"
         }
         val subtitle = when {
-            !state.connected -> "正在恢复与戒指的连接。"
+            !state.connected -> "请将戒指取出充电盒并靠近手机。"
             state.canStopUnconfirmedStart -> "结束后会保存已经产生的数据。"
             phase == FreeLivingSessionPhase.START_REQUESTED -> "确认后再开始活动。"
             phase == FreeLivingSessionPhase.STOP_REQUESTED -> "请保持站定，等待戒指停止。"
@@ -622,7 +652,7 @@ abstract class StepCollectionActivity : Activity() {
         }
         title(body, heading, subtitle)
         val card = ui.card(body, ui.statusSurface)
-        if (phase == FreeLivingSessionPhase.COLLECTING) {
+        if (phase == FreeLivingSessionPhase.COLLECTING && confirmedCollecting) {
             ui.text(card, "本次时长", 14f)
             ui.gap(card, 14)
             elapsedLabel = ui.text(card, "00:00:00", 44f, bold = true).apply {
@@ -634,23 +664,33 @@ abstract class StepCollectionActivity : Activity() {
             detail(card, "开始时间", startDateTime(session))
             updateElapsed()
         } else {
-            card.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply {
+            card.addView(ui.progress().apply {
+                tag = "capture_progress"
+                visibility = if (state.busy || state.connecting) View.VISIBLE else View.GONE
+            }, LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply {
                 gravity = Gravity.CENTER
             })
             ui.gap(card, 18)
             val progress = when {
-                !state.connected -> "记录已保留，正在重新连接"
+                !state.connected -> if (state.connecting) "正在重新连接戒指" else "等待重新连接"
+                !state.busy && state.canRetry -> "请重新检查戒指状态"
                 phase == FreeLivingSessionPhase.START_REQUESTED -> "正在启动戒指"
                 phase == FreeLivingSessionPhase.STOP_REQUESTED -> "正在保存最后数据"
                 else -> "正在核对戒指状态"
             }
-            ui.text(card, progress,
-                16f, bold = true).gravity = Gravity.CENTER
+            ui.text(card, progress, 16f, bold = true).apply {
+                tag = "capture_progress_text"
+                gravity = Gravity.CENTER
+            }
+            if (session?.startConfirmedAtMs != null) {
+                ui.gap(card, 20)
+                detail(card, "开始时间", startDateTime(session))
+            }
         }
         ui.gap(card, 18)
         detail(card, "活动", session?.takeIf { it.isPending }?.activity?.label ?: "正在准备")
         ui.gap(card, 14)
-        detail(card, "戒指", connectionLabel(state))
+        detail(card, "戒指", if (!state.connected) "连接已中断" else connectionLabel(state))
         if (phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference != null) {
             ui.gap(card, 14)
             detail(card, "计步器读数", session.reference.steps?.let { "$it 步 · 已保存" } ?: "已保存")
@@ -663,8 +703,14 @@ abstract class StepCollectionActivity : Activity() {
             }
             state.canStopUnconfirmedStart && !state.busy ->
                 action(footer, "结束并保存数据") { flow.stop() }
-            !state.connected && state.canRetry && !state.connecting ->
-                action(footer, "重新连接") { flow.reconnect() }
+            !state.connected && session?.isPending == true ->
+                // Keep one stable recovery entry while the controller performs its bounded
+                // automatic reconnect attempts. It remains visible (disabled while connecting)
+                // instead of flashing in and out with each transport retry.
+                action(footer, if (state.connecting) "连接中…" else "重新连接",
+                    enabled = !state.connecting && state.canRetry) { flow.reconnect() }
+            phase == FreeLivingSessionPhase.COLLECTING && !confirmedCollecting && state.canRetry && !state.busy ->
+                action(footer, "重新检查") { flow.retry() }
             phase == FreeLivingSessionPhase.START_REQUESTED && state.canEndStartAttempt && !state.busy ->
                 action(footer, "结束本次") { showEndStartAttempt() }
             phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference == null ->
@@ -1084,6 +1130,7 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun connectionLabel(state: CollectionFlowState): String = when {
+        disconnectedCapture(state) -> "连接已中断"
         state.connecting -> "正在连接"
         !state.connected -> "未连接"
         state.preservingExisting -> "正在准备"
@@ -1091,6 +1138,27 @@ abstract class StepCollectionActivity : Activity() {
         state.session?.isPending == true -> "已连接"
         state.canStart -> "可以开始"
         else -> "需要检查"
+    }
+
+    private fun disconnectedCapture(state: CollectionFlowState): Boolean =
+        !state.connected && state.session?.let {
+            it.isPending && it.phase in setOf(
+                FreeLivingSessionPhase.START_REQUESTED,
+                FreeLivingSessionPhase.COLLECTING,
+            )
+        } == true
+
+    private fun updateCaptureRecoveryState(state: CollectionFlowState) {
+        listOf("flow_primary", "home_reconnect").forEach { tag ->
+            window.decorView.findViewWithTag<Button>(tag)?.apply {
+                text = if (state.connecting) "连接中…" else "重新连接"
+                isEnabled = !state.connecting && state.canRetry
+            }
+        }
+        window.decorView.findViewWithTag<View>("capture_progress")?.visibility =
+            if (state.connecting) View.VISIBLE else View.GONE
+        window.decorView.findViewWithTag<TextView>("capture_progress_text")?.text =
+            if (state.connecting) "正在重新连接戒指" else "等待重新连接"
     }
 
     private fun openPreparationSettings() {
