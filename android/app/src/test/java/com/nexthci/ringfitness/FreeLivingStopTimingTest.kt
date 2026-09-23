@@ -20,7 +20,7 @@ class FreeLivingStopTimingTest {
     private val finalRecord = record.copy(bytes = 64, records = 4)
     private val stopped = HealthMessage.Status(false, 64, 4, 0, 7)
 
-    @Test fun stopIsPersistedAndSentOnceThenWaitsBeforeTheFirstConfirmationQuery() {
+    @Test fun stopUsesTwoEarlyMatchingSnapshotsInsteadOfAFixedFiveSecondWait() {
         val f = Fixture()
         f.begin()
         val before = f.count("status")
@@ -38,31 +38,31 @@ class FreeLivingStopTimingTest {
         assertFalse(f.coordinator.state.settling)
         assertNotNull(f.coordinator.state.timeoutOperationId)
         f.health(stopped)
-        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
-        assertTrue(f.coordinator.state.settling)
-        assertEquals(listsBeforeStop, f.count("list"))
-        f.advance(4_999)
-        assertEquals(before + 1, f.count("status"))
-        assertEquals(listsBeforeStop, f.count("list"))
-        f.advance(1)
-        assertEquals(before + 1, f.count("status"))
         assertEquals(listsBeforeStop + 1, f.count("list"))
         f.health(finalRecord)
         f.health(HealthMessage.ListEnd(1))
+        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
+        assertTrue(f.coordinator.state.settling)
+        assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+        f.advance(999)
+        assertEquals(before + 1, f.count("status"))
+        f.advance(1)
+        assertEquals(before + 2, f.count("status"))
+        f.observe(stopped, finalRecord)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
+        assertEquals(listsBeforeStop + 2, f.count("list"))
         assertEquals(1, f.count("stop"))
     }
 
-    @Test fun sameRecordStillCollectingGetsAnotherReadOnlyRoundBeforeTheReferencePage() {
+    @Test fun oneStillCollectingReplyThenTwoStableStoppedSnapshotsConfirmWithoutResendingStop() {
         val f = Fixture()
         f.begin()
         f.coordinator.requestStop()
         f.advance(500)
-        f.observe(active.copy(bytes = 40, records = 3), record.copy(bytes = 48, records = 3))
+        f.health(active.copy(bytes = 40, records = 3))
         assertTrue(f.coordinator.state.settling)
         assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
         assertNull(f.store.readPending()!!.stopConfirmedAtMs)
-        assertEquals(48L, f.store.readPending()!!.deviceRecordEvidence!!.record.bytes)
         val before = f.calls.toList()
         repeat(2) { f.coordinator.requestStop(); f.coordinator.reconcile(); f.coordinator.requestStart(profile) }
         assertEquals(before, f.calls)
@@ -71,33 +71,69 @@ class FreeLivingStopTimingTest {
         f.advance(1)
         f.observe(stopped, finalRecord)
         assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
-        f.advance(5_000)
+        assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+        f.advance(1_000)
         f.observe(stopped, finalRecord)
         assertEquals(CaptureControlPhase.AWAITING_REFERENCE, f.coordinator.state.phase)
         assertEquals(1, f.count("stop"))
     }
 
-    @Test fun collectingStopStatusContinuesBeyondThreeRoundsWithoutRepeatingStop() {
+    @Test fun collectingStopStatusHasAGlobalBoundWithoutRepeatingStop() {
         val f = Fixture()
         f.begin()
         val initialQueries = f.count("status")
         val initialLists = f.count("list")
         f.coordinator.requestStop()
         val request = f.store.readPending()!!.stopRequestedAtMs
-        repeat(3) { index ->
-            f.advance(if (index == 0) 5_000 else 1_500)
+        var replies = 0
+        while (f.coordinator.state.phase == CaptureControlPhase.STOPPING &&
+            replies < FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT) {
+            f.advance(if (replies == 0) FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS
+                else FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
+            assertEquals(initialQueries + replies + 1, f.count("status"))
             f.health(active)
+            replies++
         }
-        assertEquals(initialQueries + 3, f.count("status"))
+        assertEquals(FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT, replies)
+        assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, f.coordinator.state.issue)
+        assertEquals(initialQueries + replies, f.count("status"))
         assertEquals(initialLists, f.count("list"))
-        assertEquals(CaptureControlPhase.STOPPING, f.coordinator.state.phase)
-        assertTrue(f.coordinator.state.settling)
-        f.advance(1_000)
-        assertEquals(initialQueries + 4, f.count("status"))
         assertEquals(1, f.count("stop"))
-        assertNull(f.coordinator.state.issue)
         assertEquals(request, f.store.readPending()!!.stopRequestedAtMs)
         assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+        val calls = f.calls.toList()
+        f.advance(30_000)
+        assertEquals(calls, f.calls)
+    }
+
+    @Test fun continuouslyGrowingStoppedFingerprintHasAGlobalBound() {
+        val f = Fixture()
+        f.begin()
+        val initialQueries = f.count("status")
+        val initialLists = f.count("list")
+        f.coordinator.requestStop()
+        var snapshots = 0
+        while (f.coordinator.state.phase == CaptureControlPhase.STOPPING &&
+            snapshots < FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT) {
+            f.advance(if (snapshots == 0) FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS
+                else FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
+            assertEquals(initialQueries + snapshots + 1, f.count("status"))
+            val bytes = 64L + snapshots.toLong() * 16L
+            val samples = 4L + snapshots.toLong()
+            f.observe(stopped.copy(bytes = bytes, records = samples),
+                finalRecord.copy(bytes = bytes, records = samples))
+            assertEquals(initialLists + snapshots + 1, f.count("list"))
+            snapshots++
+        }
+        assertTrue(snapshots in 2..FreeLivingCaptureCoordinator.STOP_RECOVERY_POLL_LIMIT)
+        assertEquals(CaptureControlPhase.NEEDS_REVIEW, f.coordinator.state.phase)
+        assertEquals(CaptureControlIssue.UNEXPECTED_DEVICE_STATE, f.coordinator.state.issue)
+        assertEquals(1, f.count("stop"))
+        assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+        val calls = f.calls.toList()
+        f.advance(30_000)
+        assertEquals(calls, f.calls)
     }
 
     @Test fun identityChangesAndCounterRegressionStopPollingAndRetainTheJournal() {
