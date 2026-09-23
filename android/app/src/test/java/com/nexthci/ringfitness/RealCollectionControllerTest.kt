@@ -122,7 +122,7 @@ class RealCollectionControllerTest {
         assertTrue(f.owner.state.canStart)
         assertEquals(2, File(f.directory, "device-backups").listFiles()!!.size)
         f.startSelected(); f.observe(stopped(), listOf(old)); f.timeReply()
-        f.observe(stopped(), listOf(old)); f.observe(stopped(), listOf(old))
+        f.observe(stopped(), listOf(old))
         assertEquals(1, f.port.count("start"))
         val sync = f.clockEvidence.last().first
         val next = initialRecord.copy(uptimeMs = 1_000, unixMs = sync.deviceUnixMs + 500)
@@ -152,7 +152,7 @@ class RealCollectionControllerTest {
         f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(old))
         f.finishDownload(); f.observe(stopped(), listOf(old))
         f.startSelected(); f.observe(stopped(), listOf(old)); f.timeReply()
-        f.observe(stopped(), listOf(old)); f.observe(stopped(), listOf(old))
+        f.observe(stopped(), listOf(old))
         f.observeUnconfirmedStart(stopped(), listOf(old))
         assertTrue(f.owner.state.canEndStartAttempt)
         f.owner.endStartAttempt("设备未开始")
@@ -172,7 +172,7 @@ class RealCollectionControllerTest {
             f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(old))
             f.finishDownload(); f.observe(stopped(), listOf(old))
             f.startSelected(); f.observe(stopped(), listOf(old)); f.timeReply()
-            f.observe(stopped(), listOf(old)); f.observe(stopped(), listOf(old))
+            f.observe(stopped(), listOf(old))
             val sync = f.clockEvidence.last().first
             val first = initialRecord.copy(sessionId = 8, uptimeMs = 1_000,
                 unixMs = if (knownClock) sync.deviceUnixMs + 500 else 0)
@@ -319,7 +319,7 @@ class RealCollectionControllerTest {
         f.owner.stop(); f.owner.retry()
         assertEquals(queries, f.port.count("status"))
         assertEquals(1, f.port.count("stop"))
-        f.runDelay(5_000)
+        f.runDelay(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
         repeat(3) { attempt ->
             f.observe(collecting, listOf(initial))
             if (attempt < 2) f.runDelay(FreeLivingCaptureCoordinator.STOP_POLL_INTERVAL_MS)
@@ -403,7 +403,7 @@ class RealCollectionControllerTest {
         assertNull(f.owner.state.error)
         assertEquals(CollectionPage.HOME, f.owner.state.page)
         f.startSelected(); f.observe(stopped(), old); f.timeReply()
-        f.observe(stopped(), old); f.observe(stopped(), old)
+        f.observe(stopped(), old)
         val fresh = initialRecord.copy(sessionId = 9, uptimeMs = 2_000, unixMs = epoch + 60_000)
         f.observe(collecting().copy(sessionId = 9), old + fresh)
         assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
@@ -2572,8 +2572,7 @@ class RealCollectionControllerTest {
         f.timeReply()
         assertEquals(1, f.clockEvidence.size)
         assertNull(f.clockEvidence.single().second)
-        f.observe(idle()) // Post-sync unchanged record snapshot.
-        f.observe(idle()) // Capture preflight is still required.
+        f.observe(idle()) // This post-sync snapshot is also the capture preflight.
         assertEquals(1, f.port.count("start"))
         assertEquals(f.store.readPending()!!.sessionId, f.clockEvidence.last().second)
         assertEquals(f.clockEvidence.first().first, f.clockEvidence.last().first)
@@ -2598,7 +2597,7 @@ class RealCollectionControllerTest {
         assertEquals(0, f.port.count("start"))
         f.timeReply()
         assertEquals(1, f.clockEvidence.size)
-        f.observe(idle()); f.observe(idle())
+        f.observe(idle())
         assertEquals(1, f.port.count("start"))
     }
 
@@ -2623,7 +2622,7 @@ class RealCollectionControllerTest {
             f.timeReply(synced = mode != "unsynced")
             if (mode == "binding") {
                 f.failClockEvidence = true
-                f.observe(idle()); f.observe(idle())
+                f.observe(idle())
             }
             assertEquals("mode=$mode", 0, f.port.count("start"))
             assertEquals(CollectionPage.ERROR, f.owner.state.page)
@@ -2675,25 +2674,23 @@ class RealCollectionControllerTest {
         }
     }
 
-    @Test fun phoneClockChangeAfterSyncBlocksPreflightAndActualStart() {
-        for (duringWait in listOf(false, true)) Fixture(syncClock = true, deferCaptureWaits = true).use { f ->
-            f.connectReady(); f.startSelected(); f.observe(idle()); f.timeReply(); f.observe(idle())
-            if (!duringWait) f.clock.now += 5_000
-            f.observe(idle())
-            if (duringWait) {
-                f.clock.now += 5_000
-                f.runDelay(500)
-            }
-            assertEquals(0, f.port.count("start"))
-            assertTrue(f.owner.state.canRetry)
-        }
+    @Test fun phoneClockChangeCannotCrossTheDelayedStartBoundary() =
+        Fixture(syncClock = true, deferCaptureWaits = true).use { f ->
+        f.connectReady(); f.startSelected(); f.observe(idle()); f.timeReply(); f.observe(idle())
+        assertEquals(1, f.waitCount(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS))
+        f.clock.now += 5_000
+        f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+        assertEquals(0, f.port.count("start"))
+        assertTrue(f.owner.state.canRetry)
     }
 
-    @Test fun expiredClockEvidenceCannotStartAfterSlowPreflight() = Fixture(syncClock = true).use { f ->
+    @Test fun expiredClockEvidenceCannotCrossTheDelayedStartBoundary() =
+        Fixture(syncClock = true, deferCaptureWaits = true).use { f ->
         f.connectReady(); f.startSelected(); f.observe(idle()); f.timeReply(); f.observe(idle())
+        assertEquals(1, f.waitCount(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS))
         f.clock.now += PhoneClockSync.MAX_START_AGE_MS + 1
         f.clock.elapsed += PhoneClockSync.MAX_START_AGE_MS + 1
-        f.observe(idle())
+        f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
         assertEquals(0, f.port.count("start"))
         assertTrue(f.owner.state.canRetry)
     }
@@ -2953,7 +2950,7 @@ class RealCollectionControllerTest {
             owner.initialize(); owner.onConnected(port.generation); observe(stopped(), listOf(old))
             finishDownload(); observe(stopped(), listOf(old))
             startSelected(); observe(stopped(), listOf(old)); timeReply()
-            observe(stopped(), listOf(old)); observe(stopped(), listOf(old))
+            observe(stopped(), listOf(old))
             if (deferCaptureWaits) { runDelay(500); runDelay(1_000) }
             val initial = initialRecord.copy(sessionId = if (keepOld) 8 else 7, uptimeMs = 1_000, unixMs = 0,
                 bytes = if (empty) 0 else initialRecord.bytes, records = if (empty) 0 else initialRecord.records)
