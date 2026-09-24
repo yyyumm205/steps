@@ -1,6 +1,6 @@
 # 独立计步实验 App：分段采集验收与证据
 
-依据：[总纲](../../CONSTITUTION.md)3.9.0、[需求](requirements.md)、[计划](plan.md)。当前工作版本为0.8.17（59），研究导入器为0.2.5；数字保存与无读数放弃见E34，原版戒指暂存见E35，上传结果边界与研究库加固见E36，保存恢复见E37，恢复兼容与有限下载见E38，忽略无归属历史见E39，长时下载与页面恢复见E40，华为真实长时链路与恢复收口见E41，开始／结束确认延迟收口见E42，同页收尾见E43，充电检查与断线恢复修复见E44。顶层检查项描述当前走路/跑步分段及三种收尾；历史证据保留原版本的运行结果和适用范围，未执行项保持待执行。
+依据：[总纲](../../CONSTITUTION.md)3.9.0、[需求](requirements.md)、[计划](plan.md)。当前工作版本为0.8.18（60），研究导入器为0.2.5；数字保存与无读数放弃见E34，原版戒指暂存见E35，上传结果边界与研究库加固见E36，保存恢复见E37，恢复兼容与有限下载见E38，忽略无归属历史见E39，长时下载与页面恢复见E40，华为真实长时链路与恢复收口见E41，开始／结束确认延迟收口见E42，同页收尾见E43，充电检查与断线恢复修复见E44，华为约3小时完整链路见E45。顶层检查项描述当前走路/跑步分段及三种收尾；历史证据保留原版本的运行结果和适用范围，未执行项保持待执行。
 
 现行交付口径（2026-09-21用户确认）：以被试可正常使用、研究端正确读回为开发验收终点，取消独立试运行阶段和预设采集天数；真实设备、关键恢复、长时及独立操作检查继续执行，交付公布已验证设备、时长和限制。历史记录中的试用安排保留为当时背景，实际完成状态以对应证据为准。
 
@@ -1169,3 +1169,17 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 | 签名与原位更新 | 三星SM-F7310／Android14从0.8.16原位升级至0.8.17；首次安装时间保持，更新后仍为00:13跑步段的收尾页，读数尚未填写，崩溃缓冲为空 | 手机base.apk与交付文件SHA-256一致；私有文件不可直接读取，因此本轮不声称逐文件哈希全部核对 |
 
 正式包：`android/dist/0.8.17/RingFitness-Steps-0.8.17.apk`；SHA-256：`e09d04e026f06b506e4e648fac650609d0e4d4141b4818a6ffe573d13fe1af56`。签名v3有效、版本59、正式包不可调试。原始日志、UI树、截图及测试输出保存在`.local/validation/2026-09-24-ring-box/`。下一项为离盒后的真实短采、真实充电切换与早期连接失败复测；既有小米／整机重启／10小时范围继续按原计划记录。
+
+## E45：华为约3小时记录的完整下载与上传（2026-09-24）
+
+华为ELS-AN10（Android 12）运行0.8.14，连接Ringo5422完成一条约3小时走路记录。session为`2196713b-b2e2-4751-9270-3203714a2f6e`，用户名`mmm`，外部计步器读数222步，设备记录号23。戒指原始文件为4,028,677字节，包含23,445条设备记录、376,864个IMU样本和190,798个PPG样本；manifest标记`data_integrity_status=complete`。
+
+戒指到手机的传输吞吐约1.4 KiB/s。现场发生一次蓝牙断连，约4秒后自动重连并从持久断点继续；下载完成后，App校验文件、冻结独立ZIP并进入上传队列。手机最终显示“222步／已上传”，首页显示“1条记录／已全部上传”。本轮证明长记录传输持续前进、短暂断连可恢复、手机保存完成后自动上传；基础传输速度仍由当前戒指BLE发送节奏限制。
+
+从云盘读回`ringfitness-session-walking-2196713b-b2e2-4751-9270-3203714a2f6e.zip`，大小2,685,659字节，SHA-256为`b08688d5bf723adb6918816b8f0e896024d59be6c27d214dc5bd22b423bba513`。解压所得manifest、原始`.rfbin`和证据JSON与本段身份、活动、步数和文件哈希一致。读回文件及核验材料保存在`.local/validation/2026-09-24-huawei-3h-download-readonly/cloud-readback/`。
+
+研究端导入结果：使用项目导入器0.2.5导入上述ZIP，首次导入生成研究目录，重复导入返回`already_imported`且退出码为0。冻结ZIP与导入目录中的`source.zip`均为2,685,659字节，SHA-256均为`b08688d5bf723adb6918816b8f0e896024d59be6c27d214dc5bd22b423bba513`。导入后的raw文件为4,028,677字节，SHA-256为`7fd43d17f09bbcad377bc9818b0fe40322fa170a6c4d25b2206bd05249d7a566`，与manifest及原始证据JSON一致；`reference.csv`记录`ground_truth_steps=222`、`activity=walking`、`participant_id=mmm`。解码生成IMU CSV 376,864行、PPG CSV 190,798行；PPG序列连续，IMU/PPG均未发现packet gap、overlap、duplicate或rollback。质量报告保留`analysis_status=pending_review`，原因是`sample_clock_uncalibrated`、`sample_coverage_not_assessed`和`capture_boundaries_unknown`，表示研究解释仍需人工确认，不表示文件损坏或上传失败。完整导入报告见`.local/validation/2026-09-24-huawei-3h-download-readonly/research-import-verification.md`。
+
+0.8.18将下载页和前台通知统一为“正在从戒指保存到手机”，进度明确标为蓝牙传输，完成后再按用户选择上传。Android JVM测试677项全部通过；研究端pytest 550项全部通过。API31模拟器完整instrumentation发现102项，其中83项通过，19项依据明确的真实硬件、RecoveryQA或Release前置条件跳过，0项失败；29张流程截图未发现控件重叠，崩溃缓冲为空，未发现FATAL或ANR。初轮3项Bridge测试沿用单次停止快照，未满足现行“两次一致停止快照”契约；对齐测试夹具后定向3项及完整102项均通过，生产停止保护保持不变。模拟器证据保存在`.local/validation/2026-09-24-0.8.18-release/emulator/`。
+
+正式包为`android/dist/0.8.18/RingFitness-Steps-0.8.18.apk`，大小13,439,818字节，SHA-256为`a60a28a836573172aa9751668a2ea551aa3fec61df214c139719864b21f231a3`。包名`com.nexthci.ringfitness.steps`、versionCode 60、versionName 0.8.18，v3签名有效，证书与华为当前正式安装一致；Release清单不包含演示入口。华为原位升级及升级后222步记录保留需在系统安装确认完成后追加。

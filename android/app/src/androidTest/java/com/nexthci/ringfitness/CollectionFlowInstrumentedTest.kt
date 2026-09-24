@@ -845,8 +845,10 @@ class CollectionFlowInstrumentedTest {
             var originalStatus: View? = null
             scenario.onActivity { activity ->
                 originalStatus = tagged<TextView>(activity, "home_task_status")
+                assertTrue(visibleTexts(activity.window.decorView).contains("正在从戒指保存到手机"))
                 assertEquals("步数已保存", (originalStatus as TextView).text.toString())
-                assertTrue(tagged<TextView>(activity, "home_task_hint").text.contains("25%"))
+                assertEquals("蓝牙传输 25%（2.5 MB / 10.0 MB）。完成后会按你的选择上传，可离开此页。",
+                    tagged<TextView>(activity, "home_task_hint").text.toString())
                 assertEquals(250, tagged<ProgressBar>(activity, "home_download_progress").progress)
                 assertNull(taggedOrNull<Button>(activity, "home_task_action"))
             }
@@ -855,7 +857,8 @@ class CollectionFlowInstrumentedTest {
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertSame(originalStatus, tagged<TextView>(activity, "home_task_status"))
-                assertTrue(tagged<TextView>(activity, "home_task_hint").text.contains("75%"))
+                assertEquals("蓝牙传输 75%（7.5 MB / 10.0 MB）。完成后会按你的选择上传，可离开此页。",
+                    tagged<TextView>(activity, "home_task_hint").text.toString())
                 assertEquals(750, tagged<ProgressBar>(activity, "home_download_progress").progress)
             }
 
@@ -863,7 +866,7 @@ class CollectionFlowInstrumentedTest {
             renderFixture(scenario, fixture)
             scenario.onActivity { activity ->
                 assertSame(originalStatus, tagged<TextView>(activity, "home_task_status"))
-                assertEquals("原始数据已接收完成，正在检查并保存文件。",
+                assertEquals("蓝牙传输已完成，正在检查文件。完成后会按你的选择上传，可离开此页。",
                     tagged<TextView>(activity, "home_task_hint").text.toString())
                 assertEquals(1_000, tagged<ProgressBar>(activity, "home_download_progress").progress)
             }

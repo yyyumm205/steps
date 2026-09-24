@@ -571,7 +571,7 @@ abstract class StepCollectionActivity : Activity() {
             CollectionPage.SAVING -> HomeTask("正在保存步数", "正在保存", "查看进度")
             CollectionPage.DOWNLOADING -> if (state.session.startAbort != null)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
-            else HomeTask("正在保存数据", "步数已保存", "查看下载", downloadHint(state))
+            else HomeTask("正在从戒指保存到手机", "步数已保存", "查看下载", downloadHint(state))
             CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
             CollectionPage.ERROR -> when {
                 state.session?.localData != null -> if (state.uploadAvailable)
@@ -607,11 +607,13 @@ abstract class StepCollectionActivity : Activity() {
         val saved = state.downloadSavedBytes
         val total = state.downloadTotalBytes?.takeIf { it > 0 }
         if (state.downloadFinalizing || (saved != null && total != null && saved >= total)) {
-            return "原始数据已接收完成，正在检查并保存文件。"
+            return "蓝牙传输已完成，正在检查文件。完成后会按你的选择上传，可离开此页。"
         }
-        if (saved == null || total == null) return "正在读取戒指原始数据，可离开页面，后台会继续保存。"
+        if (saved == null || total == null) {
+            return "正在通过蓝牙将原始数据保存到手机。完成后会按你的选择上传，可离开此页。"
+        }
         val percent = ((saved.coerceIn(0, total) * 100L) / total).toInt()
-        return "原始数据已保存 $percent%（${formatBytes(saved)} / ${formatBytes(total)}），可离开页面，后台会继续。"
+        return "蓝牙传输 $percent%（${formatBytes(saved)} / ${formatBytes(total)}）。完成后会按你的选择上传，可离开此页。"
     }
 
     private fun formatBytes(bytes: Long): String = when {

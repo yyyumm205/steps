@@ -290,7 +290,7 @@ internal fun collectionForegroundText(state: CollectionFlowState): String {
         state.taskPage == CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
             "采集已结束，请填写计步器读数" else "结束状态待确认，可先记录读数"
         state.taskPage == CollectionPage.RING_PENDING -> "本段已保留，可稍后下载并上传"
-        state.taskPage == CollectionPage.DOWNLOADING -> "正在保存戒指数据"
+        state.taskPage == CollectionPage.DOWNLOADING -> "正在从戒指保存到手机"
         state.session?.localData != null -> "记录已保存在手机"
         else -> "戒指采集准备"
     }

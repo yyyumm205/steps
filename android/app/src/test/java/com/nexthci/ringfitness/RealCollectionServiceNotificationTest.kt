@@ -15,11 +15,11 @@ class RealCollectionServiceNotificationTest {
             downloadTotalBytes = 16L * 1024 * 1024,
         )
 
-        assertEquals("正在保存戒指数据", collectionForegroundText(initial))
+        assertEquals("正在从戒指保存到手机", collectionForegroundText(initial))
         assertTrue(gate.shouldPublish(collectionForegroundText(initial)))
         repeat(1_000) { index ->
             val progress = initial.copy(downloadSavedBytes = (index + 1L) * 16 * 1024)
-            assertEquals("正在保存戒指数据", collectionForegroundText(progress))
+            assertEquals("正在从戒指保存到手机", collectionForegroundText(progress))
             assertFalse(gate.shouldPublish(collectionForegroundText(progress)))
         }
     }
