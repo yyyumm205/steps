@@ -34,6 +34,11 @@ signing.properties
 hs_err_pid*
 replay_pid*
 
+# Local presentation exports and temporary inspection files.
+.ppt-build/
+outputs/
+tmp/
+
 # Python backend environments, bytecode, and tool caches.
 .venv/
 venv/
