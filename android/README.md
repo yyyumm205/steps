@@ -1,6 +1,6 @@
 # RingFitness Android
 
-当前工作版本：**步数采集 0.9.1（versionCode 62）**，应用 ID 为 `com.nexthci.ringfitness.steps`。在九种运动和可选 Polar H10 基础上，加固心率连接重试、文件恢复与收尾；沿用原版 Android 0.5.3 的 H10 实时 HR/RR 方案与现有戒指采集流程。数据及生命周期契约见 [多运动与心率](../specs/independent-step-collection/multisport-heart-rate.md)，发布说明见 [release-0.9.1](../docs/release-0.9.1.md)，本轮验证见 [E47](../specs/independent-step-collection/validation.md#e47可选心率失败恢复与091交付2026-09-27)。18 包跨端证据保留在 E46，华为戒指长时与云端读回证据保留在 E41–E45；新增 H10 的硬件支持范围单独验证。
+当前工作版本：**步数采集 0.9.2（versionCode 63）**，应用 ID 为 `com.nexthci.ringfitness.steps`。在九种运动和可选 Polar H10 基础上，修复新增运动上传文件名、旧冻结包跨版本续传、暂存提示和冷重开后的放弃操作；沿用原版 Android 0.5.3 的 H10 实时 HR/RR 方案与现有戒指采集流程。数据及生命周期契约见 [多运动与心率](../specs/independent-step-collection/multisport-heart-rate.md)，发布说明见 [release-0.9.2](../docs/release-0.9.2.md)，本轮三星真实羽毛球、力量训练及篮球三分支结果见 [E48](../specs/independent-step-collection/validation.md#e48新增运动真机闭环与092修复2026-09-28)。18 包跨端证据保留在 E46，华为戒指长时与云端读回证据保留在 E41–E45；新增 H10 的硬件支持范围单独验证。
 
 ## 当前流程
 

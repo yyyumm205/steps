@@ -145,13 +145,13 @@ abstract class StepCollectionActivity : Activity() {
         state.session?.reference?.let { saved ->
             stepsDraft = saved.steps?.toString().orEmpty()
         }
+        // Re-subscribing to the same state must preserve the current task and its hint.
+        if (old == state) return
         if (old != null && old.copy(downloadSavedBytes = state.downloadSavedBytes,
                 downloadTotalBytes = state.downloadTotalBytes, downloadFinalizing = state.downloadFinalizing) == state) {
             updateDownloadProgress(state)
             return
         }
-        // State updates unrelated to the form must not steal focus or replace a user's input.
-        if (old == state) return
         // Heart-rate notifications arrive independently of the ring. Keep the page, scroll
         // position and form views stable while refreshing the small heart-rate surface.
         if (old != null && old.session?.sessionId == state.session?.sessionId &&
@@ -391,7 +391,8 @@ abstract class StepCollectionActivity : Activity() {
                 ui.gap(taskCard, 10)
                 ui.text(taskCard, it).tag = "home_task_hint"
             }
-            if (state.taskPage == CollectionPage.DOWNLOADING && state.downloadTotalBytes?.let { it > 0 } == true) {
+            if (state.taskPage == CollectionPage.DOWNLOADING && state.session?.isRingDeferred != true &&
+                state.downloadTotalBytes?.let { it > 0 } == true) {
                 ui.gap(taskCard, 12)
                 taskCard.addView(ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
                     tag = "home_download_progress"
@@ -692,7 +693,10 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun updateDownloadProgress(state: CollectionFlowState) {
-        window.decorView.findViewWithTag<TextView>("home_task_hint")?.text = downloadHint(state).orEmpty()
+        // Residual transfer counters are not a download request. In particular, a parked
+        // session keeps its explicit "download and upload" action until the user selects it.
+        if (state.taskPage != CollectionPage.DOWNLOADING || state.session?.isRingDeferred == true) return
+        window.decorView.findViewWithTag<TextView>("home_task_hint")?.text = homeTask(state).hint.orEmpty()
         window.decorView.findViewWithTag<ProgressBar>("home_download_progress")?.apply {
             isIndeterminate = state.downloadSavedBytes == null
             progress = downloadProgress(state)
@@ -725,7 +729,9 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun captureSession(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
-        val session = state.session
+        // A new START can be preparing while the last completed session remains in state.
+        // Only the pending session supplies this capture screen's activity and timestamps.
+        val session = state.session?.takeIf { it.isPending }
         val phase = when {
             state.page == CollectionPage.STOPPING || session?.phase == FreeLivingSessionPhase.STOP_REQUESTED ->
                 FreeLivingSessionPhase.STOP_REQUESTED
@@ -792,7 +798,7 @@ abstract class StepCollectionActivity : Activity() {
             }
         }
         ui.gap(card, 18)
-        detail(card, "活动", session?.takeIf { it.isPending }?.activity?.label ?: "正在准备")
+        detail(card, "活动", session?.activity?.label ?: "正在准备")
         ui.gap(card, 14)
         detail(card, "戒指", if (!state.connected) "连接已中断" else connectionLabel(state))
         if (state.heartRateEnabled) {

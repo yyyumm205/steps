@@ -36,6 +36,7 @@ class SeafileSessionTransport : SessionUploadTransport {
     override fun upload(link: String, archive: File, cancelled: () -> Boolean,
         onDispatch: () -> Unit, onPayloadStart: () -> Unit): RemoteSessionReceipt {
         val page = validateLink(link)
+        validateArchiveName(archive.name)
         checkCancelled(cancelled)
         val html = get(page, cancelled, onDispatch)
         val parent = Regex("path:\\s*\"([^\"]+)\"").find(html)?.groupValues?.get(1)
@@ -46,7 +47,6 @@ class SeafileSessionTransport : SessionUploadTransport {
             cancelled, onDispatch)).asJsonObject
         val upload = trustedUri(metadata.get("upload_link").asString)
         val destination = URI(upload.toString() + if (upload.rawQuery == null) "?ret-json=1" else "&ret-json=1")
-        validateArchiveName(archive.name)
         var payloadDispatched = false
         val content = object : RequestBody() {
             override fun contentType() = MediaType.parse("application/zip")
@@ -169,8 +169,9 @@ class SeafileSessionTransport : SessionUploadTransport {
             }
             return RemoteSessionReceipt(name, id, size.asLong)
         }
+        private val ACTIVITY_NAMES = SessionActivity.selectable.joinToString("|") { Regex.escape(it.wireValue) }
         private val ARCHIVE_NAME = Regex(
-            "ringfitness-session-(?:(?:walking|running)-)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.zip",
+            "ringfitness-session-(?:(?:$ACTIVITY_NAMES)-)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.zip",
         )
         private fun checkCancelled(cancelled: () -> Boolean) {
             if (cancelled() || Thread.currentThread().isInterrupted) throw InterruptedException("Upload interrupted")

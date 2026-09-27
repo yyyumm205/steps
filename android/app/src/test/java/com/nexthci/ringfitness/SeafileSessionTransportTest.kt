@@ -69,4 +69,31 @@ class SeafileSessionTransportTest {
             assertThrows(RuntimeException::class.java) { SeafileSessionTransport.parseReceipt(bad, name, 120) }
         }
     }
+
+    @Test fun everySelectableActivityArchivePassesTransportAndReceiptValidation() {
+        val id = "11111111-1111-4111-8111-111111111111"
+        for (activity in SessionActivity.selectable) {
+            val name = "ringfitness-session-${activity.wireValue}-$id.zip"
+            assertEquals(name, SeafileSessionTransport.validateArchiveName(name))
+            val receipt = """[{"name":"$name","id":"${"b".repeat(40)}","size":120}]"""
+            assertEquals(RemoteSessionReceipt(name, "b".repeat(40), 120),
+                SeafileSessionTransport.parseReceipt(receipt, name, 120))
+            assertThrows(IllegalArgumentException::class.java) {
+                SeafileSessionTransport.parseReceipt(receipt, name, 121)
+            }
+        }
+    }
+
+    @Test fun activityArchiveValidationKeepsStrictNamesAndRejectsUnknownActivities() {
+        val id = "11111111-1111-4111-8111-111111111111"
+        listOf("badminton/", "badminton-../", "free_living", "swimming", "Badminton", "table-tennis")
+            .map { "ringfitness-session-$it-$id.zip" }
+            .plus("ringfitness-session-badminton-$id.zip.part")
+            .plus("ringfitness-session-badminton-$id.zip\n")
+            .forEach { name ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    SeafileSessionTransport.validateArchiveName(name)
+                }
+            }
+    }
 }

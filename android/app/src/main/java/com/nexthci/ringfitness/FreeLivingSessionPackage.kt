@@ -60,16 +60,16 @@ class FreeLivingSessionPackage internal constructor(
         require(directory.isDirectory) { "采集目录尚未就绪" }
         ensureDirectory(packages, directory)
         val target = child(packages, session.sessionId)
-        // For an existing provenance package, its persisted timestamp is part of the immutable
-        // research snapshot. A new package receives the time of this first freeze attempt.
+        // For an existing provenance package, its persisted creation time and originating app
+        // version belong to the immutable research snapshot, not to the current upload process.
         val savedManifest = if (target.exists()) runCatching { readJson(child(target, SNAPSHOT)) }.getOrNull() else null
         val packageCreatedAt = savedManifest?.get("created_at")?.takeUnless { it.isJsonNull }?.asString
             ?.let(Instant::parse) ?: now()
         val initial = snapshot(session.sessionId, packageCreatedAt)
         val archiveName = archiveName(session.sessionId, initial.manifest.get("activity_code").asString)
         if (target.exists()) {
-            val savedVersion = savedManifest?.get("version")?.asInt
-            val expected = snapshotForVersion(initial, requireNotNull(savedVersion) { "冻结上传包缺少版本" })
+            val expected = snapshotForSavedManifest(initial,
+                requireNotNull(savedManifest) { "冻结上传包缺少清单" })
             return@synchronized verifyFrozen(target, session.sessionId, expected)
         }
 
@@ -124,7 +124,8 @@ class FreeLivingSessionPackage internal constructor(
         } else {
             Instant.ofEpochMilli(session.startRequestedAtMs)
         }
-        val frozen = verifyFrozen(target, sessionId, snapshotForVersion(snapshot(sessionId, createdAt), savedVersion))
+        val frozen = verifyFrozen(target, sessionId,
+            snapshotForSavedManifest(snapshot(sessionId, createdAt), savedManifest))
         val obsolete = child(packages, ".obsolete-$sessionId-${UUID.randomUUID()}")
         Files.move(target.toPath(), obsolete.toPath(), StandardCopyOption.ATOMIC_MOVE)
         syncDirectory(packages)
@@ -228,6 +229,24 @@ class FreeLivingSessionPackage internal constructor(
         }, current.entries)
         8 -> current
         else -> throw IOException("冻结上传包版本不受支持")
+    }
+
+    private fun snapshotForSavedManifest(current: Snapshot, saved: JsonObject): Snapshot {
+        val version = saved.get("version")?.asInt
+            ?: throw IllegalArgumentException("冻结上传包缺少版本")
+        val expected = snapshotForVersion(current, version)
+        if (version < 6) return expected
+        val originatingVersion = saved.get("app_version")
+        require(originatingVersion?.isJsonPrimitive == true && originatingVersion.asJsonPrimitive.isString &&
+            originatingVersion.asString.isNotBlank() && originatingVersion.asString.length <= 128) {
+            "冻结上传包缺少有效的原始 App 版本"
+        }
+        // Only package provenance is inherited. Every research field and source-file hash still
+        // comes from the current verified journal; verifyFrozen also checks the persisted snapshot,
+        // metadata and archive against one another. The upload queue retains its prior archive hash.
+        return Snapshot(expected.manifest.deepCopy().apply {
+            add("app_version", originatingVersion.deepCopy())
+        }, expected.entries)
     }
 
     private fun writeArchive(archive: File, snapshot: Snapshot) {

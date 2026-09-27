@@ -145,7 +145,7 @@ class RealCollectionService : Service() {
                             RealUploadScheduler.canRetryUpload(applicationContext, sessionId)
                         override fun needsLocalReview(sessionId: String) =
                             RealUploadScheduler.queue(applicationContext).needsLocalReview(sessionId)
-                        override fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) {
+                        override fun discard(sessionId: String, atMs: Long, ownerId: String?, generation: Long?) {
                             RealUploadScheduler.discard(applicationContext, sessionId, atMs, ownerId, generation)
                         }
                     })

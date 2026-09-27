@@ -533,7 +533,7 @@ class RealCollectionBridgeInstrumentedTest {
         private val inFlight = mutableSetOf<String>()
         override fun enqueue(sessionId: String, retry: Boolean) { requests += sessionId; inFlight += sessionId }
         override fun isInFlight(sessionId: String) = sessionId in inFlight
-        override fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) { inFlight -= sessionId }
+        override fun discard(sessionId: String, atMs: Long, ownerId: String?, generation: Long?) { inFlight -= sessionId }
     }
 
     private fun imu(count: Int, uptime: Long): ByteArray = ByteArrayOutputStream().apply {

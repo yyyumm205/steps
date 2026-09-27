@@ -262,6 +262,129 @@ class FreeLivingSessionPackageTest {
         }
     }
 
+    @Test fun versionSixFrozenPackageSurvivesAppUpgradeWithOrWithoutUploadHash() {
+        assertUploadAfterAppUpgrade(6, "0.8.0")
+    }
+
+    @Test fun versionSevenFrozenPackageSurvivesAppUpgradeWithOrWithoutUploadHash() {
+        assertUploadAfterAppUpgrade(7, "0.8.1")
+    }
+
+    @Test fun versionEightFrozenPackageSurvivesAppUpgradeWithOrWithoutUploadHash() {
+        assertUploadAfterAppUpgrade(8, "0.9.0")
+    }
+
+    @Test fun badmintonPackageFromVersion091RetriesAfterAppUpgradeWithoutChangingItsNoStepReference() {
+        assertUploadAfterAppUpgrade(8, "0.9.1", SessionActivity.BADMINTON)
+    }
+
+    @Test fun upgradedUnpublishedPackageStillAllowsExplicitReferenceCorrection() {
+        val f = fixture(activity = SessionActivity.WALKING)
+        f.store.setCompletionPolicy(f.session.sessionId, CompletionPolicy.SAVE_LATER)
+        val previous = rewriteAsLegacy(f.packager.freeze(f.session), 7, appVersion = "0.8.1")
+        val corrected = SessionReference(ReferenceStatus.VALID, 21, t + 6_000)
+
+        val reopened = packager(f.directory, openStore(f.directory))
+        val revised = reopened.reviseUnpublishedReference(f.session.sessionId, corrected)
+
+        assertFalse(previous.exists())
+        val replacement = reopened.freeze(revised)
+        assertEquals(21L, manifest(replacement)["ground_truth_steps"].asLong)
+        assertEquals(BuildConfig.VERSION_NAME, manifest(replacement)["app_version"].asString)
+    }
+
+    @Test fun upgradedPackageStillRejectsChangedIdentityReferenceAndEvidence() {
+        val changes: List<(JsonObject) -> Unit> = listOf(
+            { it.addProperty("participant_id", "different-user") },
+            { it.addProperty("ground_truth_steps", 74) },
+            { it.getAsJsonObject("device_record_evidence").getAsJsonObject("record")
+                .addProperty("uptime_ms", 901) },
+            { it.addProperty("ring_finger", "middle") },
+        )
+        changes.forEach { change ->
+            val f = fixture(activity = SessionActivity.WALKING)
+            val changed = rewriteAsLegacy(f.packager.freeze(f.session), 8, "0.9.0", change)
+            val original = changed.readBytes()
+
+            assertThrows(IllegalArgumentException::class.java) {
+                packager(f.directory, openStore(f.directory)).freeze(f.session)
+            }
+
+            assertArrayEquals(original, changed.readBytes())
+        }
+    }
+
+    @Test fun upgradedPackageStillRejectsMissingOrInvalidOriginatingAppVersion() {
+        val changes: List<(JsonObject) -> Unit> = listOf(
+            { it.remove("app_version") },
+            { it.add("app_version", com.google.gson.JsonNull.INSTANCE) },
+            { it.addProperty("app_version", "") },
+            { it.addProperty("app_version", 9) },
+            { it.addProperty("app_version", "v".repeat(129)) },
+        )
+        changes.forEach { change ->
+            val f = fixture(activity = SessionActivity.WALKING)
+            val changed = rewriteAsLegacy(f.packager.freeze(f.session), 8, "0.9.0", change)
+            val original = changed.readBytes()
+
+            assertThrows(IllegalArgumentException::class.java) {
+                packager(f.directory, openStore(f.directory)).freeze(f.session)
+            }
+
+            assertArrayEquals(original, changed.readBytes())
+        }
+    }
+
+    @Test fun upgradedPackageStillRejectsSnapshotVersionEditedWithoutMatchingArchive() {
+        val f = fixture(activity = SessionActivity.WALKING)
+        val archive = rewriteAsLegacy(f.packager.freeze(f.session), 8, "0.9.0")
+        val original = archive.readBytes()
+        val snapshot = File(archive.parentFile, "manifest.snapshot.json")
+        val altered = JsonParser.parseString(snapshot.readText()).asJsonObject.apply {
+            addProperty("app_version", "0.8.17")
+        }
+        snapshot.writeText(altered.toString())
+
+        assertThrows(IllegalArgumentException::class.java) {
+            packager(f.directory, openStore(f.directory)).freeze(f.session)
+        }
+
+        assertArrayEquals(original, archive.readBytes())
+    }
+
+    @Test fun upgradedPackageCannotReplaceAnAlreadyBoundArchiveHash() {
+        val f = fixture(activity = SessionActivity.WALKING)
+        val archive = rewriteAsLegacy(f.packager.freeze(f.session), 8, "0.9.0")
+        val original = FrozenSessionPackage(archive, sha(archive.readBytes()), archive.length(), f.session.sessionId)
+        val link = "https://cloud.tsinghua.edu.cn/u/d/fixture/"
+        val oldQueue = RealUploadQueue(f.directory, f.store, freeze = { original },
+            transport = SessionUploadTransport { _, _, _, onDispatch, _ ->
+                onDispatch()
+                throw IOException("pre-upgrade network failure before payload")
+            }, sync = {})
+        assertTrue(oldQueue.enqueue(f.session.sessionId, link, false))
+        assertTrue(oldQueue.run(f.session.sessionId))
+        assertEquals(original.sha256, oldQueue.task(f.session.sessionId)!!.archiveSha256)
+        // Even a self-consistent replacement of the package cannot bypass the task's prior hash.
+        val replaced = rewriteAsLegacy(original, 8, "0.8.17")
+        val replacementBytes = replaced.readBytes()
+        assertNotEquals(original.sha256, sha(replacementBytes))
+        var networkCalls = 0
+        val reopened = RealUploadQueue(f.directory, openStore(f.directory),
+            freeze = packager(f.directory, openStore(f.directory))::freeze,
+            transport = SessionUploadTransport { _, _, _, _, _ ->
+                networkCalls++
+                throw AssertionError("changed archive must never reach the network")
+            }, sync = {})
+
+        assertFalse(reopened.run(f.session.sessionId))
+
+        assertEquals(0, networkCalls)
+        assertEquals("failed", reopened.task(f.session.sessionId)!!.state)
+        assertEquals(original.sha256, reopened.task(f.session.sessionId)!!.archiveSha256)
+        assertArrayEquals(replacementBytes, replaced.readBytes())
+    }
+
     @Test fun multipleRawFilesAndEvidenceShareOneReferenceAtTheRoot() {
         val f = fixture(rawCount = 2, withEvidence = true)
         val frozen = f.packager.freeze(f.session)
@@ -445,13 +568,86 @@ class FreeLivingSessionPackageTest {
         JsonParser.parseString(zip.getInputStream(zip.getEntry("manifest.json")).reader(Charsets.UTF_8).readText()).asJsonObject
     }
 
-    private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int): File {
+    private fun assertUploadAfterAppUpgrade(version: Int, previousAppVersion: String,
+        activity: SessionActivity = SessionActivity.WALKING) {
+        assertNotEquals(previousAppVersion, BuildConfig.VERSION_NAME)
+        listOf(false, true).forEach { hashAlreadyBound ->
+            val reference = if (activity.requiresReferenceSteps) {
+                SessionReference(ReferenceStatus.VALID, 73, t + 3_000)
+            } else SessionReference(ReferenceStatus.NOT_APPLICABLE, null, t + 3_000)
+            val f = fixture(reference, activity = activity, withEvidence = true)
+            val archive = rewriteAsLegacy(f.packager.freeze(f.session), version, previousAppVersion)
+            val originalBytes = archive.readBytes()
+            val original = FrozenSessionPackage(archive, sha(originalBytes), archive.length(), f.session.sessionId)
+            val snapshotFile = File(archive.parentFile, "manifest.snapshot.json")
+            val metadataFile = File(archive.parentFile, "package.json")
+            val originalSnapshot = snapshotFile.readBytes()
+            val originalMetadata = metadataFile.readBytes()
+            val rawBytes = f.rawFiles.map { it.readBytes() }
+            val link = "https://cloud.tsinghua.edu.cn/u/d/fixture/"
+            if (hashAlreadyBound) {
+                // Model the old process having bound the genuine old archive before a pre-payload
+                // network failure. The reopened process below always uses the real current freezer.
+                val oldQueue = RealUploadQueue(f.directory, f.store, freeze = { original },
+                    transport = SessionUploadTransport { _, _, _, onDispatch, _ ->
+                        onDispatch()
+                        throw IOException("pre-upgrade network failure before payload")
+                    }, sync = {})
+                assertTrue(oldQueue.enqueue(f.session.sessionId, link, false))
+                assertTrue(oldQueue.run(f.session.sessionId))
+                assertEquals(original.sha256, oldQueue.task(f.session.sessionId)!!.archiveSha256)
+            }
+            val reopenedStore = openStore(f.directory)
+            val currentPackager = packager(f.directory, reopenedStore,
+                now = { Instant.ofEpochMilli(t + 90_000) })
+            var requests = 0
+            val queue = RealUploadQueue(f.directory, reopenedStore, freeze = currentPackager::freeze,
+                transport = SessionUploadTransport { destination, file, _, onDispatch, onPayloadStart ->
+                    onDispatch()
+                    onPayloadStart()
+                    requests++
+                    assertEquals(link, destination)
+                    assertEquals(archive.name, file.name)
+                    assertArrayEquals(originalBytes, file.readBytes())
+                    RemoteSessionReceipt(file.name, "a".repeat(40), file.length())
+                }, now = { t + 100_000 }, sync = {})
+            assertTrue(queue.restore(link))
+            assertEquals(if (hashAlreadyBound) original.sha256 else null,
+                queue.task(f.session.sessionId)!!.archiveSha256)
+
+            assertFalse(queue.run(f.session.sessionId))
+
+            assertEquals(1, requests)
+            assertEquals(SessionTransferStatus.COMPLETE, reopenedStore.read()!!.transfer.status)
+            assertEquals(original.sha256, queue.task(f.session.sessionId)!!.archiveSha256)
+            assertArrayEquals(originalBytes, archive.readBytes())
+            assertArrayEquals(originalSnapshot, snapshotFile.readBytes())
+            assertArrayEquals(originalMetadata, metadataFile.readBytes())
+            f.rawFiles.forEachIndexed { index, file -> assertArrayEquals(rawBytes[index], file.readBytes()) }
+            assertEquals(previousAppVersion, manifest(original)["app_version"].asString)
+            assertEquals(packagedAt.toString(), manifest(original)["created_at"].asString)
+            assertEquals(activity.wireValue, manifest(original)["activity_code"].asString)
+            assertEquals(reference.status.wireValue, manifest(original)["ground_truth_status"].asString)
+            if (!activity.requiresReferenceSteps) {
+                assertTrue(manifest(original)["ground_truth_steps"].isJsonNull)
+                assertTrue(manifest(original)["ground_truth_recorded_at_ms"].isJsonNull)
+            }
+            assertFalse(queue.restore(link))
+            assertFalse(queue.run(f.session.sessionId))
+            assertEquals(1, requests)
+        }
+    }
+
+    private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int, appVersion: String? = null,
+        change: (JsonObject) -> Unit = {}): File {
         val target = frozen.file.parentFile
         val legacy = manifest(frozen).apply {
-            remove("heart_rate")
+            if (version < 8) remove("heart_rate")
             if (version < 6) listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at").forEach(::remove)
             if (version < 7) listOf("stop_origin", "stop_observed_at_ms").forEach(::remove)
             addProperty("version", version)
+            if (appVersion != null) addProperty("app_version", appVersion)
+            change(this)
         }
         val contents = ZipFile(frozen.file).use { zip ->
             zip.entries().asSequence().associate { entry ->
@@ -467,12 +663,12 @@ class FreeLivingSessionPackageTest {
                 zip.closeEntry()
             }
         }
-        val legacyArchive = File(target, "ringfitness-session-${frozen.sessionId}.zip")
+        val legacyArchive = if (version < 8) File(target, "ringfitness-session-${frozen.sessionId}.zip") else frozen.file
         Files.move(replacement.toPath(), legacyArchive.toPath(), StandardCopyOption.REPLACE_EXISTING)
         if (frozen.file != legacyArchive) assertTrue(frozen.file.delete())
         File(target, "manifest.snapshot.json").writeText(legacy.toString(), Charsets.UTF_8)
         File(target, "package.json").writeText(JsonObject().apply {
-            addProperty("package_version", 1)
+            addProperty("package_version", if (version < 8 || legacy["activity_code"].asString == "free_living") 1 else 2)
             addProperty("session_id", frozen.sessionId)
             addProperty("file_name", legacyArchive.name)
             addProperty("bytes", legacyArchive.length())

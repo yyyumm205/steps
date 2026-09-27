@@ -986,6 +986,121 @@ class RealCollectionControllerTest {
         assertTrue(f.port.reads.isEmpty())
     }
 
+    @Test fun coldReopenedDeferredNonStepSportCanBeDiscardedWithoutConnectionEvidence() {
+        listOf(false, true).forEach { useHeartRate ->
+            val uploads = RecordingUploads()
+            Fixture(uploads, withHeartRate = useHeartRate, preserveUnassignedExisting = false).use { f ->
+                val previous = f.seedLocal()
+                val previousRaw = File(f.directory, previous.localData!!.files.single().fileName)
+                val previousBytes = previousRaw.readBytes()
+                f.connectReady()
+                if (useHeartRate) f.enableReadyHeartRate()
+                f.startSelected(SessionActivity.BASKETBALL)
+                f.observe(idle()); f.observe(collecting(), listOf(initialRecord))
+                if (useHeartRate) f.heartRate.sample()
+                f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+                f.owner.finalizeSession(false, "", "not_applicable", "")
+                val deferred = requireNotNull(f.store.readPending())
+                assertTrue(deferred.isRingDeferred)
+                val hrFile = deferred.heartRate?.file?.let { File(f.directory, it.fileName) }
+                val connections = f.port.count("connect")
+                val starts = f.port.count("start")
+                val stops = f.port.count("stop")
+                val uploadRequests = uploads.requests.toList()
+
+                f.reopen()
+                assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
+                assertEquals(connections, f.port.count("connect"))
+                assertEquals(deferred, f.store.readPending())
+                f.owner.discardSession()
+
+                assertTrue("Cold-start discard must persist without a fabricated GATT generation: ${f.errors}", f.errors.isEmpty())
+                assertNull(f.store.readPending())
+                val discarded = requireNotNull(f.store.read(deferred.sessionId))
+                assertTrue(discarded.isDiscarded)
+                assertEquals(deferred.deviceRecordEvidence, discarded.deviceRecordEvidence)
+                assertEquals(deferred.preparation, discarded.preparation)
+                assertNull(discarded.discarded!!.connectionOwnerId)
+                assertNull(discarded.discarded!!.connectionGeneration)
+                assertEquals(DiscardRequest(deferred.sessionId, discarded.discarded!!.discardedAtMs, null, null),
+                    uploads.discarded.single())
+                assertEquals(previous, f.store.read(previous.sessionId))
+                assertArrayEquals(previousBytes, previousRaw.readBytes())
+                assertEquals(uploadRequests, uploads.requests)
+                assertTrue(f.port.reads.isEmpty())
+                if (hrFile != null) assertFalse(hrFile.exists())
+                f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord))
+                assertTrue(f.owner.state.canStart)
+                assertFalse(f.owner.state.records.any { it.sessionId == deferred.sessionId })
+                assertTrue(f.port.reads.isEmpty())
+                f.reopen(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(finalRecord))
+                assertTrue(f.owner.state.canStart)
+                assertTrue(f.store.read(deferred.sessionId)!!.isDiscarded)
+                assertTrue(f.port.reads.isEmpty())
+                assertEquals(starts, f.port.count("start"))
+                assertEquals(stops, f.port.count("stop"))
+            }
+        }
+    }
+
+    @Test fun discardWhileReconnectingDoesNotTreatAnUnconfirmedGenerationAsConnectionEvidence() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            val current = requireNotNull(f.store.readPending())
+            f.reopen()
+            assertTrue(f.port.generation > 0)
+            // The new owner requested a connection, but onConnected has not arrived.
+            f.owner.discardSession()
+
+            assertTrue("${f.errors}", f.errors.isEmpty())
+            val discarded = requireNotNull(f.store.read(current.sessionId)).discarded!!
+            assertNull(discarded.connectionOwnerId)
+            assertNull(discarded.connectionGeneration)
+            assertEquals(DiscardRequest(current.sessionId, discarded.discardedAtMs, null, null),
+                uploads.discarded.single())
+            assertTrue(f.port.reads.isEmpty())
+        }
+    }
+
+    @Test fun discardAfterDisconnectDoesNotReuseTheRetiredConnectionEvidence() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            f.owner.finalizeSession(false, "4", "valid", "")
+            val current = requireNotNull(f.store.readPending())
+            f.owner.onDisconnected(f.port.generation, "test disconnect")
+            f.owner.discardSession()
+
+            assertTrue("${f.errors}", f.errors.isEmpty())
+            val discarded = requireNotNull(f.store.read(current.sessionId)).discarded!!
+            assertNull(discarded.connectionOwnerId)
+            assertNull(discarded.connectionGeneration)
+            assertEquals(DiscardRequest(current.sessionId, discarded.discardedAtMs, null, null),
+                uploads.discarded.single())
+            assertTrue(f.port.reads.isEmpty())
+        }
+    }
+
+    @Test fun discardOnAnEstablishedConnectionKeepsTheSamePositiveEvidenceForStoreAndUpload() {
+        val uploads = RecordingUploads()
+        Fixture(uploads).use { f ->
+            f.beginCollecting(); f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            val current = requireNotNull(f.store.readPending())
+            val connectedGeneration = f.port.generation
+            assertTrue(connectedGeneration > 0)
+
+            f.owner.discardSession()
+
+            assertTrue("${f.errors}", f.errors.isEmpty())
+            val discarded = requireNotNull(f.store.read(current.sessionId)).discarded!!
+            assertNotNull(discarded.connectionOwnerId)
+            assertEquals(connectedGeneration, discarded.connectionGeneration)
+            assertEquals(DiscardRequest(current.sessionId, discarded.discardedAtMs,
+                discarded.connectionOwnerId, discarded.connectionGeneration), uploads.discarded.single())
+        }
+    }
+
     @Test fun unavailableUploadConfigurationFallsBackToEditableLocalSaveWithoutQueuing() {
         val uploads = RecordingUploads().apply { configured = false }
         Fixture(uploads).use { f ->
@@ -3735,7 +3850,11 @@ class RealCollectionControllerTest {
         override fun close() { recorder.close(); state = state.copy(recording = false) }
     }
 
+    private data class DiscardRequest(val sessionId: String, val atMs: Long,
+        val ownerId: String?, val generation: Long?)
+
     private class RecordingUploads : RealUploadPort {
+        val discarded = mutableListOf<DiscardRequest>()
         val requests = mutableListOf<Pair<String, Boolean>>()
         val inFlight = mutableSetOf<String>()
         val localReview = mutableSetOf<String>()
@@ -3759,6 +3878,9 @@ class RealCollectionControllerTest {
             return sessionId in requeueAvailable
         }
         override fun needsLocalReview(sessionId: String) = sessionId in localReview
+        override fun discard(sessionId: String, atMs: Long, ownerId: String?, generation: Long?) {
+            discarded += DiscardRequest(sessionId, atMs, ownerId, generation)
+        }
     }
 
     private class RecordingPort : RealCollectionPort {

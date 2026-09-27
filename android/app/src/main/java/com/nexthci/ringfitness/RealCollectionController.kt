@@ -23,7 +23,7 @@ interface RealUploadPort {
     fun isInFlight(sessionId: String): Boolean
     fun canRetryUpload(sessionId: String): Boolean = false
     fun needsLocalReview(sessionId: String): Boolean = false
-    fun discard(sessionId: String, atMs: Long, ownerId: String, generation: Long) = Unit
+    fun discard(sessionId: String, atMs: Long, ownerId: String?, generation: Long?) = Unit
 }
 
 /** Single serial owner for real device control, reference commits and recoverable downloads. */
@@ -900,14 +900,18 @@ class RealCollectionController(
         val current = requireNotNull(store.readPending())
         require(current.stopConfirmedAtMs != null)
         val atMs = clock.nowEpochMs()
-        store.discardStoppedSession(current.sessionId, atMs, preservationOwnerId, generation)
+        // A deferred session may reopen without any BLE connection. Its durable session/record
+        // identity authorizes local discard; attach connection evidence only for an established link.
+        val discardGeneration = generation.takeIf { connected && it > 0 }
+        val discardOwnerId = preservationOwnerId.takeIf { discardGeneration != null }
+        store.discardStoppedSession(current.sessionId, atMs, discardOwnerId, discardGeneration)
         heartRate?.discard(current)
         clearReferenceDraft(current.sessionId)
         closeDownload()
         query = null; readinessWait = null; selectedActivity = null; requestedActivity = null
         val cleaned = runCatching { store.cleanupDiscardedSession(current.sessionId) }
         cleaned.exceptionOrNull()?.let { reportError(it as? Exception ?: Exception(it)) }
-        uploads?.discard(current.sessionId, atMs, preservationOwnerId, generation)
+        uploads?.discard(current.sessionId, atMs, discardOwnerId, discardGeneration)
         coordinator.refresh()
         browsingHome = true; taskPage = null; taskError = null
         connect() // Retire any late, untagged DATA from the cancelled download before another task.
