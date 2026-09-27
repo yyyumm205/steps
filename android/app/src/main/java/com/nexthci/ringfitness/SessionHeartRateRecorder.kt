@@ -55,8 +55,7 @@ class SessionHeartRateRecorder(
                 syncDirectory(directory)
                 if (recovering && configured.sampleCount > 0) {
                     // A missing file must never retain an invented count from an old checkpoint.
-                    recovered = recovered.copy(sampleCount = 0, firstSampleAtMs = null, lastSampleAtMs = null,
-                        gaps = recovered.gaps + HeartRateGap(configured.startedAtMs, clock.nowEpochMs(), "storage_error"))
+                    recovered = recovered.copy(sampleCount = 0, firstSampleAtMs = null, lastSampleAtMs = null)
                 }
             } else {
                 require(opened.readLine() == HEADER) { "心率文件表头损坏，原文件已保留" }
@@ -92,9 +91,15 @@ class SessionHeartRateRecorder(
             if (recovering) {
                 val now = clock.nowEpochMs()
                 val from = recovered.lastSampleAtMs ?: recovered.startedAtMs
-                recovered = recovered.copy(gaps = recovered.gaps.map {
+                val gaps = recovered.gaps.map {
                     if (it.endedAtMs == null) it.copy(endedAtMs = now) else it
-                } + HeartRateGap(from, null, "process_restart"))
+                }.toMutableList()
+                if (recovered.sampleCount < configured.sampleCount) {
+                    // Also covers a header created before an earlier recovery's journal commit failed.
+                    gaps += HeartRateGap(from, now, "storage_error")
+                }
+                gaps += HeartRateGap(from, null, "process_restart")
+                recovered = recovered.copy(gaps = gaps)
             }
             store.updateHeartRate(session.sessionId, recovered)
             sessionId = session.sessionId
@@ -112,7 +117,7 @@ class SessionHeartRateRecorder(
         var current = requireNotNull(metadata)
         require(receivedAtMs > 0)
         require(sample.hr in 0..65535)
-        require(sample.rrMs.size == sample.rrRaw.size &&
+        require(sample.rrMs.size == sample.rrRaw.size && sample.rrMs.size <= MAX_RR_VALUES_PER_ROW &&
             sample.rrMs.all { it in 0..65535 } && sample.rrRaw.all { it in 0..65535 })
         val last = current.lastSampleAtMs ?: current.startedAtMs
         if (receivedAtMs - last > NO_DATA_GAP_MS && current.gaps.none { it.endedAtMs == null }) {
@@ -126,6 +131,8 @@ class SessionHeartRateRecorder(
         val row = "${Instant.ofEpochMilli(receivedAtMs)},$receivedAtMs,$count,${sample.hr},${sample.correctedHr}," +
             "${sample.ppgQuality},${sample.rrAvailable},${sample.contactSupported},${sample.contactStatus}," +
             "${sample.rrMs.joinToString("|")},${sample.rrRaw.joinToString("|")}\n"
+        // Include the newline in the backend's shared CSV line quota before touching disk.
+        require(row.length <= MAX_LINE_CHARACTERS) { "心率记录长度无效" }
         val appendPosition = output.filePointer
         try { appendRow(output, row.toByteArray(Charsets.US_ASCII)) } catch (error: Exception) {
             // A later retry may only follow a complete row, never an interrupted CSV append.
@@ -198,15 +205,17 @@ class SessionHeartRateRecorder(
 
     fun discard(session: FreeLivingSession) {
         if (sessionId != session.sessionId) return
-        stream?.close()
-        stream = null; metadata = null; sessionId = null
+        try { stream?.close() } finally {
+            stream = null; metadata = null; sessionId = null
+        }
         // The session store owns the discard tombstone and exact file deletion whitelist.
     }
 
     fun close() {
         try { checkpoint() } finally {
-            stream?.close()
-            stream = null; metadata = null; sessionId = null
+            try { stream?.close() } finally {
+                stream = null; metadata = null; sessionId = null
+            }
         }
     }
 
@@ -215,5 +224,7 @@ class SessionHeartRateRecorder(
             "rr_available,contact_supported,contact_status,rr_ms,rr_1_1024s"
         const val CHECKPOINT_MS = 5_000L
         const val NO_DATA_GAP_MS = 10_000L
+        private const val MAX_RR_VALUES_PER_ROW = 4096
+        private const val MAX_LINE_CHARACTERS = 64 * 1024
     }
 }

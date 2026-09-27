@@ -137,6 +137,7 @@ class RealCollectionController(
     private var selectedActivity: SessionActivity? = null
     private var requestedActivity: SessionActivity? = null
     private var heartRateEnabled = false
+    private var heartRateOperationError: String? = null
     private var stopEvidenceGeneration: Long? = null
     private var endStartAttemptReason: String? = null
     private var unknownArchiveReason: String? = null
@@ -684,23 +685,37 @@ class RealCollectionController(
         publish(state.page, state.error)
     }
 
-    override fun setHeartRateEnabled(enabled: Boolean) = safely {
-        if (store.readPending() != null || state.busy) return@safely
-        require(!enabled || heartRate != null) { "心率带服务尚未准备好" }
-        if (heartRateEnabled != enabled) heartRate?.resetSelection()
+    override fun setHeartRateEnabled(enabled: Boolean) = optionalHeartRateAction {
+        val changed = heartRateEnabled != enabled
+        // Keep the user's choice actionable even if optional SDK initialization fails.
+        // Disabling must always restore ring-only readiness.
         heartRateEnabled = enabled
-        publish(state.page, state.error)
+        require(!enabled || heartRate != null) { "心率带服务尚未准备好" }
+        if (changed) heartRate?.resetSelection()
     }
 
-    override fun scanHeartRate() = safely {
-        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+    override fun scanHeartRate() = optionalHeartRateAction {
+        if (!heartRateEnabled) return@optionalHeartRateAction
         heartRate?.search()
     }
 
-    override fun connectHeartRate(deviceId: String) = safely {
-        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+    override fun connectHeartRate(deviceId: String) = optionalHeartRateAction {
+        if (!heartRateEnabled) return@optionalHeartRateAction
         require(heartRate?.state?.devices?.any { it.deviceId == deviceId } == true)
         heartRate?.connect(deviceId)
+    }
+
+    /** An optional-device failure cannot retire the ring's verified connection or query. */
+    private fun optionalHeartRateAction(action: () -> Unit) = safely {
+        if (store.readPending() != null || state.busy) return@safely
+        try {
+            action()
+            heartRateOperationError = null
+        } catch (error: Exception) {
+            reportError(error)
+            heartRateOperationError = "心率带暂时不可用，请重新搜索或关闭心率带"
+        }
+        publish(state.page, state.error)
     }
 
     fun onHeartRateChanged() = safely {
@@ -978,6 +993,7 @@ class RealCollectionController(
         if (saving || downloader != null || backupObservation != null || query != null || readinessWait != null ||
             abortWaitOperation != null || coordinator.state.timeoutOperationId != null || coordinator.state.settling) return@safely
         val current = requireNotNull(store.readPending())
+        sealHeartRateBeforeTransfer(current)
         val resumed = store.resumeRingTransfer(current.sessionId)
         profile = resumed.preparation
         browsingHome = false
@@ -1416,6 +1432,7 @@ class RealCollectionController(
     }
 
     private fun beginDownload(current: FreeLivingSession, observed: HealthRecordObservation) {
+        sealHeartRateBeforeTransfer(current)
         val expected = requireNotNull(current.deviceRecordEvidence) { "本次戒指记录需要核对" }.record
         require(!current.deviceAssociationInvalidated && observed.address == current.preparation.ring?.address)
         require(!observed.status.collecting && observed.status.errorCode == 0 && observed.status.sessionId == expected.sessionId)
@@ -1669,6 +1686,13 @@ class RealCollectionController(
             .onFailure { reportError(it as? Exception ?: Exception(it)) }
     }
 
+    /** Retry a failed local seal before changing a deferred choice or downloading ring data. */
+    private fun sealHeartRateBeforeTransfer(session: FreeLivingSession) {
+        if (session.heartRate == null || session.heartRate.endedAtMs != null) return
+        requireNotNull(heartRate) { "心率数据尚未保存完成，请重试" }.finish(session)
+        check(store.read(session.sessionId)?.heartRate?.endedAtMs != null) { "心率数据尚未保存完成，请重试" }
+    }
+
     /** Release a failed attempt's live callback even when sealing needs a later storage retry. */
     private fun releaseHeartRate(session: FreeLivingSession) {
         if (session.heartRate == null) return
@@ -1725,8 +1749,8 @@ class RealCollectionController(
         val idle = lastIdle
         val checkingDevice = pending == null && backupObservation == null && connected &&
             (query != null || readinessWait != null || timeRound != null)
-        val hrState = heartRate?.state ?: PolarUiState()
-        val hrReady = !heartRateEnabled || (hrState.connected && hrState.hrReady && hrState.selectedDeviceId != null)
+        val hrState = (heartRate?.state ?: PolarUiState()).copy(operationError = heartRateOperationError)
+        val hrReady = !heartRateEnabled || (hrState.ready && hrState.operationError == null)
         val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null && hrReady
         val visibleProfile = pending?.preparation ?: profile
         val participantLabel = localProfile?.takeIf {

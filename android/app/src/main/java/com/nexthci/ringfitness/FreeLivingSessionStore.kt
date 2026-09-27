@@ -263,8 +263,12 @@ class FreeLivingSessionStore internal constructor(
             if (previous != null) {
                 require(previous.deviceId == heartRate.deviceId && previous.deviceName == heartRate.deviceName &&
                     previous.startedAtMs == heartRate.startedAtMs) { "本段心率带不能更换" }
+                // Distinct losses can share wall-clock readings; each added occurrence is evidence.
+                val previousStorageGaps = previous.gaps.filter { it.reason == "storage_error" }
+                    .groupingBy { it }.eachCount()
                 val documentedStorageLoss = previous.endedAtMs == null && previous.file == null &&
-                    heartRate.gaps.any { it.reason == "storage_error" && it !in previous.gaps }
+                    heartRate.gaps.filter { it.reason == "storage_error" }.groupingBy { it }.eachCount()
+                        .any { (gap, count) -> count > (previousStorageGaps[gap] ?: 0) }
                 require(heartRate.sampleCount >= previous.sampleCount || documentedStorageLoss) { "心率记录不能减少" }
                 if (previous.endedAtMs != null) require(previous == heartRate) { "已结束的心率记录保持原样" }
                 if (previous.firstSampleAtMs != null && !documentedStorageLoss) {

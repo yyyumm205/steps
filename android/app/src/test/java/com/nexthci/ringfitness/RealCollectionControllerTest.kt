@@ -38,6 +38,46 @@ class RealCollectionControllerTest {
         assertEquals(1, f.port.count("start"))
     }
 
+    @Test fun optionalHeartRateInitializationFailureKeepsRingReadyAndCanBeDisabled() = Fixture(withHeartRate = true).use { f ->
+        f.connectReady()
+        f.heartRate.selectionError = IOException("注入 H10 初始化失败")
+        f.owner.setHeartRateEnabled(true)
+        assertEquals(CollectionPage.HOME, f.owner.state.page)
+        assertTrue(f.owner.state.connected)
+        assertTrue(f.owner.state.heartRateEnabled)
+        assertFalse(f.owner.state.canStart)
+        assertNotNull(f.owner.state.heartRateState.operationError)
+
+        f.owner.setHeartRateEnabled(false)
+        assertFalse(f.owner.state.heartRateEnabled)
+        assertTrue("Optional SDK failure must leave ring readiness intact", f.owner.state.canStart)
+        assertNull(f.owner.state.error)
+        f.startSelected(); f.observe(idle())
+        assertNull(f.store.readPending()!!.heartRate)
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun optionalScanAndConnectFailureStayOnHomeAndAllowLocalRetry() {
+        listOf("scan", "connect").forEach { action ->
+            Fixture(withHeartRate = true).use { f ->
+                f.connectReady(); f.enableReadyHeartRate()
+                f.heartRate.selectionError = IOException("注入 H10 操作失败")
+                if (action == "scan") f.owner.scanHeartRate() else f.owner.connectHeartRate("H10-TEST")
+                assertEquals(CollectionPage.HOME, f.owner.state.page)
+                assertTrue(f.owner.state.connected)
+                assertNotNull(f.owner.state.heartRateState.operationError)
+                assertFalse(f.owner.state.canStart)
+                assertNull(f.owner.state.error)
+
+                f.heartRate.selectionError = null
+                f.owner.scanHeartRate()
+                assertNull(f.owner.state.heartRateState.operationError)
+                f.owner.setHeartRateEnabled(false)
+                assertTrue(f.owner.state.canStart)
+            }
+        }
+    }
+
     @Test fun enabledHeartRateRequiresConnectionReadinessAndIdentityBeforeStart() = Fixture(withHeartRate = true).use { f ->
         f.connectReady()
         f.owner.setHeartRateEnabled(true)
@@ -258,6 +298,62 @@ class RealCollectionControllerTest {
             assertNotNull(saved.localData)
             assertArrayEquals(originalBytes, heartRateFile.readBytes())
             assertEquals(listOf(saved.sessionId), f.heartRate.prepared)
+            assertEquals(listOf(saved.sessionId to false), uploads.requests)
+        }
+    }
+
+    @Test fun retryAfterHeartRateSealFailureSealsBeforeDownloadingWithoutLosingSavedReference() {
+        val uploads = RecordingUploads()
+        Fixture(uploads, withHeartRate = true).use { f ->
+            f.beginHeartRateCollecting()
+            f.heartRate.sample()
+            f.heartRate.finishError = IOException("注入心率收尾失败")
+            f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            f.owner.finalizeSession(true, "20", "valid", "")
+            val pending = f.store.readPending()!!
+            assertEquals(20L, pending.reference!!.steps)
+            assertNull(pending.heartRate!!.endedAtMs)
+            assertTrue(f.port.reads.isEmpty())
+            assertTrue(uploads.requests.isEmpty())
+
+            f.heartRate.finishError = null
+            f.errors.clear()
+            f.owner.retry(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord))
+            assertNotNull("Retry must seal H10 before transferring ring data", f.store.readPending()!!.heartRate!!.endedAtMs)
+            f.finishDownload()
+            val saved = f.store.read(pending.sessionId)!!
+            assertEquals(pending.reference, saved.reference)
+            assertNotNull(saved.localData)
+            assertEquals(1L, saved.heartRate!!.sampleCount)
+            assertEquals(listOf(saved.sessionId to false), uploads.requests)
+        }
+    }
+
+    @Test fun deferredHeartRateSealRetryKeepsManualTransferChoiceUntilSealingSucceeds() {
+        val uploads = RecordingUploads()
+        Fixture(uploads, withHeartRate = true).use { f ->
+            f.beginHeartRateCollecting(SessionActivity.BADMINTON)
+            f.heartRate.sample()
+            f.heartRate.finishError = IOException("注入心率收尾失败")
+            f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            f.owner.finalizeSession(false, "", "not_applicable", "")
+            val deferred = f.store.readPending()!!
+            assertTrue(deferred.isRingDeferred)
+            f.owner.resumeRingTransfer()
+            assertTrue("Failed local sealing must retain the deferred choice", f.store.readPending()!!.isRingDeferred)
+            assertTrue(f.port.reads.isEmpty())
+            assertTrue(uploads.requests.isEmpty())
+
+            f.heartRate.finishError = null
+            f.errors.clear()
+            f.owner.resumeRingTransfer()
+            assertNotNull(f.store.readPending()!!.heartRate!!.endedAtMs)
+            f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+            val saved = f.store.read(deferred.sessionId)!!
+            assertEquals(deferred.reference, saved.reference)
+            assertNotNull(saved.localData)
+            assertEquals(1L, saved.heartRate!!.sampleCount)
             assertEquals(listOf(saved.sessionId to false), uploads.requests)
         }
     }
@@ -3592,6 +3688,7 @@ class RealCollectionControllerTest {
         var prepareAccepted = true
         var prepareError: Exception? = null
         var finishError: Exception? = null
+        var selectionError: Exception? = null
         val activeSessionId get() = recorder.activeSessionId
 
         fun ready() {
@@ -3605,9 +3702,10 @@ class RealCollectionControllerTest {
             state = state.copy(lastHeartRate = hr)
         }
 
-        override fun resetSelection() { resetCount++; state = PolarUiState() }
-        override fun search() { state = state.copy(scanning = true) }
+        override fun resetSelection() { selectionError?.let { throw it }; resetCount++; state = PolarUiState() }
+        override fun search() { selectionError?.let { throw it }; state = state.copy(scanning = true) }
         override fun connect(deviceId: String) {
+            selectionError?.let { throw it }
             state = state.copy(selectedDeviceId = deviceId, connecting = true, scanning = false)
         }
         override fun prepare(session: FreeLivingSession): Boolean {

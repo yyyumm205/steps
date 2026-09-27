@@ -131,6 +131,66 @@ class MultisportSessionContractTest {
         assertEquals(t - 1_000, m.getAsJsonObject("heart_rate")["last_sample_at_ms"].asLong)
     }
 
+    @Test fun sampleLossRequiresAnAdditionalStorageGapOccurrence() {
+        val f = fixture(SessionActivity.RUNNING, heartRate = heart())
+        val loss = HeartRateGap(t + 100, t + 500, "storage_error")
+        val earlierLoss = HeartRateGap(t + 50, t + 400, "storage_error")
+        val checkpoint = heart().copy(sampleCount = 3, firstSampleAtMs = t + 100,
+            lastSampleAtMs = t + 300, gaps = listOf(loss, loss, earlierLoss))
+        f.store.updateHeartRate(f.session.sessionId, checkpoint)
+
+        for (gaps in listOf(checkpoint.gaps, checkpoint.gaps.reversed(), listOf(loss, earlierLoss),
+            checkpoint.gaps + HeartRateGap(t + 300, null, "process_restart"))) {
+            assertThrows(IllegalArgumentException::class.java) {
+                f.store.updateHeartRate(f.session.sessionId,
+                    checkpoint.copy(sampleCount = 2, lastSampleAtMs = t + 200, gaps = gaps))
+            }
+            assertEquals(checkpoint, f.reopen().read()!!.heartRate)
+        }
+
+        val recovered = checkpoint.copy(sampleCount = 2, lastSampleAtMs = t + 200,
+            gaps = checkpoint.gaps + loss)
+        f.store.updateHeartRate(f.session.sessionId, recovered)
+        assertEquals(recovered, f.reopen().read()!!.heartRate)
+        assertThrows(IllegalArgumentException::class.java) {
+            f.store.updateHeartRate(f.session.sessionId,
+                recovered.copy(sampleCount = 1, lastSampleAtMs = t + 100))
+        }
+        assertEquals(recovered, f.reopen().read()!!.heartRate)
+    }
+
+    @Test fun closingAnOpenStorageGapStillDocumentsRecoveredSampleLoss() {
+        val f = fixture(SessionActivity.RUNNING, heartRate = heart())
+        val checkpoint = heart().copy(sampleCount = 1, firstSampleAtMs = t + 100,
+            lastSampleAtMs = t + 100, gaps = listOf(HeartRateGap(t + 200, null, "storage_error")))
+        f.store.updateHeartRate(f.session.sessionId, checkpoint)
+        val recovered = checkpoint.copy(sampleCount = 0, firstSampleAtMs = null, lastSampleAtMs = null,
+            gaps = listOf(HeartRateGap(t + 200, t - 100, "storage_error")))
+        f.store.updateHeartRate(f.session.sessionId, recovered)
+        assertEquals(recovered, f.reopen().read()!!.heartRate)
+    }
+
+    @Test fun storageGapOccurrencesCannotReduceEndedOrFileBackedSampleCounts() {
+        for (ended in listOf(false, true)) {
+            val f = fixture(SessionActivity.RUNNING, heartRate = heart())
+            val loss = HeartRateGap(t + 100, t + 500, "storage_error")
+            val recorded = f.writeHeart(listOf(t + 100, t + 200)).copy(gaps = listOf(loss))
+            val checkpoint = if (ended) recorded else recorded.copy(endedAtMs = null)
+            f.store.updateHeartRate(f.session.sessionId, checkpoint)
+            assertThrows(IllegalArgumentException::class.java) {
+                f.store.updateHeartRate(f.session.sessionId, checkpoint.copy(sampleCount = 1,
+                    lastSampleAtMs = t + 100, gaps = checkpoint.gaps + loss))
+            }
+            assertEquals(checkpoint, f.reopen().read()!!.heartRate)
+            if (ended) {
+                assertThrows(IllegalArgumentException::class.java) {
+                    f.store.updateHeartRate(f.session.sessionId, checkpoint.copy(gaps = checkpoint.gaps + loss))
+                }
+                assertEquals(checkpoint, f.reopen().read()!!.heartRate)
+            }
+        }
+    }
+
     @Test fun incompleteGapCorruptContentOrDifferentFilenameCannotBePublished() {
         val f = fixture(SessionActivity.TABLE_TENNIS, heartRate = heart())
         f.completeReference()

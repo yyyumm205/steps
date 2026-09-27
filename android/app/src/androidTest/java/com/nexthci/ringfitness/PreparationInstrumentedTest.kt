@@ -35,12 +35,13 @@ class PreparationInstrumentedTest {
         ActivityScenario.launch<StepPreparationActivity>(launch).use { scenario ->
             repeat(2) { index ->
                 if (index == 1) scenario.recreate()
-                awaitPreparationLoaded(scenario)
-                scenario.onActivity { activity ->
+                awaitPreparationLoaded(scenario) { activity ->
                     val views = descendants(activity.findViewById(android.R.id.content)).filter { it.isShown }.toList()
-                    assertTrue(views.filterIsInstance<TextView>().any {
-                        it.tag == "heading" && it.text.toString() == "开始使用"
-                    })
+                    assertTrue("Expected the registration heading after launcher pass $index; visible text: " +
+                        views.filterIsInstance<TextView>().joinToString { "${it.tag}='${it.text}'" },
+                        views.filterIsInstance<TextView>().any {
+                            it.tag == "heading" && it.text.toString() == "开始使用"
+                        })
                     assertFalse(views.filterIsInstance<Button>().any {
                         it.isEnabled && (it.text.startsWith("开始采集") || it.text.contains("登录") || it.text.contains("Oura"))
                     })
@@ -49,18 +50,36 @@ class PreparationInstrumentedTest {
         }
     }
 
-    private fun awaitPreparationLoaded(scenario: ActivityScenario<StepPreparationActivity>) {
+    private fun awaitPreparationLoaded(
+        scenario: ActivityScenario<StepPreparationActivity>,
+        assertions: (StepPreparationActivity) -> Unit,
+    ) {
         val deadline = SystemClock.elapsedRealtime() + 10_000
+        var lastState = "No activity state observed"
         do {
             var loaded = false
             scenario.onActivity { activity ->
-                val primary = activity.findViewById<View>(android.R.id.content).findViewWithTag<Button>("primary")
-                loaded = primary != null && primary.text.toString() !in listOf("正在读取…", "正在保存…")
+                val content = activity.findViewById<View>(android.R.id.content)
+                val primary = content.findViewWithTag<Button>("primary")
+                val progress = content.findViewWithTag<View>("loading_state")
+                val heading = content.findViewWithTag<TextView>("heading")
+                val progressStatus = content.findViewWithTag<TextView>("loading_status")
+                lastState = "focus=${activity.hasWindowFocus()}, attached=${content.isAttachedToWindow}, " +
+                    "laidOut=${content.isLaidOut}, heading='${heading?.text}' shown=${heading?.isShown}, " +
+                    "primary='${primary?.text}' visibility=${primary?.visibility} enabled=${primary?.isEnabled}, " +
+                    "progress=${progress?.visibility} '${progressStatus?.text}'"
+                // Loading retains the business label (e.g. 下一步) on a hidden, disabled
+                // primary action. Wait for its rendered state, including after recreation.
+                loaded = content.isAttachedToWindow && content.isLaidOut && activity.hasWindowFocus() &&
+                    heading?.isShown == true && primary?.isShown == true && primary.isEnabled &&
+                    progress?.visibility == View.GONE
+                // Keep the readiness check and assertions in the same main-thread callback.
+                if (loaded) assertions(activity)
             }
             if (loaded) return
             SystemClock.sleep(25)
         } while (SystemClock.elapsedRealtime() < deadline)
-        throw AssertionError("Preparation page did not finish reading its profile within 10 seconds")
+        throw AssertionError("Preparation page did not become visible and ready within 10 seconds: $lastState")
     }
 
     @Test

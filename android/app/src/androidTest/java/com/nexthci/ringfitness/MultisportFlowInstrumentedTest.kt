@@ -198,7 +198,7 @@ class MultisportFlowInstrumentedTest {
                 assertTrue(stop!!.isEnabled)
                 assertEquals(View.VISIBLE, tagged<View>(it, "heart_rate_capture_hint").visibility)
             }
-            captureScreen(scenario, "h10_disconnected_capture")
+            captureScreen(scenario, "h10_disconnected_capture", anchorTag = "heart_rate_status")
             fixture.state = fixture.state.copy(heartRateState = fixture.state.heartRateState.copy(connecting = true))
             render(scenario, fixture)
             scenario.onActivity { assertEquals("心率带正在重连…", status!!.text.toString()) }
@@ -220,6 +220,122 @@ class MultisportFlowInstrumentedTest {
                 assertEquals("连接已中断，请重新连接", tagged<TextView>(it, "heart_rate_status").text.toString())
                 assertFalse(tagged<Button>(it, "flow_primary").isEnabled)
             }
+        }
+    }
+
+    @Test fun optionalHeartRateErrorsStayInPlaceAndKeepRecoveryActionsAvailable() = withFlow { handle ->
+        launch().use { scenario ->
+            register(scenario)
+            val preparation = requireNotNull(PreparationStore(File(handle.directory, "profile")).read())
+            val operationError = "心率带暂时无法启用，请重试或关闭心率带"
+            val fixture = RenderingFlow(base().copy(selectedActivity = SessionActivity.TENNIS,
+                heartRateEnabled = true, heartRateState = PolarUiState(operationError = operationError)))
+            render(scenario, fixture)
+            lateinit var preparationStatus: TextView
+            lateinit var toggle: Button
+            lateinit var scan: Button
+            lateinit var start: Button
+            var activityButtons = emptyList<Button>()
+            scenario.onActivity { activity ->
+                preparationStatus = tagged(activity, "heart_rate_status")
+                toggle = tagged(activity, "heart_rate_toggle")
+                scan = tagged(activity, "heart_rate_scan")
+                start = tagged(activity, "flow_primary")
+                activityButtons = SessionActivity.selectable.map { tagged(activity, "activity_${it.wireValue}") }
+            }
+            val preparationStates = listOf(
+                PolarUiState(operationError = operationError) to operationError,
+                PolarUiState(message = "没有发现 Polar H10") to "未发现 Polar H10，请靠近心率带后重新搜索",
+                PolarUiState(message = "搜索 H10 失败：permission denied") to "搜索失败，请检查蓝牙和权限后重试",
+                PolarUiState(selectedDeviceId = "TEST-H10",
+                    devices = listOf(PolarUiDevice("TEST-H10", "Polar H10", -45)),
+                    message = "连接 H10 失败：等待心率服务超时") to "连接超时，请靠近心率带后重试",
+            )
+            preparationStates.forEach { (polar, expected) ->
+                fixture.state = fixture.state.copy(heartRateState = polar)
+                render(scenario, fixture)
+                scenario.onActivity { activity ->
+                    assertSame(preparationStatus, tagged<TextView>(activity, "heart_rate_status"))
+                    assertEquals(expected, preparationStatus.text.toString())
+                    assertTrue(preparationStatus.isShown)
+                    assertSame(toggle, tagged<Button>(activity, "heart_rate_toggle"))
+                    assertEquals("关闭心率带", toggle.text.toString())
+                    assertTrue(toggle.isShown && toggle.isEnabled)
+                    assertSame(scan, tagged<Button>(activity, "heart_rate_scan"))
+                    assertTrue(scan.isShown && scan.isEnabled)
+                    assertSame(start, tagged<Button>(activity, "flow_primary"))
+                    assertEquals("开始采集", start.text.toString())
+                    assertFalse(start.isEnabled)
+                    assertEquals("已连接", tagged<TextView>(activity, "home_device_status").text.toString())
+                    assertNull(taggedOrNull<View>(activity, "home_task_status"))
+                    assertEquals(9, activityButtons.size)
+                    SessionActivity.selectable.forEachIndexed { index, sport ->
+                        val button = tagged<Button>(activity, "activity_${sport.wireValue}")
+                        assertSame(activityButtons[index], button)
+                        assertTrue(button.isShown && button.isEnabled)
+                        assertEquals(sport == SessionActivity.TENNIS, button.isSelected)
+                    }
+                    if (polar.selectedDeviceId != null) {
+                        assertTrue(tagged<Button>(activity, "heart_rate_device_TEST-H10").isEnabled)
+                    }
+                }
+                if (polar.operationError != null) {
+                    captureScreen(scenario, "h10_preparation_error", anchorTag = "heart_rate_controls")
+                }
+            }
+            click(scenario, "heart_rate_toggle")
+            assertEquals(listOf(false), fixture.heartRateEnabledRequests)
+            fixture.state = fixture.state.copy(heartRateEnabled = false)
+            render(scenario, fixture)
+            scenario.onActivity { activity ->
+                assertSame(start, tagged<Button>(activity, "flow_primary"))
+                assertTrue(start.isEnabled)
+                assertEquals(View.GONE, tagged<View>(activity, "heart_rate_details").visibility)
+                assertEquals("启用 Polar H10", toggle.text.toString())
+                SessionActivity.selectable.forEachIndexed { index, sport ->
+                    assertSame(activityButtons[index], tagged<Button>(activity, "activity_${sport.wireValue}"))
+                }
+            }
+
+            val now = System.currentTimeMillis()
+            val session = stopped(preparation, SessionActivity.TENNIS).copy(
+                phase = FreeLivingSessionPhase.COLLECTING, stopRequestedAtMs = null, stopConfirmedAtMs = null,
+                startRequestedAtMs = now - 190_000, startConfirmedAtMs = now - 180_000,
+                heartRate = SessionHeartRate("TEST-H10", "Polar H10", now - 180_000))
+            val recording = PolarUiState(selectedDeviceId = "TEST-H10", connected = true, hrReady = true,
+                recording = true, lastHeartRate = 72)
+            fixture.state = base().copy(page = CollectionPage.COLLECTING, session = session,
+                canStop = true, heartRateEnabled = true, heartRateState = recording)
+            render(scenario, fixture)
+            lateinit var captureStatus: TextView
+            lateinit var stop: Button
+            lateinit var elapsed: TextView
+            scenario.onActivity { activity ->
+                captureStatus = tagged(activity, "heart_rate_status")
+                stop = tagged(activity, "flow_primary")
+                elapsed = tagged(activity, "flow_elapsed")
+            }
+            val storageError = "心率数据保存中断，戒指采集继续；请检查手机空间"
+            listOf(
+                recording.copy(recording = false, storageError = storageError),
+                recording.copy(connected = false, hrReady = false, connecting = true, storageError = storageError),
+                recording.copy(lastHeartRate = 86, storageError = storageError),
+            ).forEach { polar ->
+                fixture.state = fixture.state.copy(heartRateState = polar)
+                render(scenario, fixture)
+                scenario.onActivity { activity ->
+                    assertSame(captureStatus, tagged<TextView>(activity, "heart_rate_status"))
+                    assertEquals(storageError, captureStatus.text.toString())
+                    assertTrue(captureStatus.isShown)
+                    assertSame(stop, tagged<Button>(activity, "flow_primary"))
+                    assertEquals("结束采集", stop.text.toString())
+                    assertTrue(stop.isShown && stop.isEnabled)
+                    assertSame(elapsed, tagged<TextView>(activity, "flow_elapsed"))
+                    assertEquals("正在采集", tagged<TextView>(activity, "flow_heading").text.toString())
+                    assertNull(taggedOrNull<View>(activity, "home_task_status"))
+                }
+            }
+            captureScreen(scenario, "h10_storage_error_capture", anchorTag = "heart_rate_status")
         }
     }
 
@@ -293,6 +409,7 @@ class MultisportFlowInstrumentedTest {
     private class RenderingFlow(override var state: CollectionFlowState) : CollectionFlow {
         var finalized: Pair<Boolean, Triple<String, String, String>>? = null
         val draftUpdates = mutableListOf<String>()
+        val heartRateEnabledRequests = mutableListOf<Boolean>()
         override fun observe(observer: (CollectionFlowState) -> Unit): AutoCloseable {
             observer(state)
             return AutoCloseable {}
@@ -301,6 +418,7 @@ class MultisportFlowInstrumentedTest {
             finalized = uploadNow to Triple(stepsText, status, reason)
         }
         override fun updateReferenceDraft(stepsText: String) { draftUpdates += stepsText }
+        override fun setHeartRateEnabled(enabled: Boolean) { heartRateEnabledRequests += enabled }
         override fun register(participantId: String, placement: RingPlacement) = error("Unexpected registration")
         override fun start() = error("Unexpected device start")
         override fun stop() = error("Unexpected device stop")

@@ -20,12 +20,22 @@ data class PolarUiState(
     val recording: Boolean = false,
     val lastHeartRate: Int? = null,
     val message: String = "",
+    /** Stable user-facing warning retained if heart-rate samples cannot be saved. */
+    val storageError: String? = null,
+    /** Recoverable preparation error, independent of ring readiness. */
+    val operationError: String? = null,
 ) {
     val ready: Boolean get() = connected && hrReady && selectedDeviceId != null
 }
 
 internal fun heartRateStatusLabel(enabled: Boolean, polar: PolarUiState, captureActive: Boolean = false): String = when {
     !enabled -> "未启用"
+    polar.storageError != null -> polar.storageError
+    polar.operationError != null -> polar.operationError
+    !captureActive && polar.message.startsWith("搜索 H10 失败") -> "搜索失败，请检查蓝牙和权限后重试"
+    !captureActive && polar.message == "连接 H10 失败：等待心率服务超时" -> "连接超时，请靠近心率带后重试"
+    !captureActive && polar.message == "连接 H10 失败：心率服务不可用" -> "心率服务暂不可用，请重新连接"
+    !captureActive && polar.message.startsWith("连接 H10 失败") -> "连接失败，请重试或重新搜索"
     polar.scanning -> "正在搜索 Polar H10…"
     polar.connecting -> if (captureActive) "心率带正在重连…" else "正在连接 Polar H10…"
     !polar.connected && polar.selectedDeviceId != null ->
@@ -34,6 +44,8 @@ internal fun heartRateStatusLabel(enabled: Boolean, polar: PolarUiState, capture
     polar.ready && polar.recording -> polar.lastHeartRate?.let { "$it bpm · 正在采集" } ?: "正在采集 HR/RR"
     polar.ready && captureActive -> "已连接，等待 HR/RR 数据"
     polar.ready -> "Polar H10 已就绪"
+    polar.message == "没有发现 Polar H10" -> "未发现 Polar H10，请靠近心率带后重新搜索"
+    polar.devices.isNotEmpty() -> "请选择下方的 Polar H10"
     else -> "请搜索并连接 Polar H10"
 }
 

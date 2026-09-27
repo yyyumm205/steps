@@ -16,7 +16,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 
 data class PolarH10State(
@@ -34,20 +33,17 @@ data class PolarH10State(
 
 class PolarH10Client(context: Context, private val listener: (PolarH10State) -> Unit) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val api = PolarBleApiDefaultImpl.defaultImplementation(
-        context.applicationContext,
-        setOf(
-            PolarBleApi.PolarBleSdkFeature.FEATURE_HR,
-            PolarBleApi.PolarBleSdkFeature.FEATURE_DEVICE_INFO,
-            PolarBleApi.PolarBleSdkFeature.FEATURE_BATTERY_INFO,
-        ),
-    )
+    private val applicationContext = context.applicationContext
+    private var api = createApi()
     private var state = PolarH10State()
     // SDK callbacks, UI actions and Flow collectors can run on different threads.
     private val stateLock = Any()
     private var closed = false
     private var scanJob: Job? = null
     private var scanGeneration = 0L
+    private val preparationGate = PolarPreparationGate()
+    private var preparationJob: Job? = null
+    private var preparationRebuildJob: Job? = null
     private var streamJob: Job? = null
     private var reconnectJob: Job? = null
     private var captureRequested = false
@@ -60,10 +56,24 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
     private var sampleConsumer: ((PolarHrData.PolarHrSample, Long) -> Unit)? = null
 
     init {
-        api.setAutomaticReconnection(true)
-        api.setApiCallback(object : PolarBleApiCallback() {
+        installApiCallbacks(api, preparationGate.clientGeneration)
+    }
+
+    private fun createApi(): PolarBleApi = PolarBleApiDefaultImpl.defaultImplementation(
+        applicationContext,
+        setOf(
+            PolarBleApi.PolarBleSdkFeature.FEATURE_HR,
+            PolarBleApi.PolarBleSdkFeature.FEATURE_DEVICE_INFO,
+            PolarBleApi.PolarBleSdkFeature.FEATURE_BATTERY_INFO,
+        ),
+    )
+
+    private fun installApiCallbacks(activeApi: PolarBleApi, generation: Long) {
+        activeApi.setAutomaticReconnection(true)
+        activeApi.setApiCallback(object : PolarBleApiCallback() {
             override fun deviceConnecting(polarDeviceInfo: PolarDeviceInfo) {
                 synchronized(stateLock) {
+                    if (closed || !preparationGate.acceptsClient(generation)) return
                     if (!acceptDevice(polarDeviceInfo.deviceId)) return
                     update {
                         it.copy(
@@ -82,13 +92,14 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
 
             override fun deviceConnected(polarDeviceInfo: PolarDeviceInfo) {
                 synchronized(stateLock) {
+                    if (closed || !preparationGate.acceptsClient(generation)) return
                     if (!acceptDevice(polarDeviceInfo.deviceId)) return
                     update {
                         it.copy(
                             devices = listOf(polarDeviceInfo),
                             selectedDeviceId = polarDeviceInfo.deviceId,
                             connected = true,
-                            connecting = true,
+                            connecting = !it.hrReady,
                             connectionFailed = false,
                             message = "${polarDeviceInfo.name} 已连接，等待实时 HR/RR 服务",
                         )
@@ -98,7 +109,14 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
 
             override fun deviceDisconnected(polarDeviceInfo: PolarDeviceInfo) {
                 synchronized(stateLock) {
+                    if (closed || !preparationGate.acceptsClient(generation)) return
+                    val retirement = preparationGate.disconnected(polarDeviceInfo.deviceId)
+                    if (retirement.expected && !captureRequested) {
+                        retirement.retry?.let(::issuePreparationConnection)
+                        return
+                    }
                     if (!acceptDevice(polarDeviceInfo.deviceId)) return
+                    cancelPreparationTimeout()
                     retireStream()
                     update {
                         it.copy(
@@ -120,7 +138,10 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
             }
 
             override fun bleSdkFeatureReady(identifier: String, feature: PolarBleApi.PolarBleSdkFeature) {
-                if (feature == PolarBleApi.PolarBleSdkFeature.FEATURE_HR) markHrReady(identifier)
+                synchronized(stateLock) {
+                    if (closed || !preparationGate.acceptsClient(generation)) return
+                    if (feature == PolarBleApi.PolarBleSdkFeature.FEATURE_HR) markHrReady(identifier)
+                }
             }
 
             override fun bleSdkFeaturesReadiness(
@@ -128,7 +149,17 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
                 ready: List<PolarBleApi.PolarBleSdkFeature>,
                 unavailable: List<PolarBleApi.PolarBleSdkFeature>,
             ) {
-                if (ready.contains(PolarBleApi.PolarBleSdkFeature.FEATURE_HR)) markHrReady(identifier)
+                synchronized(stateLock) {
+                    if (closed || !preparationGate.acceptsClient(generation)) return
+                    when {
+                        ready.contains(PolarBleApi.PolarBleSdkFeature.FEATURE_HR) -> markHrReady(identifier)
+                        unavailable.contains(PolarBleApi.PolarBleSdkFeature.FEATURE_HR) -> {
+                            if (!captureRequested && acceptDevice(identifier)) {
+                                failPreparation(identifier, "连接 H10 失败：心率服务不可用")
+                            }
+                        }
+                    }
+                }
             }
 
             override fun disInformationReceived(identifier: String, disInfo: DisInfo) = Unit
@@ -143,22 +174,27 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
         if (closed || captureRequested) return@synchronized
         scanJob?.cancel()
         scanJob = null
+        cancelPreparationTimeout()
         cancelReconnect()
         scanGeneration += 1
         val previousDevice = state.selectedDeviceId
+        val disconnectPrevious = state.connected || state.connecting
         update {
             PolarH10State(message = "")
         }
-        previousDevice?.let { runCatching { api.disconnectFromDevice(it) } }
+        if (disconnectPrevious) previousDevice?.let(::requestPreparationDisconnection)
     }
 
     fun search(): Unit = synchronized(stateLock) {
         if (closed || captureRequested) return@synchronized
         scanJob?.cancel()
+        cancelPreparationTimeout()
         cancelReconnect()
         scanGeneration += 1
         val generation = scanGeneration
+        if (!preparationGate.clientReady) replacePreparationClient()
         val previousDevice = state.selectedDeviceId
+        val disconnectPrevious = state.connected || state.connecting
         update {
             it.copy(
                 devices = emptyList(),
@@ -172,38 +208,31 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
                 lastHeartRate = null,
             )
         }
-        previousDevice?.let { runCatching { api.disconnectFromDevice(it) } }
+        if (disconnectPrevious) previousDevice?.let(::requestPreparationDisconnection)
         scanJob = scope.launch {
             delay(300)
             if (!synchronized(stateLock) { !closed && generation == scanGeneration }) return@launch
             val found = linkedMapOf<String, PolarDeviceInfo>()
-            val collector = launch {
-                api.searchForDevice("Polar H10")
-                    .catch { error ->
-                        synchronized(stateLock) {
-                            if (!closed && generation == scanGeneration) {
-                                update { it.copy(message = "搜索 H10 失败：${error.message}") }
-                            }
-                        }
+            val failure = collectPolarScan(10_000, { api.searchForDevice("Polar H10") }) { device ->
+                synchronized(stateLock) {
+                    if (!closed && generation == scanGeneration &&
+                        (device.hasHeartRateService || device.name.contains("H10", true))) {
+                        found[device.deviceId] = device
+                        update { it.copy(devices = found.values.sortedByDescending(PolarDeviceInfo::rssi)) }
                     }
-                    .collect { device ->
-                        synchronized(stateLock) {
-                            if (!closed && generation == scanGeneration &&
-                                (device.hasHeartRateService || device.name.contains("H10", true))) {
-                                found[device.deviceId] = device
-                                update { it.copy(devices = found.values.sortedByDescending(PolarDeviceInfo::rssi)) }
-                            }
-                        }
-                    }
+                }
             }
-            delay(10_000)
-            collector.cancel()
             synchronized(stateLock) {
                 if (!closed && generation == scanGeneration) {
+                    scanJob = null
                     update {
                         it.copy(
                             scanning = false,
-                            message = if (found.isEmpty()) "没有发现 Polar H10" else "请选择 Polar H10",
+                            message = when {
+                                failure != null -> "搜索 H10 失败：请检查蓝牙和权限后重试"
+                                found.isEmpty() -> "没有发现 Polar H10"
+                                else -> "请选择 Polar H10"
+                            },
                         )
                     }
                 }
@@ -214,9 +243,11 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
     fun connect(deviceId: String): Unit = synchronized(stateLock) {
         if (closed || captureRequested) return@synchronized
         scanJob?.cancel()
+        cancelPreparationTimeout()
         cancelReconnect()
         scanGeneration += 1
         val previousDevice = state.selectedDeviceId
+        val disconnectPrevious = state.connected || state.connecting
         update {
             it.copy(
                 devices = it.devices.filter { device -> device.deviceId == deviceId },
@@ -230,22 +261,14 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
                 lastHeartRate = null,
             )
         }
-        previousDevice?.takeIf { it != deviceId }?.let { runCatching { api.disconnectFromDevice(it) } }
-        runCatching { api.connectToDevice(deviceId) }
-            .onFailure { error ->
-                update {
-                    it.copy(
-                        connecting = false,
-                        connectionFailed = true,
-                        message = "连接 H10 失败：${error.message}",
-                    )
-                }
-            }
+        if (disconnectPrevious) previousDevice?.takeIf { it != deviceId }?.let(::requestPreparationDisconnection)
+        issuePreparationConnection(startPreparationTimeout(deviceId))
     }
 
     fun startRecording(consumer: (PolarHrData.PolarHrSample, Long) -> Unit): Boolean = synchronized(stateLock) {
         val deviceId = state.selectedDeviceId ?: return@synchronized false
         if (closed || captureRequested || !state.connected || !state.hrReady || streamJob?.isActive == true) return@synchronized false
+        cancelPreparationTimeout()
         captureGeneration += 1
         captureDeviceId = deviceId
         sampleConsumer = consumer
@@ -257,6 +280,7 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
     fun resumeLiveRecording(consumer: (PolarHrData.PolarHrSample, Long) -> Unit): Boolean = synchronized(stateLock) {
         val deviceId = state.selectedDeviceId ?: return@synchronized false
         if (closed || (captureRequested && captureDeviceId != deviceId)) return@synchronized false
+        cancelPreparationTimeout()
         if (!captureRequested) {
             captureGeneration += 1
             captureDeviceId = deviceId
@@ -394,6 +418,7 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
 
     fun markCaptureRestored(deviceId: String): Unit = synchronized(stateLock) {
         if (closed) return@synchronized
+        cancelPreparationTimeout()
         cancelReconnect()
         scanJob?.cancel()
         scanGeneration += 1
@@ -421,6 +446,7 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
 
     private fun markHrReady(identifier: String): Unit = synchronized(stateLock) {
         if (!acceptDevice(identifier)) return@synchronized
+        cancelPreparationTimeout()
         update {
             it.copy(
                 connected = true,
@@ -443,17 +469,114 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
         captureDeviceId = null
         sampleConsumer = null
         scanJob?.cancel()
+        cancelPreparationTimeout()
         streamJob?.cancel()
         streamJob = null
         cancelReconnect()
         runCatching { state.selectedDeviceId?.let(api::disconnectFromDevice) }
-        api.shutDown()
-        scope.cancel()
+        try { api.shutDown() } finally { scope.cancel() }
     }
 
     /** Call only while holding stateLock. Old device callbacks cannot adopt a new selection. */
     private fun acceptDevice(deviceId: String): Boolean = !closed && state.selectedDeviceId == deviceId &&
-        (!captureRequested || captureDeviceId == deviceId)
+        (if (captureRequested) captureDeviceId == deviceId else
+            !state.connectionFailed && !preparationGate.isDisconnecting(deviceId))
+
+    /** Preparation waits for both BLE connection and HR readiness within the same deadline. */
+    private fun startPreparationTimeout(deviceId: String): PolarPreparationGate.Attempt {
+        val attempt = preparationGate.begin(deviceId)
+        val next = scope.launch(start = CoroutineStart.LAZY) {
+            delay(20_000)
+            synchronized(stateLock) {
+                if (!closed && !captureRequested && preparationGate.finish(attempt)) {
+                    failPreparation(deviceId, "连接 H10 失败：等待心率服务超时")
+                }
+            }
+        }
+        preparationJob = next
+        next.start()
+        return attempt
+    }
+
+    private fun issuePreparationConnection(attempt: PolarPreparationGate.Attempt) {
+        if (closed || captureRequested || state.selectedDeviceId != attempt.deviceId ||
+            !preparationGate.isCurrent(attempt)) return
+        if (preparationGate.needsClientReplacement(attempt.deviceId)) {
+            schedulePreparationRebuild(attempt)
+            return
+        }
+        if (!preparationGate.takeConnection(attempt)) return
+        preparationRebuildJob?.cancel()
+        preparationRebuildJob = null
+        runCatching { api.connectToDevice(attempt.deviceId) }.onFailure {
+            failPreparation(attempt.deviceId, "连接 H10 失败：请重试或重新搜索", disconnect = false)
+        }
+    }
+
+    /** Some SDK disconnect paths are already closed and do not emit an acknowledgement. */
+    private fun schedulePreparationRebuild(attempt: PolarPreparationGate.Attempt) {
+        preparationRebuildJob?.cancel()
+        val next = scope.launch(Dispatchers.Main, start = CoroutineStart.LAZY) {
+            delay(1_000)
+            synchronized(stateLock) {
+                if (closed || captureRequested || !preparationGate.isCurrent(attempt) ||
+                    !preparationGate.needsClientReplacement(attempt.deviceId)) return@synchronized
+                try {
+                    replacePreparationClient()
+                    issuePreparationConnection(attempt)
+                } catch (error: Exception) {
+                    failPreparation(attempt.deviceId, "连接 H10 失败：请重试或重新搜索", disconnect = false)
+                }
+            }
+        }
+        preparationRebuildJob = next
+        next.start()
+    }
+
+    /** Called on the main thread; old callbacks are fenced before shutting down the singleton. */
+    private fun replacePreparationClient() {
+        check(!captureRequested)
+        preparationGate.replaceClient(
+            shutdown = { api.shutDown() },
+            create = { generation ->
+                createApi().also { replacement ->
+                    api = replacement
+                    installApiCallbacks(replacement, generation)
+                }
+            },
+        )
+    }
+
+    private fun cancelPreparationTimeout() {
+        preparationGate.clear()
+        preparationJob?.cancel()
+        preparationJob = null
+        preparationRebuildJob?.cancel()
+        preparationRebuildJob = null
+    }
+
+    /** A terminal preparation failure leaves retry controls available despite late SDK callbacks. */
+    private fun failPreparation(deviceId: String, message: String, disconnect: Boolean = true) {
+        if (closed || captureRequested || state.selectedDeviceId != deviceId || state.connectionFailed) return
+        cancelPreparationTimeout()
+        val requestDisconnection = disconnect && preparationGate.beginDisconnection(deviceId)
+        update {
+            it.copy(
+                connected = false,
+                hrReady = false,
+                connecting = false,
+                connectionFailed = true,
+                recording = false,
+                lastHeartRate = null,
+                message = message,
+            )
+        }
+        if (requestDisconnection) runCatching { api.disconnectFromDevice(deviceId) }
+    }
+
+    private fun requestPreparationDisconnection(deviceId: String) {
+        if (preparationGate.beginDisconnection(deviceId)) runCatching { api.disconnectFromDevice(deviceId) }
+    }
 
     private fun ownsStream(deviceId: String, capture: Long, stream: Long): Boolean =
         captureRequested && captureGeneration == capture && streamGeneration == stream && acceptDevice(deviceId)
@@ -473,11 +596,12 @@ class PolarH10Client(context: Context, private val listener: (PolarH10State) -> 
         streamJob = null
         previous?.cancel()
         val preceding = streamBarrier
+        val retiringApi = api
         if (previous != null || stopDeviceId != null) {
             val cleanup = scope.launch(start = CoroutineStart.LAZY) {
                 preceding?.join()
                 previous?.join()
-                if (stopDeviceId != null) runCatching { api.stopHrStreaming(stopDeviceId) }
+                if (stopDeviceId != null) runCatching { retiringApi.stopHrStreaming(stopDeviceId) }
             }
             streamBarrier = cleanup
             cleanup.start()
