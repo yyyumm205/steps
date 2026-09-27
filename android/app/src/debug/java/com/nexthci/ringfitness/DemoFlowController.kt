@@ -4,6 +4,7 @@ import java.io.File
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -44,6 +45,9 @@ class DemoFlowController(
     private var taskPage: CollectionPage? = null
     private var taskError: String? = null
     private var selectedActivity: SessionActivity? = null
+    private var heartRateEnabled = false
+    private var heartRateState = PolarUiState()
+    private var heartRateSelectionGeneration = 0L
 
     @Volatile override var state = CollectionFlowState(isSimulation = true, busy = true)
         private set
@@ -71,6 +75,7 @@ class DemoFlowController(
         if (initialized) return@safely
         initialized = true
         store.listSessions().filter { it.isDiscarded }.forEach { runCatching { store.cleanupDiscardedSession(it.sessionId) } }
+        restoreDemoHeartRate()
         recoverStored(resumeTransfer = true)
         val currentId = store.read()?.sessionId
         store.listSessions().filter {
@@ -104,6 +109,10 @@ class DemoFlowController(
         if (current?.isPending == true) { showStored(current); return@safely }
         val activity = requireNotNull(selectedActivity) { "请选择本次活动" }
         require(activity != SessionActivity.FREE_LIVING)
+        if (heartRateEnabled && !heartRateState.ready) {
+            publish(CollectionPage.HOME, "请先连接并等待 Polar H10 就绪")
+            return@safely
+        }
         if (!connected) { publish(CollectionPage.RECOVERY, "连接已断开，请重新连接"); return@safely }
         // This synthetic reset is allowed only after the previous record is verified on disk.
         if (current != null && !current.isDiscarded) verifyLocalFiles(current)
@@ -113,7 +122,9 @@ class DemoFlowController(
         operationEpoch++
         attachCoordinator()
         selectedActivity = null
-        coordinator!!.requestStart(profile, activity = activity)
+        val heartRate = if (heartRateEnabled) SessionHeartRate(requireNotNull(heartRateState.selectedDeviceId),
+            heartRateState.devices.single { it.deviceId == heartRateState.selectedDeviceId }.name, clock.nowEpochMs()) else null
+        coordinator!!.requestStart(profile, activity = activity, heartRate = heartRate)
     }
 
     override fun selectActivity(activity: SessionActivity) = safely {
@@ -121,6 +132,39 @@ class DemoFlowController(
         if (store.readPending() != null || state.busy) return@safely
         selectedActivity = activity
         publish(state.page, state.error)
+    }
+
+    override fun setHeartRateEnabled(enabled: Boolean) = safely {
+        if (store.readPending() != null || state.busy) return@safely
+        heartRateSelectionGeneration++
+        heartRateEnabled = enabled
+        heartRateState = PolarUiState()
+        publish(CollectionPage.HOME)
+    }
+
+    override fun scanHeartRate() = safely {
+        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+        val generation = ++heartRateSelectionGeneration
+        heartRateState = PolarUiState(scanning = true)
+        publish(CollectionPage.HOME)
+        later(300, CollectionPage.HOME) {
+            if (generation != heartRateSelectionGeneration || !heartRateEnabled) return@later
+            heartRateState = PolarUiState(devices = listOf(DEMO_H10))
+            publish(CollectionPage.HOME)
+        }
+    }
+
+    override fun connectHeartRate(deviceId: String) = safely {
+        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+        require(heartRateState.devices.any { it.deviceId == deviceId })
+        val generation = ++heartRateSelectionGeneration
+        heartRateState = heartRateState.copy(selectedDeviceId = deviceId, connecting = true)
+        publish(CollectionPage.HOME)
+        later(300, CollectionPage.HOME) {
+            if (generation != heartRateSelectionGeneration || !heartRateEnabled) return@later
+            heartRateState = heartRateState.copy(connected = true, hrReady = true, connecting = false)
+            publish(CollectionPage.HOME)
+        }
     }
 
     override fun enterFinish() = safely {
@@ -150,7 +194,7 @@ class DemoFlowController(
             val current = requireNotNull(store.readPending())
             val policy = current.completionPolicy ?:
                 if (uploadNow) CompletionPolicy.SAVE_UPLOAD else CompletionPolicy.DEFER_ON_RING
-            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs(), current.activity)
             savingReference = true
             try {
                 publish(CollectionPage.SAVING)
@@ -180,6 +224,8 @@ class DemoFlowController(
         coordinator?.close(); coordinator = null
         downloading.remove(current.sessionId)
         selectedActivity = null
+        heartRateEnabled = false
+        heartRateState = PolarUiState()
         taskPage = null
         taskError = if (cleaned) null else "本段已放弃，剩余文件将在下次打开时继续清理。"
         browsingHome = true
@@ -200,6 +246,7 @@ class DemoFlowController(
             store.requestStop(current.sessionId, clock.nowEpochMs())
             publish(CollectionPage.STOPPING)
             val stopped = record.copy(endedAtMs = clock.nowEpochMs())
+            finishDemoHeartRate(current)
             device.save(stopped)
             if (consume(FlowTestFault.STOP_TIMEOUT)) {
                 later(1800) { publish(CollectionPage.RECOVERY, "暂未收到结束确认，请重新检查") }
@@ -211,13 +258,17 @@ class DemoFlowController(
         browsingHome = false
         if (savingReference) { publish(CollectionPage.SAVING); return@safely }
         val current = store.read() ?: return@safely
+        if (!current.activity.requiresReferenceSteps) {
+            publish(if (current.stopConfirmedAtMs == null) CollectionPage.RECOVERY else CollectionPage.FINISH)
+            return@safely
+        }
         require(current.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED, FreeLivingSessionPhase.AWAITING_REFERENCE))
         publish(if (current.stopConfirmedAtMs != null && current.completionPolicy == null) CollectionPage.FINISH else CollectionPage.REFERENCE)
     }
 
     override fun updateReferenceDraft(stepsText: String) = safely {
         val current = requireNotNull(store.readPending())
-        require(current.reference == null && current.startAbort == null) { "本段无需填写步数" }
+        require(current.reference == null && current.startAbort == null && current.activity.requiresReferenceSteps) { "本段无需填写步数" }
         require(stepsText.isEmpty() || stepsText.matches(Regex("[0-9]{1,19}"))) { "请输入计步器上的整数" }
         referenceDrafts.save(current.sessionId, stepsText)
         publish(state.page, state.error)
@@ -229,7 +280,7 @@ class DemoFlowController(
         val current = requireNotNull(store.read())
         if (current.reference != null) { showStored(current); return@safely }
         require(current.stopConfirmedAtMs == null || current.completionPolicy != null) { "请选择保存方式" }
-        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs(), current.activity)
         if (current.stopConfirmedAtMs == null && reference.status == ReferenceStatus.VALID) {
             throw IllegalArgumentException("请先确认结束，或注明本次读数的异常")
         }
@@ -284,7 +335,7 @@ class DemoFlowController(
     }
 
     override fun reviseReference(sessionId: String, stepsText: String, status: String, reason: String) = safely {
-        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+        val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs(), requireNotNull(store.read(sessionId)).activity)
         store.reviseReferenceBeforeUpload(sessionId, reference)
         publish(CollectionPage.HOME)
     }
@@ -347,6 +398,7 @@ class DemoFlowController(
             override fun start(): Boolean {
                 val session = requireNotNull(store.read())
                 check(device.read() == null)
+                prepareDemoHeartRate(session)
                 device.save(DemoDeviceRecord(session.sessionId, (UUID.randomUUID().hashCode() and 0x7fffffff) % 65535 + 1, clock.nowEpochMs()))
                 blockedQuery = consume(FlowTestFault.START_TIMEOUT)
                 return true
@@ -355,6 +407,7 @@ class DemoFlowController(
             override fun stop(): Boolean {
                 val session = requireNotNull(store.read())
                 val record = requireOwnedDevice(session)
+                finishDemoHeartRate(session)
                 device.save(record.copy(endedAtMs = clock.nowEpochMs()))
                 blockedQuery = consume(FlowTestFault.STOP_TIMEOUT)
                 return true
@@ -526,6 +579,43 @@ class DemoFlowController(
         }
     }
 
+    private fun prepareDemoHeartRate(session: FreeLivingSession) {
+        val configured = session.heartRate ?: return
+        val now = clock.nowEpochMs()
+        val file = File(directory, SessionHeartRate.fileName(session.sessionId))
+        require(!file.exists()) { "本段演示心率文件已存在" }
+        val sample = "${Instant.ofEpochMilli(now)},$now,1,72,72,0,true,true,true,833,853\n"
+        writeDemoFile(file, (SessionHeartRate.CSV_HEADER + "\n" + sample).toByteArray(Charsets.UTF_8), syncDirectory)
+        store.updateHeartRate(session.sessionId, configured.copy(sampleCount = 1,
+            firstSampleAtMs = now, lastSampleAtMs = now))
+        heartRateState = heartRateState.copy(recording = true, lastHeartRate = 72)
+    }
+
+    private fun finishDemoHeartRate(session: FreeLivingSession) {
+        val recorded = session.heartRate ?: return
+        if (recorded.endedAtMs != null) return
+        val now = clock.nowEpochMs()
+        val file = File(directory, SessionHeartRate.fileName(session.sessionId))
+        require(file.isFile) { "本段演示心率文件需要检查" }
+        val bytes = file.readBytes()
+        store.updateHeartRate(session.sessionId, recorded.copy(endedAtMs = now,
+            gaps = recorded.gaps.map { if (it.endedAtMs == null) it.copy(endedAtMs = now) else it },
+            file = SessionHeartRateFile(file.name, bytes.size.toLong(), demoDigest(bytes))))
+        heartRateEnabled = false
+        heartRateState = heartRateState.copy(recording = false)
+    }
+
+    private fun restoreDemoHeartRate() {
+        val session = store.read()?.takeIf { !it.isDiscarded && it.localData == null } ?: return
+        val recorded = session.heartRate?.takeIf { it.endedAtMs == null } ?: return
+        val now = clock.nowEpochMs()
+        store.updateHeartRate(session.sessionId, recorded.copy(gaps = recorded.gaps +
+            HeartRateGap(recorded.lastSampleAtMs ?: recorded.startedAtMs, now, "process_restart")))
+        heartRateEnabled = true
+        heartRateState = PolarUiState(devices = listOf(DEMO_H10), selectedDeviceId = recorded.deviceId,
+            connected = true, hrReady = true, recording = true, lastHeartRate = 72)
+    }
+
     private fun verifyLocalFiles(session: FreeLivingSession) {
         val local = requireNotNull(session.localData)
         require(local.files.isNotEmpty())
@@ -590,18 +680,21 @@ class DemoFlowController(
             ringName = profile?.ring?.name.orEmpty(), placement = profile?.placement,
             session = session, connected = connected, busy = busy, error = if (visiblePage == CollectionPage.HOME) taskError else error,
             savedSteps = reference?.steps, referenceStatus = reference?.status?.name?.lowercase(),
-            canStart = !blockingWork && connected && profile?.ring != null && (session == null || session.localData != null),
+            canStart = !blockingWork && connected && profile?.ring != null && (session == null || session.localData != null) &&
+                (!heartRateEnabled || heartRateState.ready),
             canStop = !busy && connected && session?.phase == FreeLivingSessionPhase.COLLECTING &&
                 (recoveryOwner || coordinator?.state?.phase == CaptureControlPhase.COLLECTING),
             canRetry = !busy && (taskPage != null || session != null || !connected),
             selectedActivity = selectedActivity, referenceDraft = referenceDraft,
+            heartRateEnabled = (session?.isPending == true && session.heartRate != null) || heartRateEnabled,
+            heartRateState = heartRateState,
             records = store.listSessions().filterNot { it.isDiscarded }.map { FlowRecordSummary(it.sessionId, it.reference?.steps,
                 it.reference?.status?.name?.lowercase(), it.transfer.status.name.lowercase(), it.localData != null,
                 transferInFlight = it.sessionId in transferring, activity = it.activity,
                 uploadDeferred = it.completionPolicy == CompletionPolicy.SAVE_LATER,
                 startedAtMs = it.startedAtMs,
                 timeZoneId = it.timeZoneId,
-                referenceEditable = it.localData != null && it.reference != null &&
+                referenceEditable = it.activity.requiresReferenceSteps && it.localData != null && it.reference != null &&
                     it.completionPolicy == CompletionPolicy.SAVE_LATER &&
                     it.transfer.status == SessionTransferStatus.PENDING && it.transfer.attempts == 0 &&
                     it.sessionId !in transferring,
@@ -628,5 +721,6 @@ class DemoFlowController(
     companion object {
         private val waitingPages = setOf(CollectionPage.STARTING, CollectionPage.STOPPING, CollectionPage.SAVING, CollectionPage.DOWNLOADING, CollectionPage.UPLOADING)
         val DEMO_RING = PreparedRing("02:00:00:00:00:01", "体验戒指")
+        val DEMO_H10 = PolarUiDevice("DEMOH10", "Polar H10（演示）", -42)
     }
 }

@@ -35,7 +35,7 @@ enum class DeviceBoundarySource(val wireValue: String) {
 }
 
 enum class ReferenceStatus(val wireValue: String) {
-    VALID("valid"), MISSING("missing"), UNRELIABLE("unreliable"),
+    VALID("valid"), MISSING("missing"), UNRELIABLE("unreliable"), NOT_APPLICABLE("not_applicable"),
 }
 
 data class SessionReference(
@@ -182,6 +182,7 @@ data class FreeLivingSession(
     val referenceRevisions: List<SessionReferenceRevision> = emptyList(),
     val startCommandDispatch: StartCommandDispatch? = null,
     val stopCommandDispatch: StopCommandDispatch? = null,
+    val heartRate: SessionHeartRate? = null,
 ) {
     val isDiscarded: Boolean get() = discarded != null
     val isPending: Boolean get() = localData == null && startAttemptArchive == null && !isDiscarded && startAbort?.completedAtMs == null
@@ -251,6 +252,32 @@ class FreeLivingSessionStore internal constructor(
         readJournalLocked()?.let { it.archived + it.current }.orEmpty()
     }
 
+    /** Persists H10 progress before local completion freezes all session sources. */
+    fun updateHeartRate(sessionId: String, heartRate: SessionHeartRate): FreeLivingSession =
+        update(sessionId, allowStartAbort = true) { current ->
+            require(current.localData == null && current.transfer.attempts == 0 &&
+                current.transfer.status == SessionTransferStatus.PENDING) { "本段心率数据已保存完成" }
+            require(!File(file.parentFile, "packages/$sessionId").exists()) { "本段上传包已固定" }
+            heartRate.validate(sessionId)
+            val previous = current.heartRate
+            if (previous != null) {
+                require(previous.deviceId == heartRate.deviceId && previous.deviceName == heartRate.deviceName &&
+                    previous.startedAtMs == heartRate.startedAtMs) { "本段心率带不能更换" }
+                val documentedStorageLoss = previous.endedAtMs == null && previous.file == null &&
+                    heartRate.gaps.any { it.reason == "storage_error" && it !in previous.gaps }
+                require(heartRate.sampleCount >= previous.sampleCount || documentedStorageLoss) { "心率记录不能减少" }
+                if (previous.endedAtMs != null) require(previous == heartRate) { "已结束的心率记录保持原样" }
+                if (previous.firstSampleAtMs != null && !documentedStorageLoss) {
+                    require(previous.firstSampleAtMs == heartRate.firstSampleAtMs)
+                }
+            } else {
+                require(current.phase == FreeLivingSessionPhase.START_REQUESTED && current.startCommandDispatch == null) {
+                    "请在开始前选择心率带"
+                }
+            }
+            current.copy(heartRate = heartRate)
+        }
+
     fun setCompletionPolicy(sessionId: String, policy: CompletionPolicy): FreeLivingSession =
         update(sessionId, allowArchived = true) { current ->
             require(current.stopConfirmedAtMs != null) { "请等待戒指确认结束" }
@@ -273,7 +300,7 @@ class FreeLivingSessionStore internal constructor(
      */
     fun finalizeStoppedSession(sessionId: String, policy: CompletionPolicy,
         reference: SessionReference): FreeLivingSession = update(sessionId) { current ->
-        validateReference(reference)
+        validateReference(reference, current.activity)
         require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE && current.stopConfirmedAtMs != null) {
             "请等待戒指确认结束"
         }
@@ -294,6 +321,11 @@ class FreeLivingSessionStore internal constructor(
             reference = current.reference ?: reference,
         )
     }
+
+    /** Non-step sports still persist the explicit completion choice, without inventing a step count. */
+    fun finalizeStoppedSessionWithoutReference(sessionId: String, policy: CompletionPolicy,
+        recordedAtMs: Long): FreeLivingSession = finalizeStoppedSession(sessionId, policy,
+            SessionReference(ReferenceStatus.NOT_APPLICABLE, null, recordedAtMs))
 
     /** Explicit user action releases a durable save-for-later choice. */
     fun allowUpload(sessionId: String): FreeLivingSession = update(sessionId, allowArchived = true) { current ->
@@ -399,6 +431,7 @@ class FreeLivingSessionStore internal constructor(
         require(session.reference != null && session.stopConfirmedAtMs != null) { "采集信息尚未保存完整" }
         require(local.files.none { it.simulated }) { "演示数据不能进入实验上传包" }
         verifyLocalFiles(session, local.files)
+        verifyHeartRate(session)
         // Local audit additions must not change already frozen research manifests.
         encode(session, version = 3).apply {
             remove("phase")
@@ -411,7 +444,9 @@ class FreeLivingSessionStore internal constructor(
             }
             if (session.activity != SessionActivity.FREE_LIVING) addActivity(session.activity)
             if (unknownTime != null) getAsJsonObject("start_baseline").add("unknown_time_start_evidence", unknownTime.encode())
-            addProperty("version", 7)
+            addProperty("version", 8)
+            addProperty("ground_truth_source", if (session.activity.requiresReferenceSteps) "external_pedometer" else "none")
+            add("heart_rate", SessionHeartRate.manifest(session.heartRate))
             addProperty("step_schema_version", 1)
             addProperty("rfbin_version", 2)
             addProperty("simulated", false)
@@ -428,12 +463,21 @@ class FreeLivingSessionStore internal constructor(
                 local.files.sortedBy { it.fileName }.forEach { file ->
                     add(encodeFile(file).apply { addProperty("role", "raw") })
                 }
+                session.heartRate?.file?.let { file -> add(JsonObject().apply {
+                    addProperty("file_name", file.fileName)
+                    addProperty("role", "polar_hr_rr")
+                    add("device_session_id", JsonNull.INSTANCE)
+                    addProperty("bytes", file.bytes)
+                    addProperty("sha256", file.sha256)
+                    addProperty("simulated", false)
+                }) }
             })
         }
     }
 
     fun requestStart(preparation: PreparationSnapshot, requestedAtMs: Long, timeZoneId: String,
-        baseline: DeviceStartBaseline? = null, activity: SessionActivity = SessionActivity.FREE_LIVING): FreeLivingSession =
+        baseline: DeviceStartBaseline? = null, activity: SessionActivity = SessionActivity.FREE_LIVING,
+        heartRate: SessionHeartRate? = null): FreeLivingSession =
         synchronized(processLock) {
             validatePreparation(preparation)
             // A session freezes research identity and device fields. Local display metadata stays
@@ -451,6 +495,7 @@ class FreeLivingSessionStore internal constructor(
             if (existing != null && existing.isPending) {
                 require(existing.preparation == sessionPreparation) { "已有采集段的编号、位置或戒指不能更改" }
                 require(existing.activity == activity) { "已有采集段的活动类型不能更改" }
+                if (heartRate != null) require(existing.heartRate?.deviceId == heartRate.deviceId) { "本段心率带不能更换" }
                 require(existing.phase == FreeLivingSessionPhase.START_REQUESTED ||
                     existing.phase == FreeLivingSessionPhase.COLLECTING) { "上一段原始数据尚未安全保存，暂不能开始新采集" }
                 return@synchronized existing
@@ -464,6 +509,7 @@ class FreeLivingSessionStore internal constructor(
                 startRequestedAtMs = requestedAtMs,
                 startBaseline = baseline,
                 activity = activity,
+                heartRate = heartRate,
             ), if (journal == null) emptyList() else journal.archived + journal.current)
         }
 
@@ -715,7 +761,7 @@ class FreeLivingSessionStore internal constructor(
         }
 
     fun saveReference(sessionId: String, reference: SessionReference): FreeLivingSession = update(sessionId) { current ->
-        validateReference(reference)
+        validateReference(reference, current.activity)
         current.reference?.let { saved ->
             require(saved.status == reference.status && saved.steps == reference.steps && saved.reason == reference.reason) {
                 "本次读数已保存，请联系研究者核对修改"
@@ -724,7 +770,7 @@ class FreeLivingSessionStore internal constructor(
         }
         require(current.phase == FreeLivingSessionPhase.AWAITING_REFERENCE ||
             current.phase == FreeLivingSessionPhase.STOP_REQUESTED) { "请先结束本次采集" }
-        require(current.stopConfirmedAtMs != null || reference.status != ReferenceStatus.VALID) {
+        require(current.stopConfirmedAtMs != null || reference.status in setOf(ReferenceStatus.MISSING, ReferenceStatus.UNRELIABLE)) {
             "停止尚待确认，请记录读数异常"
         }
         current.copy(reference = reference)
@@ -736,7 +782,7 @@ class FreeLivingSessionStore internal constructor(
      */
     fun reviseReferenceBeforeUpload(sessionId: String, reference: SessionReference): FreeLivingSession =
         update(sessionId, allowArchived = true) { current ->
-            validateReference(reference)
+            validateReference(reference, current.activity)
             val previous = requireNotNull(current.reference) { "本段还没有可修改的计步器读数" }
             require(current.localData != null) { "请先完成戒指数据保存" }
             require(current.transfer.status == SessionTransferStatus.PENDING && current.transfer.attempts == 0 &&
@@ -761,6 +807,7 @@ class FreeLivingSessionStore internal constructor(
             require(current.completionPolicy != CompletionPolicy.DEFER_ON_RING) { "请先确认继续保存戒指数据" }
             require(completedAtMs > 0)
             verifyLocalFiles(current, files)
+            verifyHeartRate(current)
             current.localData?.let {
                 require(it.files == files) { "本次文件已确认，不能替换" }
                 return@update current
@@ -771,6 +818,7 @@ class FreeLivingSessionStore internal constructor(
     fun markTransferStarted(sessionId: String): FreeLivingSession = update(sessionId, allowArchived = true) { current ->
         require(current.uploadAllowed) { "本段已保存，等待手动上传" }
         verifyLocalFiles(current, requireNotNull(current.localData) { "文件尚未保存完整" }.files)
+        verifyHeartRate(current)
         if (current.transfer.status == SessionTransferStatus.COMPLETE ||
             current.transfer.status == SessionTransferStatus.TRANSFERRING) return@update current
         current.copy(transfer = current.transfer.copy(status = SessionTransferStatus.TRANSFERRING,
@@ -842,7 +890,7 @@ class FreeLivingSessionStore internal constructor(
                 value.asJsonObject
             }
             val version = envelope.strictLong("journal_version")
-            require(version in 1L..13L) { "版本不受支持" }
+            require(version in 1L..14L) { "版本不受支持" }
             val payload = envelope.getAsJsonObject("session") ?: error("缺少采集段")
             val archives = if (version >= 2L) envelope.required("archived_sessions").asJsonArray else JsonArray()
             val hashed = if (version == 1L) payload else journalPayload(payload, archives)
@@ -868,7 +916,7 @@ class FreeLivingSessionStore internal constructor(
         val payload = encode(journal.current)
         val archives = JsonArray().apply { journal.archived.forEach { add(encode(it)) } }
         val envelope = JsonObject().apply {
-            addProperty("journal_version", 13)
+            addProperty("journal_version", 14)
             add("session", payload)
             add("archived_sessions", archives)
             addProperty("sha256", digest(journalPayload(payload, archives).toString()))
@@ -916,6 +964,14 @@ class FreeLivingSessionStore internal constructor(
         syncDirectory(directory)
     }
 
+    private fun verifyHeartRate(session: FreeLivingSession) {
+        session.heartRate?.let { heartRate ->
+            SessionHeartRate.verifyFile(requireNotNull(file.parentFile), session.sessionId, heartRate)
+            heartRate.file?.let { FileOutputStream(File(file.parentFile, it.fileName), true).use { stream -> stream.fd.sync() } }
+            syncDirectory(requireNotNull(file.parentFile))
+        }
+    }
+
     companion object {
         private val processLock = Any()
         private const val LEGACY_COMMAND_OWNER_ID = "00000000-0000-0000-0000-000000000000"
@@ -929,7 +985,7 @@ class FreeLivingSessionStore internal constructor(
             require(journal.archived.all { !it.isPending }) { "尚未保存完整的采集段不能归档" }
         }
 
-        private fun validateReference(reference: SessionReference) {
+        private fun validateReference(reference: SessionReference, activity: SessionActivity) {
             require(reference.recordedAtMs > 0)
             require(reference.steps == null || reference.steps >= 0) { "请输入非负整数步数" }
             require(reference.reason == null || (reference.reason.isNotBlank() && reference.reason == reference.reason.trim()))
@@ -937,6 +993,10 @@ class FreeLivingSessionStore internal constructor(
                 ReferenceStatus.VALID -> require(reference.steps != null && reference.reason == null)
                 ReferenceStatus.MISSING -> require(reference.steps == null && reference.reason != null)
                 ReferenceStatus.UNRELIABLE -> require(reference.steps != null && reference.reason != null)
+                ReferenceStatus.NOT_APPLICABLE -> require(reference.steps == null && reference.reason == null)
+            }
+            require((reference.status == ReferenceStatus.NOT_APPLICABLE) == !activity.requiresReferenceSteps) {
+                "本段运动与参考步数类型不一致"
             }
         }
 
@@ -1104,11 +1164,11 @@ class FreeLivingSessionStore internal constructor(
                 else if (!hasStopTransition) require(evidence.status.collecting)
             }
             session.reference?.let {
-                validateReference(it)
-                require(hasStopTransition && (hasStop || it.status != ReferenceStatus.VALID))
+                validateReference(it, session.activity)
+                require(hasStopTransition && (hasStop || it.status in setOf(ReferenceStatus.MISSING, ReferenceStatus.UNRELIABLE)))
             }
             session.referenceRevisions.forEachIndexed { index, revision ->
-                validateReference(revision.previous)
+                validateReference(revision.previous, session.activity)
                 require(revision.replacedAtMs > 0)
                 val replacement = session.referenceRevisions.getOrNull(index + 1)?.previous ?: session.reference
                 require(replacement != null && revision.replacedAtMs == replacement.recordedAtMs) {
@@ -1120,6 +1180,7 @@ class FreeLivingSessionStore internal constructor(
                 require(hasStop && session.reference != null && it.completedAtMs > 0)
                 validateFiles(session, it.files)
             }
+            session.heartRate?.validate(session.sessionId, finalized = session.localData != null)
             val transfer = session.transfer
             require(transfer.attempts >= 0)
             require((transfer.receipt != null) == (transfer.status == SessionTransferStatus.COMPLETE))
@@ -1146,7 +1207,7 @@ class FreeLivingSessionStore internal constructor(
             }
         }
 
-        private fun encode(s: FreeLivingSession, version: Long = 13L) = JsonObject().apply {
+        private fun encode(s: FreeLivingSession, version: Long = 14L) = JsonObject().apply {
             require(version >= 13L || s.completionPolicy != CompletionPolicy.DEFER_ON_RING)
             addProperty("session_id", s.sessionId)
             addProperty("participant_id", s.preparation.participantId)
@@ -1162,7 +1223,7 @@ class FreeLivingSessionStore internal constructor(
             addActivity(if (version >= 6L) s.activity else SessionActivity.FREE_LIVING)
             addProperty("activity_label_status", "unlabelled")
             addProperty("activity_label_source", "none")
-            addProperty("ground_truth_source", "external_pedometer")
+            addProperty("ground_truth_source", if (version >= 14 && !s.activity.requiresReferenceSteps) "none" else "external_pedometer")
             addProperty("ground_truth_status", s.reference?.status?.wireValue ?: "missing")
             addNullable("ground_truth_steps", s.reference?.steps)
             addNullable("ground_truth_recorded_at_ms", s.reference?.groundTruthRecordedAtMs)
@@ -1269,6 +1330,7 @@ class FreeLivingSessionStore internal constructor(
                     addNullable("connection_generation", dispatch.connectionGeneration)
                 }
             } ?: JsonNull.INSTANCE)
+            if (version >= 14L) add("heart_rate", s.heartRate?.encode() ?: JsonNull.INSTANCE)
         }
 
         private fun decode(p: JsonObject, version: Long): FreeLivingSession {
@@ -1358,7 +1420,10 @@ class FreeLivingSessionStore internal constructor(
                             if (it.required("owner_id").isJsonNull) null else it.strictString("owner_id"),
                             it.nullableLong("connection_generation"))
                     },
+                heartRate = if (version < 14L || p.required("heart_rate").isJsonNull) null else
+                    SessionHeartRate.decode(p.getAsJsonObject("heart_rate")),
             )
+            require(version >= 14L || s.activity.requiresReferenceSteps) { "运动类型版本不受支持" }
             // Re-encoding checks required fields, fixed metadata, explicit nulls and derived values.
             require(encode(s, version) == p) { "采集段字段不完整或数据含义不一致" }
             return s

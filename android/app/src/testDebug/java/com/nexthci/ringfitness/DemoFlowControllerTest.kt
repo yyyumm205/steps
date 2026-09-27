@@ -732,6 +732,117 @@ class DemoFlowControllerTest {
         assertNull(f.store.read())
     }
 
+    @Test fun everyNonStepSportCommitsNotApplicableWithoutAReferenceDraft() {
+        for (sport in SessionActivity.selectable.filterNot { it.requiresReferenceSteps }) {
+            val f = Fixture()
+            f.begin(sport); f.stopAtFinish()
+            f.flow.finalizeSession(true, "", "not_applicable", ""); f.drain()
+            val saved = requireNotNull(f.store.read())
+            assertEquals(sport, saved.activity)
+            assertEquals(ReferenceStatus.NOT_APPLICABLE, saved.reference!!.status)
+            assertNull(saved.reference.steps)
+            assertNull(saved.reference.reason)
+            assertNull(saved.heartRate)
+            assertEquals(SessionTransferStatus.COMPLETE, saved.transfer.status)
+            assertFalse(File(f.directory, SessionHeartRate.fileName(saved.sessionId)).exists())
+            f.restart(); f.drain()
+            assertEquals(saved, f.store.read())
+        }
+    }
+
+    @Test fun optionalHeartRateGatesStartAndDisablingItCancelsPendingSelectionCallbacks() {
+        val f = Fixture()
+        f.flow.selectActivity(SessionActivity.BADMINTON)
+        assertFalse(f.flow.state.heartRateEnabled)
+        assertTrue(f.flow.state.canStart)
+        f.flow.setHeartRateEnabled(true)
+        assertFalse(f.flow.state.canStart)
+        f.flow.start(); f.drain()
+        assertNull(f.store.read())
+        f.flow.scanHeartRate(); f.advance(300)
+        val deviceId = f.flow.state.heartRateState.devices.single().deviceId
+        f.flow.connectHeartRate(deviceId)
+        assertTrue(f.flow.state.heartRateState.connecting)
+        f.flow.setHeartRateEnabled(false); f.drain()
+        assertFalse(f.flow.state.heartRateEnabled)
+        assertEquals(PolarUiState(), f.flow.state.heartRateState)
+        assertTrue(f.flow.state.canStart)
+        f.begin(SessionActivity.BADMINTON)
+        assertNull(f.store.read()!!.heartRate)
+    }
+
+    @Test fun deferredHeartRateFileSurvivesOwnerRestartAndResumesTheSameNonStepSession() {
+        val f = Fixture()
+        f.enableHeartRate()
+        f.begin(SessionActivity.STRENGTH_TRAINING)
+        val started = f.store.read()!!
+        assertTrue(f.flow.state.heartRateState.recording)
+        assertEquals(1L, started.heartRate!!.sampleCount)
+        f.stopAtFinish()
+        val stopped = f.store.read()!!
+        val hr = requireNotNull(stopped.heartRate)
+        val file = File(f.directory, requireNotNull(hr.file).fileName)
+        val bytes = file.readBytes()
+        assertNotNull(hr.endedAtMs)
+        assertEquals("recorded", hr.status)
+        f.flow.finalizeSession(false, "", "not_applicable", ""); f.drain()
+        f.restart(); f.drain()
+        assertEquals(CollectionPage.RING_PENDING, f.flow.state.page)
+        assertEquals(stopped.sessionId, f.store.read()!!.sessionId)
+        assertEquals(hr, f.store.read()!!.heartRate)
+        assertNull(f.store.read()!!.localData)
+        assertArrayEquals(bytes, file.readBytes())
+        f.flow.resumeRingTransfer(); f.drain()
+        assertEquals(stopped.sessionId, f.store.read()!!.sessionId)
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+        assertEquals(ReferenceStatus.NOT_APPLICABLE, f.store.read()!!.reference!!.status)
+        assertArrayEquals(bytes, file.readBytes())
+        assertFalse(f.flow.state.heartRateEnabled)
+        f.begin(SessionActivity.RUNNING)
+        assertNull(f.store.read()!!.heartRate)
+    }
+
+    @Test fun discardedHeartRateSessionRemovesItsCsvAndPreservesTheEarlierSession() {
+        val f = Fixture()
+        f.complete("13")
+        val earlier = f.store.read()!!
+        val earlierFile = File(f.directory, earlier.localData!!.files.single().fileName)
+        val earlierBytes = earlierFile.readBytes()
+        f.enableHeartRate()
+        f.begin(SessionActivity.FOOTBALL); f.stopAtFinish()
+        f.flow.finalizeSession(false, "", "not_applicable", ""); f.drain()
+        val discarded = f.store.read()!!
+        val hrFile = File(f.directory, discarded.heartRate!!.file!!.fileName)
+        assertTrue(hrFile.isFile)
+        f.flow.discardSession(); f.restart(); f.drain()
+        assertTrue(f.store.read(discarded.sessionId)!!.isDiscarded)
+        assertFalse(hrFile.exists())
+        assertEquals(earlier, f.store.read(earlier.sessionId))
+        assertArrayEquals(earlierBytes, earlierFile.readBytes())
+        assertFalse(f.flow.state.heartRateEnabled)
+        assertTrue(f.flow.state.canStart)
+    }
+
+    @Test fun restartingAnActiveHeartRateDemoMarksTheGapAndKeepsTheOriginalDevice() {
+        val f = Fixture()
+        f.enableHeartRate(); f.begin(SessionActivity.TABLE_TENNIS)
+        val before = f.store.read()!!
+        f.advance(400)
+        f.restart(); f.drain()
+        val restored = f.store.read()!!
+        assertEquals(before.sessionId, restored.sessionId)
+        assertEquals(before.heartRate!!.deviceId, restored.heartRate!!.deviceId)
+        assertEquals(before.heartRate.sampleCount, restored.heartRate.sampleCount)
+        assertEquals("partial", restored.heartRate.status)
+        assertEquals("process_restart", restored.heartRate.gaps.single().reason)
+        assertNotNull(restored.heartRate.gaps.single().endedAtMs)
+        assertTrue(f.flow.state.heartRateState.recording)
+        f.stopAtFinish()
+        f.flow.finalizeSession(true, "", "not_applicable", ""); f.drain()
+        assertEquals(SessionTransferStatus.COMPLETE, f.store.read()!!.transfer.status)
+        assertEquals("partial", f.store.read()!!.heartRate!!.status)
+    }
+
     private inner class Fixture(parent: File = temporary.newFolder()) {
         val directory = File(parent, "collection-demo")
         var now = 1_789_804_800_000L
@@ -776,6 +887,11 @@ class DemoFlowControllerTest {
                 }
             })
         fun startWalking() { flow.selectActivity(SessionActivity.WALKING); flow.start() }
+        fun enableHeartRate() {
+            flow.setHeartRateEnabled(true); flow.scanHeartRate(); advance(300)
+            flow.connectHeartRate(flow.state.heartRateState.devices.single().deviceId); advance(300)
+            assertTrue(flow.state.heartRateState.ready)
+        }
         fun begin(activity: SessionActivity = SessionActivity.WALKING) {
             flow.selectActivity(activity); flow.start(); drain()
             assertEquals(CollectionPage.COLLECTING, flow.state.page)

@@ -75,7 +75,7 @@ class SessionCompletionPolicyTest {
         assertFalse(f.queue().run(f.id))
         assertEquals(0, f.requests)
         assertThrows(IllegalArgumentException::class.java) { f.store.allowUpload(f.id) }
-        assertEquals(13, JsonParser.parseString(File(f.directory, "session.json").readText())
+        assertEquals(14, JsonParser.parseString(File(f.directory, "session.json").readText())
             .asJsonObject["journal_version"].asInt)
     }
 
@@ -97,7 +97,7 @@ class SessionCompletionPolicyTest {
         assertEquals(deferred.deviceRecordEvidence, completed.deviceRecordEvidence)
         assertNotNull(completed.localData)
         val manifest = f.reopen().manifestSnapshot(f.id)
-        assertEquals(7, manifest["version"].asInt)
+        assertEquals(8, manifest["version"].asInt)
         assertFalse(manifest.has("completion_policy"))
     }
 
@@ -152,7 +152,7 @@ class SessionCompletionPolicyTest {
         assertFalse(restored.uploadAllowed)
         f.reopen().allowUpload(f.id)
         assertEquals(CompletionPolicy.SAVE_UPLOAD, f.reopen().read()!!.completionPolicy)
-        assertEquals(13, JsonParser.parseString(File(f.directory, "session.json").readText())
+        assertEquals(14, JsonParser.parseString(File(f.directory, "session.json").readText())
             .asJsonObject["journal_version"].asInt)
     }
 
@@ -378,6 +378,7 @@ class SessionCompletionPolicyTest {
             session.remove("completion_policy"); session.remove("discarded"); session.remove("start_abort")
             session.remove("reference_revisions"); session.remove("start_command_dispatch")
             session.remove("stop_observed_at_ms"); session.remove("stop_origin"); session.remove("stop_command_dispatch")
+            session.remove("heart_rate")
             session.getAsJsonObject("start_baseline")?.remove("unknown_time_start_evidence")
             envelope.addProperty("journal_version", 6)
             val payload = JsonObject().apply {
@@ -390,6 +391,10 @@ class SessionCompletionPolicyTest {
             val journal = File(directory, "session.json")
             val envelope = JsonParser.parseString(journal.readText()).asJsonObject
             envelope.addProperty("journal_version", version)
+            if (version < 14) {
+                envelope.getAsJsonObject("session").remove("heart_rate")
+                envelope.getAsJsonArray("archived_sessions").forEach { it.asJsonObject.remove("heart_rate") }
+            }
             val payload = JsonObject().apply {
                 add("session", envelope.getAsJsonObject("session"))
                 add("archived_sessions", envelope.getAsJsonArray("archived_sessions"))

@@ -33,7 +33,7 @@ class FreeLivingSessionPackageTest {
         val f = fixture(SessionReference(ReferenceStatus.VALID, 0, t + 3000))
         val frozen = f.packager.freeze(f.session)
         val manifest = manifest(frozen)
-        assertEquals(7, manifest["version"].asInt)
+        assertEquals(8, manifest["version"].asInt)
         assertEquals(1, manifest["step_schema_version"].asInt)
         assertEquals(2, manifest["rfbin_version"].asInt)
         assertEquals("hand_finger_v1", manifest["ring_placement_schema"].asString)
@@ -159,7 +159,7 @@ class FreeLivingSessionPackageTest {
         val frozen = f.packager.freeze(f.session)
         val before = frozen.file.readBytes()
         val m = manifest(frozen)
-        assertEquals(7, m["version"].asInt)
+        assertEquals(8, m["version"].asInt)
         assertEquals(1, m["step_schema_version"].asInt)
         assertEquals("daily_activity_v2", m["activity_schema"].asString)
         assertEquals(-16, m.getAsJsonObject("start_baseline").getAsJsonObject("status")["error_code"].asInt)
@@ -194,6 +194,7 @@ class FreeLivingSessionPackageTest {
         payload.remove("stop_observed_at_ms")
         payload.remove("stop_origin")
         payload.remove("stop_command_dispatch")
+        payload.remove("heart_rate")
         val hashed = JsonObject().apply {
             add("session", payload)
             add("archived_sessions", envelope["archived_sessions"])
@@ -203,11 +204,11 @@ class FreeLivingSessionPackageTest {
         val frozen = f.packager.freeze(f.session)
         val before = frozen.file.readBytes()
         val m = manifest(frozen)
-        assertEquals(7, m["version"].asInt)
+        assertEquals(8, m["version"].asInt)
         assertFalse(m.getAsJsonObject("start_baseline").has("charging_recovery_evidence"))
         assertFalse(m.has("start_attempt_archive"))
         f.store.markTransferStarted(f.session.sessionId)
-        assertEquals(13, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(14, JsonParser.parseString(journal.readText()).asJsonObject["journal_version"].asInt)
         assertArrayEquals(before, packager(f.directory, openStore(f.directory)).freeze(f.session).file.readBytes())
         assertEquals(m, manifest(f.packager.freeze(f.session)))
     }
@@ -242,7 +243,7 @@ class FreeLivingSessionPackageTest {
         listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEach { activity ->
             val f = fixture(activity = activity)
             val current = f.packager.freeze(f.session)
-            val legacyArchive = rewriteAsPackageVersionOne(current)
+            val legacyArchive = rewriteAsLegacy(current, 7)
             val original = legacyArchive.readBytes()
             val originalHash = sha(original)
 
@@ -447,8 +448,9 @@ class FreeLivingSessionPackageTest {
     private fun rewriteAsLegacy(frozen: FrozenSessionPackage, version: Int): File {
         val target = frozen.file.parentFile
         val legacy = manifest(frozen).apply {
-            listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at",
-                "stop_origin", "stop_observed_at_ms").forEach(::remove)
+            remove("heart_rate")
+            if (version < 6) listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at").forEach(::remove)
+            if (version < 7) listOf("stop_origin", "stop_observed_at_ms").forEach(::remove)
             addProperty("version", version)
         }
         val contents = ZipFile(frozen.file).use { zip ->

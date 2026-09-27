@@ -19,6 +19,7 @@ from pathlib import Path
 from . import __version__
 from .archive_limits import check_zip_directory
 from .health_raw_v2 import OutputBudget, decode_to_csv, read_header
+from .heart_rate import import_heart_rate
 from .phone_time import add_phone_time
 from .schema import ValidationError, integer, object_value, require, safe_name, strict_json, validate_manifest
 
@@ -301,12 +302,31 @@ def decode_archive(stage, manifest, limits):
             validate_sidecar(stage / "raw" / sidecar_name, entry, report, manifest)
             used_evidence.add(sidecar_name)
     require(used_evidence == set(evidence_entries), "orphan raw evidence file")
-    phone_alignment = add_phone_time(manifest, reports, stage / "derived", limits.decoded_bytes)
+    heart_rate = import_heart_rate(stage, manifest, budget)
+    alignment_manifest, heart_rate_bytes = manifest, 0
+    if heart_rate is not None:
+        if heart_rate["normalized_csv"] is not None:
+            heart_rate_bytes = (stage / "derived" / heart_rate["normalized_csv"]).stat().st_size
+        if "heart_rate_phone_clock_order_uncertain" in heart_rate["timing_warnings"]:
+            # Both streams use the same phone wall clock. HR can expose a clock
+            # correction between the ring's otherwise ordered START/STOP events.
+            alignment_manifest = dict(manifest, timing_warnings=manifest["timing_warnings"] +
+                                      ["heart_rate_phone_clock_order_uncertain"])
+    # Reserve HR output bytes while expanding ring CSVs so their final combined
+    # size shares one quota. The frozen manifest retains its original warnings.
+    phone_alignment = add_phone_time(alignment_manifest, reports, stage / "derived",
+                                     limits.decoded_bytes - heart_rate_bytes)
     reasons = ["sample_clock_uncalibrated", "sample_coverage_not_assessed"]
     if manifest["capture_boundary_status"] != "confirmed":
         reasons.append("capture_boundaries_unknown")
-    if manifest["ground_truth_status"] != "valid":
+    if manifest["ground_truth_status"] not in ("valid", "not_applicable"):
         reasons.append("reference_" + manifest["ground_truth_status"])
+    if heart_rate is not None and heart_rate["enabled"]:
+        reasons.extend(heart_rate["timing_warnings"])
+        if heart_rate["status"] != "recorded":
+            reasons.append("heart_rate_" + heart_rate["status"])
+        if heart_rate["zero_hr_samples"] or heart_rate["contact_not_detected_samples"]:
+            reasons.append("heart_rate_signal_quality_requires_review")
     if manifest["timing_warnings"]:
         reasons.append("phone_or_device_timing_warning")
     if manifest.get("stop_origin") == "device_observed":
@@ -332,6 +352,12 @@ def decode_archive(stage, manifest, limits):
                "sample_coverage_status": "not_assessed", "files": reports,
                "reference_rows": 1, "reference_applies_to": "all_raw_files_in_session",
                "limits": asdict(limits)}
+    if heart_rate is not None:
+        quality["rules_version"] = 3
+        quality["heart_rate"] = heart_rate
+        quality["reference_applicability"] = ("not_applicable" if manifest["ground_truth_status"] == "not_applicable"
+                                               else "step_count")
+        write_json(stage / "heart-rate.json", heart_rate)
     write_json(stage / "quality.json", quality)
     fields = ["session_id", "participant_id", "installation_id", "ring_placement_schema", "ring_placement",
               "ring_hand", "ring_finger", "app_version", "created_at", "time_zone_id",
@@ -591,6 +617,12 @@ def _summarize_locked(root: Path, output: Path, limits: Limits):
         rows.append({"session_id": manifest["session_id"], "participant_id": manifest["participant_id"],
                      "activity_code": manifest["activity_code"],
                      "ground_truth_steps": manifest["ground_truth_steps"], "ground_truth_status": manifest["ground_truth_status"],
+                     "ground_truth_source": manifest["ground_truth_source"],
+                     "heart_rate_enabled": manifest.get("heart_rate", {}).get("enabled", ""),
+                     "heart_rate_status": manifest.get("heart_rate", {}).get("status", ""),
+                     "heart_rate_sample_count": manifest.get("heart_rate", {}).get("sample_count", ""),
+                     "heart_rate_gap_count": (len(manifest["heart_rate"]["gaps"]) if "heart_rate" in manifest else ""),
+                     "heart_rate_timestamp_source": manifest.get("heart_rate", {}).get("timestamp_source", ""),
                      "started_at_ms": manifest["started_at_ms"], "ended_at_ms": manifest["ended_at_ms"],
                      "analysis_status": quality["analysis_status"], "daily_aggregation_eligible": False,
                      "analysis_reasons": ";".join(quality["analysis_reasons"])})
@@ -605,8 +637,10 @@ def _summarize_locked(root: Path, output: Path, limits: Limits):
                 for other in rows):
             row["analysis_reasons"] += ";overlapping_session_intervals"
     output = local_path(output)
-    fields = ["session_id", "participant_id", "activity_code", "ground_truth_steps", "ground_truth_status", "started_at_ms",
-              "ended_at_ms", "analysis_status", "daily_aggregation_eligible", "analysis_reasons"]
+    activity_fields = ["session_id", "participant_id", "activity_code", "ground_truth_steps", "ground_truth_status", "started_at_ms",
+                       "ended_at_ms", "analysis_status", "daily_aggregation_eligible", "analysis_reasons"]
+    fields = activity_fields + ["ground_truth_source", "heart_rate_enabled", "heart_rate_status",
+                                "heart_rate_sample_count", "heart_rate_gap_count", "heart_rate_timestamp_source"]
     if output.exists():
         require(output.is_file() and not is_link_like(output), "existing summary is not a regular file")
         require(0 < output.stat().st_size <= limits.decoded_bytes,
@@ -615,11 +649,11 @@ def _summarize_locked(root: Path, output: Path, limits: Limits):
         try:
             with output.open("r", encoding="utf-8", newline="") as stream:
                 previous = csv.DictReader(stream)
-                legacy_fields = [field for field in fields if field != "activity_code"]
+                legacy_fields = [field for field in activity_fields if field != "activity_code"]
                 initial_fields = ["session_id", "participant_id", "ground_truth_steps"]
-                require(previous.fieldnames in (fields, legacy_fields, initial_fields),
+                require(previous.fieldnames in (fields, activity_fields, legacy_fields, initial_fields),
                         "existing summary fields are invalid")
-                preserves_catalog = previous.fieldnames in (fields, legacy_fields)
+                preserves_catalog = previous.fieldnames in (fields, activity_fields, legacy_fields)
                 for row in previous:
                     session_id = row.get("session_id")
                     require(not preserves_catalog or session_id and session_id in current_ids,

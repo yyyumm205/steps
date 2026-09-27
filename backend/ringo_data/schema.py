@@ -9,6 +9,13 @@ from uuid import UUID
 
 MAX_LONG = (1 << 63) - 1
 MAX_UINT = (1 << 32) - 1
+STEP_ACTIVITIES = ("walking", "running")
+NON_STEP_ACTIVITIES = ("badminton", "football", "basketball", "tennis", "table_tennis",
+                       "volleyball", "strength_training")
+HEART_RATE_FIELDS = ("enabled", "device_id", "device_name", "status", "timestamp_source",
+                     "started_at_ms", "ended_at_ms", "first_sample_at_ms", "last_sample_at_ms",
+                     "sample_count", "gaps")
+HEART_RATE_GAP_REASONS = ("disconnected", "process_restart", "stream_error", "storage_error", "no_data")
 
 
 class ValidationError(ValueError):
@@ -156,6 +163,45 @@ def validate_record(value, name):
     return value
 
 
+def validate_heart_rate(value):
+    """Validate receipt-time evidence independently of the ring's device clock."""
+    value = object_fields(value, "heart_rate", HEART_RATE_FIELDS)
+    require(type(value["enabled"]) is bool, "invalid heart_rate.enabled")
+    require(value["timestamp_source"] == "phone_receipt", "invalid heart rate timestamp source")
+    count = integer(value["sample_count"], "heart_rate.sample_count")
+    require(type(value["gaps"]) is list, "invalid heart rate gaps")
+    time_fields = ("started_at_ms", "ended_at_ms", "first_sample_at_ms", "last_sample_at_ms")
+    if not value["enabled"]:
+        require(value["device_id"] is None and value["device_name"] is None and
+                value["status"] == "not_requested" and count == 0 and not value["gaps"] and
+                all(value[field] is None for field in time_fields), "disabled heart rate must be empty")
+        return value
+    for field in ("device_id", "device_name"):
+        require(text(value[field], "heart_rate." + field, 256).strip() != "",
+                "empty heart rate device identity")
+        require(all(ord(char) >= 32 and ord(char) != 127 for char in value[field]),
+                "control character in heart rate device identity")
+    start = integer(value["started_at_ms"], "heart_rate.started_at_ms", 1)
+    end = integer(value["ended_at_ms"], "heart_rate.ended_at_ms", 1)
+    # These are real phone-wall-clock readings. A clock correction can reverse
+    # their order; the importer preserves and flags it instead of losing ring data.
+    for gap in value["gaps"]:
+        object_fields(gap, "heart rate gap", ("started_at_ms", "ended_at_ms", "reason"))
+        gap_start = integer(gap["started_at_ms"], "heart rate gap start", 1)
+        gap_end = integer(gap["ended_at_ms"], "heart rate gap end", 1)
+        require(gap["reason"] in HEART_RATE_GAP_REASONS, "invalid heart rate gap reason")
+    if count == 0:
+        require(value["first_sample_at_ms"] is None and value["last_sample_at_ms"] is None,
+                "empty heart rate capture has sample times")
+        require(value["status"] == "no_samples", "empty heart rate status mismatch")
+    else:
+        first = integer(value["first_sample_at_ms"], "heart_rate.first_sample_at_ms", 1)
+        last = integer(value["last_sample_at_ms"], "heart_rate.last_sample_at_ms", 1)
+        expected = "partial" if value["gaps"] else "recorded"
+        require(value["status"] == expected, "heart rate status disagrees with gaps or samples")
+    return value
+
+
 def validate_unknown_time_start(baseline, manifest, record):
     evidence = object_value(baseline.get("unknown_time_start_evidence"), "unknown time start evidence")
     require(set(evidence) == {"version", "record", "backup_id", "raw_sha256", "owner_id",
@@ -207,7 +253,7 @@ def validate_unknown_time_start(baseline, manifest, record):
 def validate_manifest(value):
     m = object_value(value, "manifest")
     version = integer(m.get("version"), "version")
-    require(version in (2, 3, 4, 5, 6, 7), "unsupported version")
+    require(version in (2, 3, 4, 5, 6, 7, 8), "unsupported version")
     required = {
         "version", "step_schema_version", "rfbin_version", "simulated", "session_id",
         "participant_id", "participant_name", "installation_id", "ring_placement",
@@ -224,21 +270,25 @@ def validate_manifest(value):
     }
     if version >= 6:
         required.update({"ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at"})
-    if version == 7:
+    if version >= 7:
         required.update({"stop_origin", "stop_observed_at_ms"})
-    has_activity_selection = version == 4 or (version in (5, 6, 7) and m.get("activity_schema") == "daily_activity_v3")
+    if version >= 8:
+        required.add("heart_rate")
+    has_activity_selection = version == 4 or (version in (5, 6, 7, 8) and m.get("activity_schema") == "daily_activity_v3")
     if has_activity_selection:
         required.add("activity_selection_source")
     require(set(m) == required, "manifest fields do not match activity schema")
     for key, expected in (("step_schema_version", 1), ("rfbin_version", 2)):
         require(integer(m[key], key) == expected, f"unsupported {key}")
     require(m["simulated"] is False, "simulated archives require the isolated demo path")
+    non_step = version >= 8 and m["activity_code"] in NON_STEP_ACTIVITIES
     fixed = {"capture_purpose": "daily_activity", "activity_label_status": "unlabelled",
-             "activity_label_source": "none", "ground_truth_source": "external_pedometer",
+             "activity_label_source": "none", "ground_truth_source": "none" if non_step else "external_pedometer",
              "data_integrity_status": "complete"}
     if has_activity_selection:
         fixed.update(activity_schema="daily_activity_v3", activity_selection_source="participant")
-        require(m["activity_code"] in ("walking", "running"), "unsupported activity_code")
+        supported = STEP_ACTIVITIES + NON_STEP_ACTIVITIES if version >= 8 else STEP_ACTIVITIES
+        require(m["activity_code"] in supported, "unsupported activity_code")
     else:
         fixed.update(activity_schema="daily_activity_v2", activity_code="free_living")
     for key, expected in fixed.items():
@@ -282,7 +332,7 @@ def validate_manifest(value):
     require(m["start_confirmed_at_ms"] is not None, "record has no start confirmation")
     require(m["stop_confirmed_at_ms"] is not None, "complete upload requires a confirmed stop")
     stop_event = m["stop_requested_at_ms"]
-    if version == 7:
+    if version >= 7:
         stop_observed = integer(m["stop_observed_at_ms"], "stop_observed_at_ms", 1, nullable=True)
         stop_origin = m["stop_origin"]
         require(stop_origin in ("user_request", "device_observed", "legacy_unspecified"), "invalid stop_origin")
@@ -301,8 +351,12 @@ def validate_manifest(value):
                 "legacy complete upload requires a requested stop")
     steps = integer(m["ground_truth_steps"], "ground_truth_steps", nullable=True)
     status = m["ground_truth_status"]
-    require(status in ("valid", "missing", "unreliable"), "invalid reference status")
-    if status == "valid":
+    require(status in (("not_applicable",) if non_step else ("valid", "missing", "unreliable")),
+            "invalid reference status")
+    if non_step:
+        require(steps is None and m["ground_truth_recorded_at_ms"] is None and m["ground_truth_reason"] is None,
+                "non-step activity must have a not-applicable reference without a value")
+    elif status == "valid":
         require(steps is not None and m["stop_confirmed_at_ms"] is not None,
                 "valid reference needs a value and stopped confirmation")
         require(m["ground_truth_reason"] is None, "valid reference must not have an abnormal reason")
@@ -378,7 +432,7 @@ def validate_manifest(value):
     require(all(m["start_status_evidence"][counter] <= m["stop_status_evidence"][counter]
                 for counter in ("bytes", "records")), "STOP counters moved backwards from START")
     baseline = object_value(m["start_baseline"], "start_baseline")
-    has_charging_recovery = version == 3 or (version in (4, 5, 6, 7) and "charging_recovery_evidence" in baseline)
+    has_charging_recovery = version == 3 or (version in (4, 5, 6, 7, 8) and "charging_recovery_evidence" in baseline)
     baseline_status = validate_status(baseline.get("status"), "baseline status",
                                       allow_charging_error=has_charging_recovery)
     require(baseline_status["collecting"] is False and baseline_status["error_code"] == (-16 if has_charging_recovery else 0),
@@ -388,7 +442,7 @@ def validate_manifest(value):
         validate_charging_recovery(baseline)
     else:
         require("charging_recovery_evidence" not in baseline,
-                "charging recovery evidence requires manifest version 3 through 7")
+                "charging recovery evidence requires manifest version 3 through 8")
     require(type(baseline.get("records")) is list and len(baseline["records"]) <= 255, "invalid baseline records")
     for item in baseline["records"]:
         validate_record(item, "baseline record")
@@ -400,12 +454,12 @@ def validate_manifest(value):
         require(any(all(item[key] == baseline_status[key] for key in ("device_session_id", "bytes", "records"))
                     for item in baseline["records"]), "baseline STATUS and LIST disagree")
     previous = next((item for item in baseline["records"] if item["device_session_id"] == device_id), None)
-    has_unknown_time_start = version == 5 or (version in (6, 7) and "unknown_time_start_evidence" in baseline)
+    has_unknown_time_start = version == 5 or (version in (6, 7, 8) and "unknown_time_start_evidence" in baseline)
     if has_unknown_time_start:
         preserved_unknown = validate_unknown_time_start(baseline, m, record)
     else:
         require("unknown_time_start_evidence" not in baseline,
-                "unknown time start evidence requires manifest version 5 through 7")
+                "unknown time start evidence requires manifest version 5 through 8")
         preserved_unknown = None
     baseline_fields = {"status", "records", "observed_at_ms"}
     if has_charging_recovery:
@@ -420,6 +474,7 @@ def validate_manifest(value):
                 (previous["unix_ms"] > 0 and record["unix_ms"] > 0 and previous["uptime_ms"] > 0 and record["uptime_ms"] > 0
                 and previous["unix_ms"] != record["unix_ms"] and previous["uptime_ms"] != record["uptime_ms"]),
                 "reused record id lacks two changed nonzero time anchors")
+    heart_rate = validate_heart_rate(m["heart_rate"]) if version >= 8 else None
     files = m["files"]
     require(type(files) is list and len(files) > 0, "empty file list")
     names = set()
@@ -430,15 +485,26 @@ def validate_manifest(value):
         name = safe_name(entry["file_name"])
         require(name.casefold() not in names and name.lower() != "manifest.json", "duplicate file entry")
         names.add(name.casefold())
-        require(name.startswith(m["session_id"] + "-"), "file does not belong to session")
-        require(entry["role"] in ("raw", "evidence"), "invalid file role")
-        suffix = ".rfbin" if entry["role"] == "raw" else ".raw-evidence.json"
-        require(name.endswith(suffix), "file extension disagrees with role")
-        require(integer(entry["device_session_id"], "file device id", maximum=65535) == device_id,
-                "file device id mismatch")
+        if entry["role"] == "polar_hr_rr" and version >= 8:
+            require(heart_rate["enabled"], "disabled heart rate has a CSV")
+            require(name == m["session_id"] + "_polar_hr_rr.csv", "heart rate file does not belong to session")
+            require(entry["device_session_id"] is None, "heart rate file must not claim a ring device id")
+        else:
+            require(name.startswith(m["session_id"] + "-"), "file does not belong to session")
+            require(entry["role"] in ("raw", "evidence"), "invalid file role")
+            suffix = ".rfbin" if entry["role"] == "raw" else ".raw-evidence.json"
+            require(name.endswith(suffix), "file extension disagrees with role")
+            require(integer(entry["device_session_id"], "file device id", maximum=65535) == device_id,
+                    "file device id mismatch")
         integer(entry["bytes"], "file bytes", 1)
         require(type(entry["sha256"]) is str and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]),
                 "invalid file SHA-256")
         require(entry["simulated"] is False, "simulated file in real archive")
     require(any(x["role"] == "raw" for x in files), "archive has no raw file")
+    if heart_rate is not None and heart_rate["enabled"]:
+        heart_files = [entry for entry in files if entry["role"] == "polar_hr_rr"]
+        require(len(heart_files) <= 1, "multiple heart rate CSV files")
+        require(heart_files or (heart_rate["sample_count"] == 0 and
+                any(gap["reason"] == "storage_error" for gap in heart_rate["gaps"])),
+                "missing heart rate CSV without a recorded storage error")
     return m

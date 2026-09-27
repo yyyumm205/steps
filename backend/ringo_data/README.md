@@ -1,10 +1,10 @@
 # 活动采集数据导入
 
-本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录及 IMU/PPG CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)及[功能规格](../../specs/independent-step-collection/requirements.md)。
+本工具接收 Android 独立采集版本冻结的 ZIP，校验并保留原始数据，生成每个 session 的参考记录、IMU/PPG CSV，以及可选的 Polar H10 HR/RR CSV。运行仅使用 Python 3.10+ 标准库；测试使用 pytest。实验语义遵循[项目总纲](../../CONSTITUTION.md)、[功能规格](../../specs/independent-step-collection/requirements.md)及[多运动与可选心率带契约](../../specs/independent-step-collection/multisport-heart-rate.md)。
 
-当前导入器版本为 **0.2.5**，可用 `python -m backend.ringo_data --version` 查询。跨session的原始文件归属以回执绑定、实际SHA-256匹配的冻结`source.zip`为准；先创建有界临时快照，再从同一快照读取清单，结束后清理。落地清单或派生缓存损坏时，仍能识别共享raw并隔离后到包，避免重复进入主索引。冻结源或回执无法验证时报告可重试的研究库完整性错误，保留原件，新包不进入坏包拒收缓存；修复后同一扫描进程可重试。既有研究目录拒绝符号链接和非普通文件，manifest、质量报告及导入回执统一有界读取；异常不会覆盖上一份完整索引。云端回执长度／SHA到导入快照的绑定及既有配额继续生效。每次新导入需核验既有冻结包，耗时随库总量增长，大规模长段须另做性能验证。
+当前导入器版本为 **0.3.0**，可用 `python -m backend.ringo_data --version` 查询。跨session的原始文件归属以回执绑定、实际SHA-256匹配的冻结`source.zip`为准；先创建有界临时快照，再从同一快照读取清单，结束后清理。落地清单或派生缓存损坏时，仍能识别共享raw并隔离后到包，避免重复进入主索引。冻结源或回执无法验证时报告可重试的研究库完整性错误，保留原件，新包不进入坏包拒收缓存；修复后同一扫描进程可重试。既有研究目录拒绝符号链接和非普通文件，manifest、质量报告及导入回执统一有界读取；异常不会覆盖上一份完整索引。云端回执长度／SHA到导入快照的绑定及既有配额继续生效。每次新导入需核验既有冻结包，耗时随库总量增长，大规模长段须另做性能验证。
 
-本轮证据与剩余阻断见[恢复与故障隔离验证E31](../../specs/independent-step-collection/validation.md#e31发布核对与在途恢复2026-09-21)；既有契约审计见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。
+既有恢复与故障隔离证据见[验证E31](../../specs/independent-step-collection/validation.md#e31发布核对与在途恢复2026-09-21)；既有契约审计见[后端复查记录](../../specs/independent-step-collection/validation.md#后端契约与导入防护复查2026-09-21)。多运动与心率的跨端及硬件验收需按本轮契约独立记录。
 
 Android 0.8.3的新登记直接使用规范化用户名作为`participant_id`，兼容字段`participant_name`与其相同，沿用现有契约。`reference.csv`、信号CSV与session索引按该字段区分被试；研究者为不同被试分配不同用户名（如`p001`、`p002`），同一人换手机继续填写原用户名。离线登记无法检查全局重名，同名会视作同一人。已有测试包保持原文，不做身份迁移；重复导入继续按session及文件哈希处理。
 
@@ -48,31 +48,34 @@ python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.
 
 ## 输入与输出
 
-新采集按走路、跑步分别建立 session，每次清零计步器并保存该次总数。新云端包分别命名为`ringfitness-session-walking-<session_id>.zip`和`ringfitness-session-running-<session_id>.zip`；名称便于人工辨认，导入器仍以包内经校验的`manifest.activity_code`为权威。历史无活动前缀的`ringfitness-session-<session_id>.zip`继续兼容且不改名。当前新冻结包采用 `version=7`：v6在v4/v5的活动和恢复语义上补齐原版的佩戴拆分字段、App版本和包创建时间，v7继续增加停止来源和停止观察时间。走跑包使用 `activity_schema=daily_activity_v3`，`activity_code` 为 `walking` 或 `running`，`activity_selection_source=participant` 表示被试在开始前选择的活动任务。每个 session 保留独立 UUID、原始文件和参考总数。活动选择在整个 session 内固定。
+新采集支持走路、跑步、羽毛球、足球、篮球、网球、乒乓球、排球和力量训练。每个 session 在开始前固定一种活动，包名为 `ringfitness-session-<activity_code>-<session_id>.zip`；导入器以包内经校验的 `manifest.activity_code` 为权威。历史无活动前缀的 `ringfitness-session-<session_id>.zip` 继续兼容且不改名。新冻结包采用 `version=8`，沿用 v7 的佩戴、App 版本、创建时间和停止来源字段，并增加必填的 `heart_rate` 对象。活动选择使用 `activity_schema=daily_activity_v3`、`activity_selection_source=participant`，英文标识为 `walking/running/badminton/football/basketball/tennis/table_tennis/volleyball/strength_training`。
 
-历史 `version=2/3` 包继续采用 `daily_activity_v2/free_living`，v4保留走跑任务声明，v5保留未知日期兼容证据；这些已冻结包保持原有字段与含义。所有版本均要求 `step_schema_version=1`、`rfbin_version=2`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
+走路、跑步沿用清零计步器及填写本段总数的流程，有效零步保留为 `0`。其余七种运动使用 `ground_truth_source=none`、`ground_truth_status=not_applicable`，步数、步数确认时间和参考原因均为 null；收尾确认时间单独保留在 `reference_saved_at_ms`。导出的 CSV 以空字段表达 null，研究端需结合 `ground_truth_status` 区分不适用与缺失。每个 session 保留独立 UUID、活动选择、原始文件和一行参考记录。
+
+历史 `version=2/3` 包继续采用 `daily_activity_v2/free_living`，v4保留走跑任务声明，v5保留未知日期兼容证据，v6/v7保留各自的来源字段；已冻结包保持原有字段与含义。所有版本均要求 `step_schema_version=1`、`rfbin_version=2`、`simulated=false`。根目录包含 `manifest.json` 和 `files` 列出的平铺文件；`raw` 为 `.rfbin`，`evidence` 为对应 `.raw-evidence.json`，v8 的 `polar_hr_rr` 为 `<session_id>_polar_hr_rr.csv`。manifest 保留 Android 账本的身份、位置、请求/确认、真实边界及设备证据，文件清单保留字节数和 SHA-256。
 
 历史自由活动的普通记录使用版本 2，其开始基线必须为空闲且 `error_code=0`。历史版本 3 专门保存充电错误兼容路径：开始基线保留真实的空闲状态和 `error_code=-16`，并要求 `start_baseline.charging_recovery_evidence` 同时证明原因是 `charging`、电量接口报告未充电、两条回复来自同一次连接且在检查时均不超过 5 秒。证据保存原因码、电量充电状态、两条回复的接收时间与连接代次、检查时间；STATUS 接收时间必须等于基线观察时间。缺失、过期或相互矛盾的证据拒收。版本 2 不接受此兼容字段；所有版本的成功开始、停止与下载记录证据仍要求 `error_code=0`。兼容证据随原清单保留，冻结旧包保持原字节内容。
 
 版本 4 同时支持普通开始与充电错误兼容路径。普通开始要求空闲且 `error_code=0`，省略 `charging_recovery_evidence` 字段；兼容路径要求空闲且 `error_code=-16`，保留与版本 3 同样完整、有效的证据对象。兼容路径缺少证据或证据显式为 null 时拒收；普通开始携带该字段、或其他状态与证据冲突时也拒收。版本 2/3 保持原有校验，版本 4/5 支持新增活动选择字段。
 
-版本5用于开始基线中存在一条设备日期未知的旧记录。`unknown_time_start_evidence`保存完整重读备份的身份及哈希、连接owner/代次、保全时间和手机校时请求/回复。旧记录仍为`unix_ms=0`；新记录必须符合本次TIME锚及时间窗口，数值ID复用时uptime也须改变。v5支持走路/跑步或历史自由活动，以及已有充电兼容证据；缺失、冲突或过期的证据拒收。v6沿用相同证据组合，并要求`ring_placement_schema/hand/finger`与组合位置一致，`app_version`非空，`created_at`为UTC时间。v7在v6基础上要求`stop_origin`与停止请求／确认组合一致，并保存`stop_observed_at_ms`；用户请求停止、设备自行停止和旧来源不明分别表达。这里的时钟证据用于记录归属检查，样本精确时间仍依原有质量规则。冻结v2–v6包原文保持。
+版本5用于开始基线中存在一条设备日期未知的旧记录。`unknown_time_start_evidence`保存完整重读备份的身份及哈希、连接owner/代次、保全时间和手机校时请求/回复。旧记录仍为`unix_ms=0`；新记录必须符合本次TIME锚及时间窗口，数值ID复用时uptime也须改变。v5支持走路/跑步或历史自由活动，以及已有充电兼容证据；缺失、冲突或过期的证据拒收。v6沿用相同证据组合，并要求`ring_placement_schema/hand/finger`与组合位置一致，`app_version`非空，`created_at`为UTC时间。v7在v6基础上要求`stop_origin`与停止请求／确认组合一致，并保存`stop_observed_at_ms`；用户请求停止、设备自行停止和旧来源不明分别表达。v8继续保留这些恢复及停止证据。这里的时钟证据用于记录归属检查，样本精确时间仍依原有质量规则。冻结v2–v7包原文保持。
 
-手机的“稍后上传”和放弃审计仅控制本地工作流。放弃段不产生研究上传包；暂缓段手动上传时沿用同一session及冻结内容。后台接收后仍按session与ZIP哈希去重。
+手机的“暂存到戒指”、历史“稍后上传”和放弃审计仅控制本地工作流。“暂存到戒指”时已接收的心率保存在手机，戒指原始文件等待用户手动下载；下载完整后才冻结并上传同一 session。历史“稍后上传”沿用已在手机的文件与冻结包。放弃仅清理所选段的手机文件与任务，该段不产生研究上传包。更换用户名只影响新段，既有包及上传任务保持采集时的身份。后台接收后仍按 session 与 ZIP 哈希去重。
 
-校验包括严格整数类型、有效零步/缺失/不可靠参考、明确停止、记录指纹与开始基线、原始头部、记录数、载荷 CRC32、整文件 SHA-256、sidecar 对应关系，以及 ZIP 路径、重复条目和资源配额。参考原因保存在原 manifest 中；每个 session 的 `reference.csv` 只有一行，整段总数关联所有原始文件。软件可导入同一 session 的多个片段文件并标记重叠待核对；设备多文件能力仍待实测。
+校验包括严格整数类型、有效零步/缺失/不可靠/不适用参考、明确停止、记录指纹与开始基线、原始头部、记录数、载荷 CRC32、整文件 SHA-256、sidecar 对应关系，以及 ZIP 路径、重复条目和资源配额。参考原因保存在原 manifest 中；每个 session 的 `reference.csv` 只有一行，步数适用时整段总数关联所有原始文件。软件可导入同一 session 的多个片段文件并标记重叠待核对；设备多文件能力仍待实测。
 
-嵌套设备证据按对应版本精确校验字段；两类恢复证据同时存在时要求连接代次一致。时区采用 Android `ZoneId` 语法，固定偏移须在 ±18 小时内且与保存的秒数一致；地区时区保留采集时的偏移，不依赖研究电脑的时区数据库推翻历史记录。已有合法 v2–v6 包保持格式与原文；v7按停止来源新增字段严格校验，历史导入产物保持原样。异常包保留到拒收目录，供复核。
+嵌套设备证据按对应版本精确校验字段；两类恢复证据同时存在时要求连接代次一致。时区采用 Android `ZoneId` 语法，固定偏移须在 ±18 小时内且与保存的秒数一致；地区时区保留采集时的偏移，不依赖研究电脑的时区数据库推翻历史记录。已有合法 v2–v7 包保持格式与原文；v8按运动适用性及心率对象精确校验新增字段，历史导入产物保持原样。异常包保留到拒收目录，供复核。
 
 ```text
 输出目录/
   sessions/<session_id>/
     source.zip         原始冻结上传包
     manifest.json      包内清单原文
-    raw/               原始 rfbin 和设备证据
-    derived/           IMU 与 PPG CSV
+    raw/               原始 rfbin、设备证据及可选 HR/RR CSV
+    derived/           IMU、PPG 及可选 HR/RR CSV
     reference.csv      唯一 session 参考记录
     quality.json       时钟、信号及分析限制
+    heart-rate.json    v8 的心率状态、缺口和质量统计
     import.json        导入版本、包哈希及产物哈希
   conflicts/<session_id>/<zip_sha256>/
   rejected/<zip_sha256>/
@@ -80,15 +83,35 @@ python -m backend.ringo_data cloud-sync --config research-data/cloud-sync.local.
 
 校验与派生在同卷暂存目录执行，文件同步后一次重命名发布。相同 ID、相同 ZIP 返回既有结果，并复核原包及派生产物；相同 ID、不同 ZIP 保留双方并报告冲突。不同 session 若与 canonical session 共享原始文件 SHA-256，后到包完整保留在冲突目录，回执以 `duplicate_of` 指向 canonical session，且不进入 session 索引。拒收包保存在独立目录，原输入保持不变。Windows 使用文件同步与同卷目录重命名；整机断电后的目录持久性仍需系统级验证。
 
+## 可选 Polar H10 心率数据
+
+九种运动均可选 H10，手机端每段默认关闭。开启后通过手机实时接收 HR/RR，同一 session 固定心率带身份；断连缺口随记录保留，连接恢复后继续接收。胸带离线回补属于后续范围。
+
+v8 的 `heart_rate.enabled` 表示本段是否选择心率带。关闭时设备身份、起止时间和首末样本时间均为 null，`status=not_requested`、`sample_count=0`、`gaps=[]`，包内无心率 CSV。开启时设备 ID、名称及开始/结束时间必填；状态依实际记录表达为 `recorded`、`partial` 或 `no_samples`。缺口保存 `disconnected/process_restart/stream_error/storage_error/no_data` 原因及已关闭的起止时间。无样本时可以保留仅含表头的 CSV；确实未建立文件时须同时有 `sample_count=0` 和 `storage_error` 缺口。
+
+原始文件位于 `raw/<session_id>_polar_hr_rr.csv`，保留以下列及全部原字节：
+
+```text
+timestamp_iso,timestamp_unix_ms,sample_index,hr_bpm,corrected_hr_bpm,ppg_quality,rr_available,contact_supported,contact_status,rr_ms,rr_1_1024s
+```
+
+派生文件位于 `derived/<session_id>_polar_hr_rr.csv`，在这些原列之前增加 `session_id,participant_id,activity_code,timestamp_source,phone_receipt_offset_ms`。`timestamp_source` 固定为 `phone_receipt`，`phone_receipt_offset_ms` 是手机接收时间相对心率开始时间的差值。一次 BLE 通知中的多个样本可以有相同接收时间；导入器按原样保留顺序和重复时间，RR 数组继续以 `|` 分隔。
+
+心率校验逐行流式执行，核对固定表头、连续样本序号、UTC ISO/毫秒一致性、整数/布尔值、RR 数组长度及清单的样本数和首末时间。每行最多 65,536 个字符、每行每组 RR 最多 4096 个；文件清单继续校验长度和 SHA-256，`device_session_id` 必须为 null。心率与戒指派生 CSV 共享输出总配额。相同 session 更换心率文件或设备身份会形成另一份 ZIP，按既有规则进入冲突目录。
+
+`heart-rate.json` 与 `quality.json.heart_rate` 保存同一份报告，包括原设备身份、状态、样本数、原缺口、缺口并集时长、首样本延迟、末样本至结束间隔、最大接收间隔及 RR/接触质量统计。重叠缺口只计一次时长；零 HR、零 RR 和 SDK 特殊质量值保留，并记录相应统计。手机时钟回拨或时间超出记录边界时保留所有样本，增加 `heart_rate_phone_clock_order_uncertain` 或 `heart_rate_capture_boundary_uncertain`，相关时长指标置为 null。心率证据显示手机时钟回拨时，戒指的手机时间估计也标为 `unavailable`，因为该估计依赖同一手机时钟稳定的前提。
+
+接收时间表达手机收到通知的时刻，生理样本精确时间仍为未知；报告保留 `physiological_sample_time_known=false`、`resampling_applied=false`、`sample_coverage_status=not_assessed`。研究端可据缺口和质量统计筛选数据，完整覆盖及戒指—胸带精密同步仍需独立验证。
+
 ## 时间、活动标签与质量边界
 
 导入器0.2.0为单文件session增加手机时间估算：所有通道共用`phone_capture_window_v1`平移，手机开始请求与停止确认约束样本时间轴，取可行区间中点。新增`phone_estimated_unix_ms/iso`及`phone_earliest_unix_ms/phone_latest_unix_ms/phone_time_source`；quality的`phone_time_alignment`记录区间与假设。手机时钟稳定、设备标称速率和原session关联是前提，该范围不等于实测校时精度。时序异常、回卷、过长信号或多文件时保留`unavailable`原因；原有时间、数据和参考不改写，分析资格仍待核对。已导入同包继续返回既有结果；需要新版派生列时，用相同`import`命令指定新的独立`--output`目录，原输入与旧研究产物保留。
 
-- `timestamp_unix_ms`、`timestamp_iso` 当前留空：尚无验证通过的样本绝对时间标定。真实起止未知时 manifest 使用 null，rfbin 头使用 0；解码保持未知。
+- 戒指 CSV 的 `timestamp_unix_ms`、`timestamp_iso` 当前留空：尚无验证通过的样本绝对时间标定。真实起止未知时 manifest 使用 null，rfbin 头使用 0；解码保持未知。心率 CSV 的同名列保留手机接收时间，来源由 `timestamp_source=phone_receipt` 明确区分。
 - `packet_uptime_ms` 保留包内端点；`ring_uptime_ms` 按包内样本位置及标称周期展开。IMU 为 20 ms，PPG 为 40 ms。`relative_sample_offset_ms` 相对当前文件该通道首样本，`relative_to_device_anchor_ms` 相对原始设备锚点；回退和环绕保持原差值。
 - `device_anchor_estimated_unix_ms/iso` 单列设备锚推算值，仅用于诊断，不能作为真实采集边界。质量报告保留缺口、重叠及 uptime 回退统计，不插值、补点、重采样或拼成连续时间。
-- 加速度换算沿用原解码器的 `raw / 2048 × 9.80665`。每行 `activity_code` 保留 session 的 `walking`、`running` 或历史 `free_living`。走路、跑步选择声明整次采集任务；逐样本 `activity_truth` 保持空值，标签状态/来源固定为 `unlabelled/none`。逐样本分类评价仍需独立的活动时间标注。
+- 加速度换算沿用原解码器的 `raw / 2048 × 9.80665`。每行 `activity_code` 保留 session 的九种运动之一或历史 `free_living`。活动选择声明整次采集任务；逐样本 `activity_truth` 保持空值，标签状态/来源固定为 `unlabelled/none`。逐样本分类评价仍需独立的活动时间标注。
 - `quality.json` 当前将分析资格保持 `pending_review`，分别报告未知边界、未校准样本时钟、参考异常、信号间隔和多文件风险。CRC/SHA 通过证明传输与保存一致性；信号覆盖、计步器时间对应和设备时钟仍需另行验证。
-- `reference.csv` 与 `summary` 的逐 session 索引均包含 `activity_code`，可据此筛选走路和跑步记录。`summary` 从已验证的清单重建索引，可覆盖旧版缺少活动列的索引；已归档的 ZIP、清单及派生产物保持原样。跨活动同样检查重复原始文件和已知时间区间重叠。当前不生成每日总数；跨午夜、未知边界或未评估覆盖均保留为整段记录。日汇总的有效覆盖与排除规则将在时间质量验收后接入。
+- `reference.csv` 与 `summary` 的逐 session 索引均包含 `activity_code`，可据此筛选运动。索引新增 `ground_truth_source` 及 `heart_rate_enabled/heart_rate_status/heart_rate_sample_count/heart_rate_gap_count/heart_rate_timestamp_source`；旧包的心率列为空，v8 关闭心率的记录明确为 `False/not_requested/0`。`summary` 从已验证的清单重建索引，兼容原活动索引及更早缺少活动列的索引；已归档的 ZIP、清单及派生产物保持原样。跨活动同样检查重复原始文件和已知时间区间重叠。当前不生成每日总数；跨午夜、未知边界或未评估覆盖均保留为整段记录。日汇总的有效覆盖与排除规则将在时间质量验收后接入。
 
 原始 `daily_activity_v1`、CSV v1 及睡眠相关包继续使用原交接后端，其含义保持原契约。它们不进入这个独立活动入口。云盘下载负责将同一测试文件夹中的冻结 ZIP 交给本 CLI；凭据及真实位置保存在本地配置。

@@ -250,7 +250,10 @@ def test_historical_index_without_activity_column_upgrades_without_losing_rows(t
     summarize(root, output)
     with output.open("r", encoding="utf-8", newline="") as stream:
         current = list(csv.DictReader(stream))
-    legacy_fields = [field for field in current[0] if field != "activity_code"]
+    # Write the actual pre-activity index, not a hybrid of new HR columns and old identity fields.
+    legacy_fields = ["session_id", "participant_id", "ground_truth_steps", "ground_truth_status",
+                     "started_at_ms", "ended_at_ms", "analysis_status",
+                     "daily_aggregation_eligible", "analysis_reasons"]
     with output.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=legacy_fields, lineterminator="\n",
                                 extrasaction="ignore")

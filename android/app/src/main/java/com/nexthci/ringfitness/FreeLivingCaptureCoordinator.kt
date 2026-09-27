@@ -92,7 +92,8 @@ class FreeLivingCaptureCoordinator(
         var latestStopStatus: SensorPacket.Health? = null,
     )
     private data class StartIntent(val preparation: PreparationSnapshot, val atMs: Long, val zone: String,
-        val allowedExisting: ExistingRecordAuthorization?, val activity: SessionActivity)
+        val allowedExisting: ExistingRecordAuthorization?, val activity: SessionActivity,
+        val heartRate: SessionHeartRate?)
     private data class RecordIdentity(val sessionId: Int, val uptimeMs: Long, val unixMs: Long)
     private enum class StartWaitStage { BEFORE_START, BEFORE_STATUS }
     private data class StartWait(val id: Long, val generation: Long, val sessionId: String, val stage: StartWaitStage)
@@ -162,10 +163,10 @@ class FreeLivingCaptureCoordinator(
 
     fun requestStart(preparation: PreparationSnapshot, allowedExisting: ExistingRecordAuthorization? = null,
         activity: SessionActivity = SessionActivity.FREE_LIVING,
-        verifiedPreflight: HealthRecordObservation? = null) = dispatch {
+        verifiedPreflight: HealthRecordObservation? = null, heartRate: SessionHeartRate? = null) = dispatch {
         if (!ensureRestored() || round != null || intent != null || session != null) return@dispatch
         if (!connectedTo(preparation.ring?.address)) return@dispatch
-        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting, activity)
+        intent = StartIntent(preparation, clock.nowEpochMs(), clock.timeZoneId(), allowedExisting, activity, heartRate)
         if (verifiedPreflight == null) {
             beginRound(Purpose.PREFLIGHT)
             return@dispatch
@@ -600,7 +601,7 @@ class FreeLivingCaptureCoordinator(
                 val saved = save { store.requestStart(requested.preparation, requested.atMs, requested.zone,
                     DeviceStartBaseline(observed.status, observed.records, observed.statusReceivedAtMs, chargingRecovery,
                         requested.allowedExisting?.unknownTimeStartEvidence),
-                    requested.activity) } ?: return
+                    requested.activity, heartRate = requested.heartRate) } ?: return
                 baseline = observed
                 startPollCount = 0
                 check(saved.phase == FreeLivingSessionPhase.START_REQUESTED)
@@ -662,7 +663,7 @@ class FreeLivingCaptureCoordinator(
                     if (startWait != waiting || generation != waiting.generation || session?.sessionId != waiting.sessionId) return@callback
                     // A durable request remains the prerequisite even if storage changed while waiting.
                     val durable = try { store.readPending() } catch (_: Exception) { storageFailure(); return@callback }
-                    if (durable != session || durable?.phase != FreeLivingSessionPhase.START_REQUESTED) {
+                    if (!acceptIndependentSignalProgress(durable) || durable?.phase != FreeLivingSessionPhase.START_REQUESTED) {
                         clearAssociation()
                         readJournal()
                         return@callback
@@ -820,7 +821,7 @@ class FreeLivingCaptureCoordinator(
                 dispatch callback@{
                     if (stopWait != waiting || generation != waiting.generation || session?.sessionId != waiting.sessionId) return@callback
                     val durable = try { store.readPending() } catch (_: Exception) { storageFailure(); return@callback }
-                    if (durable != session || durable?.phase != FreeLivingSessionPhase.STOP_REQUESTED) {
+                    if (!acceptIndependentSignalProgress(durable) || durable?.phase != FreeLivingSessionPhase.STOP_REQUESTED) {
                         clearAssociation()
                         readJournal()
                         return@callback
@@ -832,6 +833,18 @@ class FreeLivingCaptureCoordinator(
         } catch (_: Exception) {
             invalidateRound(CaptureControlIssue.COMMAND_NOT_ACCEPTED)
         }
+    }
+
+    /** HR checkpoints share the journal but do not change ring command/ownership evidence. */
+    private fun acceptIndependentSignalProgress(durable: FreeLivingSession?): Boolean {
+        val current = session ?: return false
+        if (durable == null || durable.copy(heartRate = current.heartRate) != current) return false
+        val before = current.heartRate
+        val after = durable.heartRate
+        if ((before == null) != (after == null) || before?.deviceId != after?.deviceId ||
+            before?.deviceName != after?.deviceName || before?.startedAtMs != after?.startedAtMs) return false
+        session = durable
+        return true
     }
 
     private fun allowedBaseline(observed: HealthRecordObservation, authorization: ExistingRecordAuthorization?): Boolean {

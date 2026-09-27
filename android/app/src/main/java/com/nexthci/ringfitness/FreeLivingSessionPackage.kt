@@ -142,17 +142,24 @@ class FreeLivingSessionPackage internal constructor(
 
     private fun snapshot(sessionId: String, packageCreatedAt: Instant): Snapshot {
         val manifest = store.manifestSnapshot(sessionId, packageCreatedAt)
-        val rawEntries = manifest.getAsJsonArray("files").map { item ->
+        val sourceEntries = manifest.getAsJsonArray("files").map { item ->
             val entry = item.asJsonObject.deepCopy()
             val name = entry.get("file_name").asString
-            require(name.startsWith("$sessionId-") && name.endsWith(".rfbin") && SIMPLE_NAME.matches(name)) {
-                "原始文件名称无效"
+            val role = entry.get("role").asString
+            require(SIMPLE_NAME.matches(name) && when (role) {
+                "raw" -> name.startsWith("$sessionId-") && name.endsWith(".rfbin")
+                "polar_hr_rr" -> name == SessionHeartRate.fileName(sessionId) && entry.get("device_session_id").isJsonNull
+                else -> false
+            }) {
+                "采集文件名称或角色无效"
             }
             val source = child(directory, name)
             verifySource(source, entry)
             Entry(source, entry)
         }
-        require(rawEntries.isNotEmpty() && rawEntries.map { it.file.name }.distinct().size == rawEntries.size)
+        require(sourceEntries.map { it.file.name }.distinct().size == sourceEntries.size)
+        val rawEntries = sourceEntries.filter { it.manifest.get("role").asString == "raw" }
+        require(rawEntries.isNotEmpty())
         val entries = rawEntries.flatMap { raw ->
             val header = verifyRaw(raw.file, raw.manifest.get("device_session_id").asInt,
                 manifest.get("started_at_ms").takeUnless { it.isJsonNull }?.asLong ?: 0,
@@ -184,7 +191,7 @@ class FreeLivingSessionPackage internal constructor(
                 }
                 listOf(raw, Entry(evidenceFile, entry))
             }
-        }.sortedBy { it.file.name }
+        }.plus(sourceEntries.filter { it.manifest.get("role").asString == "polar_hr_rr" }).sortedBy { it.file.name }
         manifest.add("files", JsonArray().apply { entries.forEach { add(it.manifest) } })
         return Snapshot(manifest, entries)
     }
@@ -192,7 +199,7 @@ class FreeLivingSessionPackage internal constructor(
     private fun legacySnapshot(current: Snapshot): Snapshot {
         val manifest = current.manifest.deepCopy().apply {
             listOf("ring_placement_schema", "ring_hand", "ring_finger", "app_version", "created_at",
-                "stop_origin", "stop_observed_at_ms").forEach(::remove)
+                "stop_origin", "stop_observed_at_ms", "heart_rate").forEach(::remove)
             val baseline = getAsJsonObject("start_baseline")
             val version = when {
                 baseline?.get("unknown_time_start_evidence")?.isJsonNull == false -> 5
@@ -213,8 +220,13 @@ class FreeLivingSessionPackage internal constructor(
             addProperty("version", 6)
             remove("stop_origin")
             remove("stop_observed_at_ms")
+            remove("heart_rate")
         }, current.entries)
-        7 -> current
+        7 -> Snapshot(current.manifest.deepCopy().apply {
+            addProperty("version", 7)
+            remove("heart_rate")
+        }, current.entries)
+        8 -> current
         else -> throw IOException("冻结上传包版本不受支持")
     }
 
@@ -384,7 +396,7 @@ class FreeLivingSessionPackage internal constructor(
         private const val BUFFER_SIZE = 64 * 1024
         private const val ZIP_TIME = 315_532_800_000L
         private val SIMPLE_NAME = Regex("^[a-zA-Z0-9._-]+$")
-        private val ACTIVITY_CODES = setOf("walking", "running")
+        private val ACTIVITY_CODES = SessionActivity.selectable.map { it.wireValue }.toSet()
         private fun legacyArchiveName(sessionId: String) = "ringfitness-session-$sessionId.zip"
         private fun archiveName(sessionId: String, activityCode: String) = when (activityCode) {
             in ACTIVITY_CODES -> "ringfitness-session-$activityCode-$sessionId.zip"

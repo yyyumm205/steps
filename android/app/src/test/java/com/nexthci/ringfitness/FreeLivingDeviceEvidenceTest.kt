@@ -33,7 +33,7 @@ class FreeLivingDeviceEvidenceTest {
         listOf("start_baseline", "device_record_evidence", "device_association_invalidated",
             "start_attempt_archive", "completion_policy", "discarded", "start_abort",
             "reference_revisions", "start_command_dispatch", "stop_observed_at_ms", "stop_origin",
-            "stop_command_dispatch").forEach(payload::remove)
+            "stop_command_dispatch", "heart_rate").forEach(payload::remove)
         envelope.addProperty("journal_version", 2)
         updateChecksum(envelope)
         file.writeText(envelope.toString())
@@ -43,7 +43,7 @@ class FreeLivingDeviceEvidenceTest {
         assertNull(open(file).read()!!.startAttemptArchive)
         assertArrayEquals(bytes, file.readBytes())
         open(file).requestStop(original.sessionId, t + 2)
-        assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
+        assertEquals(14, JsonParser.parseString(file.readText()).asJsonObject["journal_version"].asInt)
         assertNull(open(file).read()!!.deviceRecordEvidence)
         assertNull(open(file).read()!!.startAttemptArchive)
     }

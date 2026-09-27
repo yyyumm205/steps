@@ -54,6 +54,7 @@ class RealCollectionController(
     private val syncClockBeforeStart: Boolean = false,
     /** Release builds verify that the ring is out of its charging case before START. */
     private val requireBatteryBeforeStart: Boolean = false,
+    private val heartRate: SessionHeartRatePort? = null,
     private val saveClockEvidence: (PhoneClockSyncEvidence, String?) -> Unit = { evidence, sessionId ->
         PhoneClockSync.save(directory, evidence, sessionId)
     },
@@ -135,6 +136,7 @@ class RealCollectionController(
     private var referenceDraftError: String? = null
     private var selectedActivity: SessionActivity? = null
     private var requestedActivity: SessionActivity? = null
+    private var heartRateEnabled = false
     private var stopEvidenceGeneration: Long? = null
     private var endStartAttemptReason: String? = null
     private var unknownArchiveReason: String? = null
@@ -187,13 +189,24 @@ class RealCollectionController(
                     require(proof.generation == generation &&
                         backups.verifyUnknown(requireNotNull(profile?.ring).address, proof.record, proof.backupId).sha256 == proof.rawSha256)
                 }
-                return port.start()
+                val pending = requireNotNull(store.readPending())
+                var accepted = false
+                try {
+                    if (pending.heartRate != null && heartRate?.prepare(pending) != true) return false
+                    accepted = port.start()
+                    return accepted
+                } finally {
+                    if (!accepted && pending.heartRate != null) {
+                        releaseHeartRate(requireNotNull(store.read(pending.sessionId)))
+                    }
+                }
             }
         }, clock,
         schedule = { delay, action -> scheduler.schedule(delay) { if (!closed) safely(action = action) } }) { control ->
         control.observation?.let(::recordDiagnostic)
         when (control.phase) {
             CaptureControlPhase.IDLE -> if (control.observation != null) {
+                store.read()?.let(::releaseHeartRate)
                 lastIdle = control.observation.takeIf { !it.status.collecting && it.status.errorCode == 0 }
                 browsingHome = true; taskPage = null; taskError = null
                 if (lastIdle == null) taskError = "本次尝试已结束，请重新连接戒指后再试。"
@@ -201,6 +214,8 @@ class RealCollectionController(
             }
             CaptureControlPhase.CHECKING -> publish(if (store.readPending() == null) CollectionPage.STARTING else CollectionPage.RECOVERY)
             CaptureControlPhase.STARTING -> {
+                // The durable session owns this choice; the next session starts with H10 off.
+                if (control.session != null) heartRateEnabled = false
                 startingClockEvidence?.let { evidence ->
                     val session = requireNotNull(control.session)
                     requireFreshClockEvidence(evidence)
@@ -216,6 +231,7 @@ class RealCollectionController(
             }
             CaptureControlPhase.STOPPING -> publish(CollectionPage.STOPPING)
             CaptureControlPhase.AWAITING_REFERENCE -> {
+                store.readPending()?.let(::finishHeartRateSafely)
                 if (control.observation != null) stopEvidenceGeneration = generation
                 val current = store.readPending()
                 if (current?.isRingDeferred == true) publish(CollectionPage.RING_PENDING)
@@ -261,6 +277,15 @@ class RealCollectionController(
         localProfile = requireNotNull(preparation.read()) { "请先完成准备信息" }
         profile = store.readPending()?.preparation ?: localProfile
         require(profile?.ring != null && profile?.placement != null) { "请先选择戒指与佩戴位置" }
+        store.readPending()?.let { pending ->
+            if (pending.heartRate != null && pending.heartRate.endedAtMs == null) {
+                if (pending.stopRequestedAtMs != null || pending.stopConfirmedAtMs != null || pending.startAbort != null)
+                    finishHeartRateSafely(pending)
+                else runCatching { heartRate?.restore(pending) }.onFailure {
+                    reportError(it as? Exception ?: Exception(it))
+                }
+            }
+        }
         coordinator.restore()
         val current = store.read()
         val pending = current?.takeIf { it.isPending }
@@ -653,10 +678,33 @@ class RealCollectionController(
     override fun register(participantId: String, placement: RingPlacement) = Unit // Preparation owns registration.
 
     override fun selectActivity(activity: SessionActivity) = safely {
-        require(activity in setOf(SessionActivity.WALKING, SessionActivity.RUNNING))
-        if (!state.canStart || state.busy) return@safely
+        require(activity in SessionActivity.selectable)
+        if (store.readPending() != null || state.busy || !connected) return@safely
         selectedActivity = activity
         publish(state.page, state.error)
+    }
+
+    override fun setHeartRateEnabled(enabled: Boolean) = safely {
+        if (store.readPending() != null || state.busy) return@safely
+        require(!enabled || heartRate != null) { "心率带服务尚未准备好" }
+        if (heartRateEnabled != enabled) heartRate?.resetSelection()
+        heartRateEnabled = enabled
+        publish(state.page, state.error)
+    }
+
+    override fun scanHeartRate() = safely {
+        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+        heartRate?.search()
+    }
+
+    override fun connectHeartRate(deviceId: String) = safely {
+        if (!heartRateEnabled || store.readPending() != null || state.busy) return@safely
+        require(heartRate?.state?.devices?.any { it.deviceId == deviceId } == true)
+        heartRate?.connect(deviceId)
+    }
+
+    fun onHeartRateChanged() = safely {
+        if (initialized) publish(state.page, state.error)
     }
 
     override fun start() = safely {
@@ -728,8 +776,14 @@ class RealCollectionController(
             generation, unknownEvidence)
         browsingHome = false; lastIdle = null
         coordinator.refresh()
+        val hr = if (heartRateEnabled) {
+            val selected = requireNotNull(heartRate).state
+            require(selected.connected && selected.hrReady) { "请连接心率带，或关闭可选心率采集" }
+            val id = requireNotNull(selected.selectedDeviceId)
+            SessionHeartRate(id, selected.devices.firstOrNull { it.deviceId == id }?.name ?: "Polar H10", clock.nowEpochMs())
+        } else null
         coordinator.requestStart(requireNotNull(profile), allowed, requireNotNull(requestedActivity),
-            verifiedPreflight = before.takeIf { startingClockEvidence != null && it.status.errorCode == 0 })
+            verifiedPreflight = before.takeIf { startingClockEvidence != null && it.status.errorCode == 0 }, heartRate = hr)
     }
 
     private fun beginClockSync(before: HealthRecordObservation) {
@@ -766,6 +820,8 @@ class RealCollectionController(
         if (!state.canStop) return@safely
         browsingHome = false
         coordinator.requestStop()
+        store.readPending()?.takeIf { it.phase in setOf(FreeLivingSessionPhase.STOP_REQUESTED,
+            FreeLivingSessionPhase.AWAITING_REFERENCE) }?.let(::finishHeartRateSafely)
     }
 
     override fun enterFinish() = safely {
@@ -808,7 +864,7 @@ class RealCollectionController(
                 uploadAvailable -> CompletionPolicy.SAVE_UPLOAD
                 else -> CompletionPolicy.SAVE_LATER
             }
-            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs())
+            val reference = sessionReferenceFromInput(stepsText, status, reason, clock.nowEpochMs(), current.activity)
             saving = true
             val saved = try {
                 publish(CollectionPage.SAVING)
@@ -818,6 +874,7 @@ class RealCollectionController(
                 }
             } finally { saving = false }
             clearReferenceDraft(current.sessionId)
+            heartRate?.finish(requireNotNull(store.read(current.sessionId)))
             if (saved.isRingDeferred) publish(CollectionPage.RING_PENDING)
             else if (connected) inspect()
             else publish(CollectionPage.RECOVERY, "记录已保存，请重新连接以下载数据")
@@ -829,6 +886,7 @@ class RealCollectionController(
         require(current.stopConfirmedAtMs != null)
         val atMs = clock.nowEpochMs()
         store.discardStoppedSession(current.sessionId, atMs, preservationOwnerId, generation)
+        heartRate?.discard(current)
         clearReferenceDraft(current.sessionId)
         closeDownload()
         query = null; readinessWait = null; selectedActivity = null; requestedActivity = null
@@ -1226,6 +1284,7 @@ class RealCollectionController(
         val proof = unknownPreservation?.takeIf { canAttachUnknownProof }?.let {
             UnknownTimeRecordProof(it.record, it.backupId, it.rawSha256, preservationOwnerId, generation, it.savedAtMs)
         }
+        releaseHeartRate(current)
         store.archiveStartAttempt(current.sessionId, observed, clock.nowEpochMs(), requireNotNull(unknownArchiveReason), proof)
         unknownArchiveReason = null
         coordinator.refresh()
@@ -1346,6 +1405,7 @@ class RealCollectionController(
         val proof = if (empty) null else requireNotNull(unknownPreservation).let {
             UnknownTimeRecordProof(it.record, it.backupId, it.rawSha256, preservationOwnerId, generation, it.savedAtMs)
         }
+        releaseHeartRate(current)
         store.completeUnconfirmedStartAbort(current.sessionId, proof, observed, clock.nowEpochMs(), preservationOwnerId)
         coordinator.refresh()
         browsingHome = true; taskPage = null
@@ -1597,8 +1657,26 @@ class RealCollectionController(
         recoveryTimeRound = null; recoveredStopClock = null
         query = null; readinessWait = null; timeRound = null; startingClockEvidence = null
         coordinator.close()
+        runCatching { heartRate?.close() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
         runCatching { closeDownload() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
         runCatching { port.disconnect() }.onFailure { reportError(it as? Exception ?: Exception(it)) }
+    }
+
+    /** Optional signal I/O must not prevent STOP, ring reconciliation or reference persistence. */
+    private fun finishHeartRateSafely(session: FreeLivingSession) {
+        if (session.heartRate == null || session.heartRate.endedAtMs != null || session.isDiscarded) return
+        runCatching { heartRate?.finish(session) }
+            .onFailure { reportError(it as? Exception ?: Exception(it)) }
+    }
+
+    /** Release a failed attempt's live callback even when sealing needs a later storage retry. */
+    private fun releaseHeartRate(session: FreeLivingSession) {
+        if (session.heartRate == null) return
+        try { finishHeartRateSafely(session) } finally {
+            runCatching { heartRate?.discard(session) }
+                .onFailure { reportError(it as? Exception ?: Exception(it)) }
+        }
+        heartRateEnabled = false
     }
 
     /** Release the transport when leaving an idle page; pending captures keep their owner. */
@@ -1647,7 +1725,9 @@ class RealCollectionController(
         val idle = lastIdle
         val checkingDevice = pending == null && backupObservation == null && connected &&
             (query != null || readinessWait != null || timeRound != null)
-        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null
+        val hrState = heartRate?.state ?: PolarUiState()
+        val hrReady = !heartRateEnabled || (hrState.connected && hrState.hrReady && hrState.selectedDeviceId != null)
+        val canStart = pending == null && idle != null && !connecting && connected && query == null && readinessWait == null && timeRound == null && backupObservation == null && hrReady
         val visibleProfile = pending?.preparation ?: profile
         val participantLabel = localProfile?.takeIf {
             it.participantId == visibleProfile?.participantId
@@ -1674,6 +1754,7 @@ class RealCollectionController(
                 query == null && downloader == null && !saving && !coordinator.state.settling && coordinator.state.timeoutOperationId == null &&
                 coordinator.state.phase == CaptureControlPhase.NEEDS_REVIEW,
             records = recordSummaries(), selectedActivity = selectedActivity,
+            heartRateEnabled = pending?.heartRate != null || (pending == null && heartRateEnabled), heartRateState = hrState,
             referenceDraft = referenceDraft, referenceDraftError = referenceDraftError,
             canStopUnconfirmedStart = connected && !connecting && query == null && abortWaitOperation == null &&
                 !abortCandidateInvalidated && pending?.phase == FreeLivingSessionPhase.START_REQUESTED && pending.startAbort == null &&

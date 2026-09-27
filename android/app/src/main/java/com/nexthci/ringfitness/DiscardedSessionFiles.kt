@@ -18,6 +18,7 @@ internal object DiscardedSessionFiles {
             add("$id.clock-recovery.json")
             add("$id-simulated-signal.txt")
             add("$id-simulated-receipt.txt")
+            add(SessionHeartRate.fileName(id))
         }
         names.forEach { deleteFile(child(root, it)) }
         // Crash leftovers have a generated suffix and only these known temporary extensions.
@@ -41,11 +42,9 @@ internal object DiscardedSessionFiles {
                 require(folder.isDirectory)
                 listOf(
                     "ringfitness-session-$id.zip",
-                    "ringfitness-session-walking-$id.zip",
-                    "ringfitness-session-running-$id.zip",
                     "manifest.snapshot.json",
                     "package.json",
-                ).forEach {
+                ).plus(SessionActivity.selectable.map { "ringfitness-session-${it.wireValue}-$id.zip" }).forEach {
                     deleteFile(child(folder, it))
                 }
                 syncDirectory(folder)

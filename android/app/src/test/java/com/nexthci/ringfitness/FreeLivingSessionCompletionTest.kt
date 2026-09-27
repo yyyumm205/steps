@@ -261,7 +261,7 @@ class FreeLivingSessionCompletionTest {
             "start_baseline", "device_record_evidence", "device_association_invalidated",
             "start_attempt_archive", "completion_policy", "discarded", "start_abort",
             "reference_revisions", "start_command_dispatch", "stop_observed_at_ms", "stop_origin",
-            "stop_command_dispatch").forEach(session::remove)
+            "stop_command_dispatch", "heart_rate").forEach(session::remove)
         envelope.addProperty("journal_version", 1)
         envelope.remove("archived_sessions")
         envelope.addProperty("sha256", digest(session.toString().toByteArray()))
@@ -274,7 +274,7 @@ class FreeLivingSessionCompletionTest {
         assertNull(restored.startAttemptArchive)
         assertArrayEquals(originalBytes, file.readBytes())
         open(file).saveReference(stopped.sessionId, SessionReference(ReferenceStatus.VALID, 0, t + 3_000))
-        assertEquals(13, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(14, JsonParser.parseString(file.readText()).asJsonObject.get("journal_version").asInt)
         assertEquals(0L, open(file).read()!!.reference!!.steps)
         assertNull(open(file).read()!!.startAttemptArchive)
     }

@@ -62,6 +62,16 @@ class RealCollectionService : Service() {
                     syncDirectory(filesDir)
                 }
                 val store = FreeLivingSessionStore(File(directory, "session.json"))
+                val clock = object : CaptureClock {
+                    override fun nowEpochMs() = System.currentTimeMillis()
+                    override fun timeZoneId() = ZoneId.systemDefault().id
+                    override fun nowElapsedMs() = android.os.SystemClock.elapsedRealtime()
+                }
+                val optionalHeartRate = RealSessionHeartRate(this, directory, store, clock,
+                    dispatch = { action -> if (!destroyed) worker.execute { if (!destroyed) action() } },
+                    onMain = { action -> onMain(allowDestroyed = true, action = action) },
+                    changed = { controller?.onHeartRateChanged() },
+                    reportError = { Log.e(TAG, "Optional heart rate capture", it) })
                 val port = object : RealCollectionPort {
                     override fun connect(ring: PreparedRing, generation: Long): Boolean = onMain {
                         clientGeneration = generation
@@ -110,10 +120,7 @@ class RealCollectionService : Service() {
                 val owner = RealCollectionController(directory, PreparationStore(File(filesDir, "preparation/profile.properties")),
                     store, port, CollectionScheduler { delay, action ->
                         worker.schedule({ if (!destroyed) action() }, delay, TimeUnit.MILLISECONDS)
-                    }, object : CaptureClock {
-                        override fun nowEpochMs() = System.currentTimeMillis()
-                        override fun timeZoneId() = ZoneId.systemDefault().id
-                    }, authorizedExisting = {
+                    }, clock, authorizedExisting = {
                         // A one-time, exact baseline is provisioned locally for the authorized old lab record.
                         // Release never consumes this development-only authorization.
                         val file = File(directory, "authorized-existing.json")
@@ -125,7 +132,8 @@ class RealCollectionService : Service() {
                         trace("observation generation=${observation.connectionGeneration} status=${observation.status} records=${observation.records}")
                         writeObservation(File(directory, "device-observation.json"), Gson().toJson(observation))
                     }, reportError = { error -> Log.e(TAG, "Real collection operation failed", error) },
-                    syncClockBeforeStart = true, requireBatteryBeforeStart = true, uploads = object : RealUploadPort {
+                    syncClockBeforeStart = true, requireBatteryBeforeStart = true, heartRate = optionalHeartRate,
+                    uploads = object : RealUploadPort {
                         override val available: Boolean = runCatching {
                             SeafileSessionTransport.validateLink(BuildConfig.ACTIVITY_UPLOAD_LINK.trim())
                         }.isSuccess
@@ -436,6 +444,9 @@ object RealCollectionBridge : CollectionFlow {
     override fun register(participantId: String, placement: RingPlacement) = Unit
     override fun start() { dispatch?.invoke { it.start() } }
     override fun selectActivity(activity: SessionActivity) { dispatch?.invoke { it.selectActivity(activity) } }
+    override fun setHeartRateEnabled(enabled: Boolean) { dispatch?.invoke { it.setHeartRateEnabled(enabled) } }
+    override fun scanHeartRate() { dispatch?.invoke { it.scanHeartRate() } }
+    override fun connectHeartRate(deviceId: String) { dispatch?.invoke { it.connectHeartRate(deviceId) } }
     override fun stop() { dispatch?.invoke { it.stop() } }
     override fun chooseFinish(uploadNow: Boolean) { dispatch?.invoke { it.chooseFinish(uploadNow) } }
     override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) {

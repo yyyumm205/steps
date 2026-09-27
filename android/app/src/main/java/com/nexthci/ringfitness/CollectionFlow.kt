@@ -7,6 +7,36 @@ enum class CollectionPage {
 
 enum class FlowTestFault { NONE, START_TIMEOUT, STOP_TIMEOUT, SAVE_FAILURE, DOWNLOAD_FAILURE, UPLOAD_FAILURE }
 
+data class PolarUiDevice(val deviceId: String, val name: String, val rssi: Int)
+
+/** Bluetooth details presented without exposing SDK objects to the flow or its simulations. */
+data class PolarUiState(
+    val devices: List<PolarUiDevice> = emptyList(),
+    val selectedDeviceId: String? = null,
+    val connected: Boolean = false,
+    val hrReady: Boolean = false,
+    val connecting: Boolean = false,
+    val scanning: Boolean = false,
+    val recording: Boolean = false,
+    val lastHeartRate: Int? = null,
+    val message: String = "",
+) {
+    val ready: Boolean get() = connected && hrReady && selectedDeviceId != null
+}
+
+internal fun heartRateStatusLabel(enabled: Boolean, polar: PolarUiState, captureActive: Boolean = false): String = when {
+    !enabled -> "未启用"
+    polar.scanning -> "正在搜索 Polar H10…"
+    polar.connecting -> if (captureActive) "心率带正在重连…" else "正在连接 Polar H10…"
+    !polar.connected && polar.selectedDeviceId != null ->
+        if (captureActive) "心率带连接已中断，等待恢复" else "连接已中断，请重新连接"
+    polar.connected && !polar.hrReady -> "已连接，等待 HR/RR 就绪"
+    polar.ready && polar.recording -> polar.lastHeartRate?.let { "$it bpm · 正在采集" } ?: "正在采集 HR/RR"
+    polar.ready && captureActive -> "已连接，等待 HR/RR 数据"
+    polar.ready -> "Polar H10 已就绪"
+    else -> "请搜索并连接 Polar H10"
+}
+
 data class FlowRecordSummary(
     val sessionId: String,
     val steps: Long?,
@@ -30,6 +60,9 @@ data class FlowRecordSummary(
 
 internal val FlowRecordSummary.displayStartedAtMs: Long?
     get() = startedAtMs ?: phoneStartAtMs
+
+internal val FlowRecordSummary.referenceLabel: String
+    get() = if (!activity.requiresReferenceSteps) "无需计步" else steps?.let { "$it 步" } ?: "未提供读数"
 
 internal fun FreeLivingSession.phoneStartAnchorMs(): Long? =
     startConfirmedAtMs ?: startRequestedAtMs.takeIf { it > 0 }
@@ -66,6 +99,8 @@ data class CollectionFlowState(
     val records: List<FlowRecordSummary> = emptyList(),
     val fault: FlowTestFault = FlowTestFault.NONE,
     val selectedActivity: SessionActivity? = null,
+    val heartRateEnabled: Boolean = false,
+    val heartRateState: PolarUiState = PolarUiState(),
     /** Recoverable UI input. It is not research reference data until stop confirmation. */
     val referenceDraft: String? = null,
     /** Set when the visible input has not yet replaced the last durable draft. */
@@ -82,6 +117,9 @@ interface CollectionFlow {
     fun register(participantId: String, placement: RingPlacement)
     fun start()
     fun selectActivity(activity: SessionActivity) = Unit
+    fun setHeartRateEnabled(enabled: Boolean) = Unit
+    fun scanHeartRate() = Unit
+    fun connectHeartRate(deviceId: String) = Unit
     fun stop()
     fun chooseFinish(uploadNow: Boolean) = Unit
     /** Commits the completion choice and reference observation as one durable operation. */
@@ -109,9 +147,17 @@ internal fun sessionReferenceFromInput(
     status: String,
     reason: String,
     recordedAtMs: Long,
+    activity: SessionActivity = SessionActivity.FREE_LIVING,
 ): SessionReference {
+    if (!activity.requiresReferenceSteps) {
+        require(stepsText.isBlank() && reason.isBlank() && status == ReferenceStatus.NOT_APPLICABLE.wireValue) {
+            "本项运动无需填写步数"
+        }
+        return SessionReference(ReferenceStatus.NOT_APPLICABLE, null, recordedAtMs)
+    }
     val kind = ReferenceStatus.entries.singleOrNull { it.wireValue == status }
         ?: throw IllegalArgumentException("请选择读数状态")
+    require(kind != ReferenceStatus.NOT_APPLICABLE) { "请填写本次参考步数" }
     val steps = when {
         kind == ReferenceStatus.MISSING -> null
         stepsText.trim().matches(Regex("[0-9]+")) -> stepsText.trim().toLongOrNull()

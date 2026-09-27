@@ -24,6 +24,391 @@ class RealCollectionControllerTest {
     private fun collecting() = HealthMessage.Status(true, initialRecord.bytes, initialRecord.records, 0, 7)
     private fun stopped() = HealthMessage.Status(false, finalRecord.bytes, finalRecord.records, 0, 7)
 
+    @Test fun heartRateDefaultsOffAndAnUnreadyStrapDoesNotGateRingStart() = Fixture(withHeartRate = true).use { f ->
+        f.connectReady()
+        assertFalse(f.owner.state.heartRateEnabled)
+        assertFalse(f.owner.state.heartRateState.ready)
+
+        f.startSelected(); f.observe(idle()); f.observe(collecting(), listOf(initialRecord))
+
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertNull(f.store.readPending()!!.heartRate)
+        assertTrue(f.heartRate.prepared.isEmpty())
+        assertNull(f.heartRate.activeSessionId)
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun enabledHeartRateRequiresConnectionReadinessAndIdentityBeforeStart() = Fixture(withHeartRate = true).use { f ->
+        f.connectReady()
+        f.owner.setHeartRateEnabled(true)
+        assertEquals(1, f.heartRate.resetCount)
+        assertTrue(f.owner.state.heartRateEnabled)
+        assertFalse(f.owner.state.canStart)
+        f.startSelected()
+        assertNull(f.store.readPending())
+
+        f.heartRate.state = PolarUiState(selectedDeviceId = "H10-TEST", connected = true)
+        f.owner.onHeartRateChanged()
+        assertFalse(f.owner.state.canStart)
+        f.heartRate.state = PolarUiState(connected = true, hrReady = true)
+        f.owner.onHeartRateChanged()
+        assertFalse(f.owner.state.canStart)
+        assertEquals(0, f.port.count("start"))
+
+        f.heartRate.ready(); f.owner.onHeartRateChanged()
+        assertTrue(f.owner.state.canStart)
+        f.startSelected(); f.observe(idle()); f.observe(collecting(), listOf(initialRecord))
+        val session = f.store.readPending()!!
+        assertEquals("H10-TEST", session.heartRate!!.deviceId)
+        assertEquals("Polar H10 fixture", session.heartRate!!.deviceName)
+        assertEquals(listOf(session.sessionId), f.heartRate.prepared)
+        assertEquals(session.sessionId, f.heartRate.activeSessionId)
+        assertTrue(f.owner.state.heartRateEnabled)
+    }
+
+    @Test fun disablingHeartRateClearsSelectionAndRestoresRingOnlyStart() = Fixture(withHeartRate = true).use { f ->
+        f.connectReady(); f.enableReadyHeartRate()
+        f.heartRate.state = f.heartRate.state.copy(hrReady = false)
+        f.owner.onHeartRateChanged()
+        assertFalse(f.owner.state.canStart)
+
+        f.owner.setHeartRateEnabled(false)
+
+        assertEquals(2, f.heartRate.resetCount)
+        assertFalse(f.owner.state.heartRateEnabled)
+        assertNull(f.owner.state.heartRateState.selectedDeviceId)
+        assertTrue(f.owner.state.canStart)
+        f.startSelected(); f.observe(idle()); f.observe(collecting(), listOf(initialRecord))
+        assertNull(f.store.readPending()!!.heartRate)
+        assertTrue(f.heartRate.prepared.isEmpty())
+        assertEquals(1, f.port.count("start"))
+    }
+
+    @Test fun rejectedOrThrowingHeartRateAndRingStartsSealAndReleaseTheSignalOwner() {
+        for (failure in listOf("heart_rate_rejected", "heart_rate_throws", "ring_rejected", "ring_throws")) {
+            Fixture(withHeartRate = true).use { f ->
+                f.connectReady(); f.enableReadyHeartRate()
+                when (failure) {
+                    "heart_rate_rejected" -> f.heartRate.prepareAccepted = false
+                    "heart_rate_throws" -> f.heartRate.prepareError = IOException("注入 H10 启动失败")
+                    "ring_rejected" -> f.port.accept = { it != "start" }
+                    "ring_throws" -> f.port.accept = { command ->
+                        if (command == "start") throw IOException("注入戒指启动失败")
+                        true
+                    }
+                }
+
+                f.startSelected(); f.observe(idle())
+
+                val session = f.store.readPending()!!
+                assertEquals(failure, FreeLivingSessionPhase.START_REQUESTED, session.phase)
+                assertNull(failure, session.startConfirmedAtMs)
+                assertNull(failure, session.startCommandDispatch)
+                assertEquals(failure, listOf(session.sessionId), f.heartRate.prepared)
+                assertEquals(failure, listOf(session.sessionId), f.heartRate.finished)
+                assertEquals(failure, listOf(session.sessionId), f.heartRate.discarded)
+                assertNull(failure, f.heartRate.activeSessionId)
+                assertFalse(failure, f.heartRate.state.recording)
+                assertNotNull(failure, session.heartRate!!.endedAtMs)
+                SessionHeartRate.verifyFile(f.directory, session.sessionId, session.heartRate!!)
+                assertEquals(failure, if (failure.startsWith("ring_")) 1 else 0, f.port.count("start"))
+                assertEquals(failure, CollectionPage.RECOVERY, f.owner.state.page)
+            }
+        }
+    }
+
+    @Test fun heartRateJournalCheckpointsDuringBothStartWaitsPreserveTheCaptureSequence() =
+        Fixture(deferCaptureWaits = true, withHeartRate = true).use { f ->
+            f.connectReady(); f.enableReadyHeartRate()
+            f.startSelected(); f.observe(idle())
+            val requested = f.store.readPending()!!
+            val configured = requested.heartRate!!
+            f.store.updateHeartRate(requested.sessionId, configured.copy(gaps = listOf(
+                HeartRateGap(configured.startedAtMs, ++f.clock.now, "disconnected"))))
+            assertEquals(0, f.port.count("start"))
+
+            f.runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+
+            assertEquals(1, f.port.count("start"))
+            assertEquals(requested.sessionId, f.heartRate.activeSessionId)
+            f.heartRate.sample()
+            assertEquals(1L, f.store.readPending()!!.heartRate!!.sampleCount)
+            val polls = f.port.count("status")
+            f.runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+            assertEquals(polls + 1, f.port.count("status"))
+            f.observe(collecting(), listOf(initialRecord))
+
+            val collecting = f.store.readPending()!!
+            assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+            assertEquals(requested.sessionId, collecting.sessionId)
+            assertEquals(1L, collecting.heartRate!!.sampleCount)
+            assertEquals("disconnected", collecting.heartRate!!.gaps.single().reason)
+            assertTrue(f.errors.isEmpty())
+        }
+
+    @Test fun heartRateJournalCheckpointsDuringBothStopWaitsPreserveStopConfirmation() =
+        Fixture(deferCaptureWaits = true, withHeartRate = true).use { f ->
+            f.beginHeartRateCollecting()
+            f.heartRate.sample()
+            f.heartRate.finishError = IOException("注入心率收尾失败")
+            f.owner.stop()
+            assertEquals(FreeLivingSessionPhase.STOP_REQUESTED, f.store.readPending()!!.phase)
+            assertEquals("注入心率收尾失败", f.errors.single().message)
+            f.heartRate.sample(73)
+            val polls = f.port.count("status")
+
+            f.runDelay(FreeLivingCaptureCoordinator.STOP_FIRST_POLL_DELAY_MS)
+            assertEquals(polls + 1, f.port.count("status"))
+            f.observe(stopped(), listOf(finalRecord))
+            assertNull(f.store.readPending()!!.stopConfirmedAtMs)
+            f.heartRate.sample(74)
+            f.heartRate.finishError = null
+            f.runDelay(FreeLivingCaptureCoordinator.STOP_FLASH_SETTLE_DELAY_MS)
+            f.observe(stopped(), listOf(finalRecord))
+
+            val stopped = f.store.readPending()!!
+            assertEquals(CollectionPage.FINISH, f.owner.state.page)
+            assertNotNull(stopped.stopConfirmedAtMs)
+            assertEquals(3L, stopped.heartRate!!.sampleCount)
+            assertNotNull(stopped.heartRate!!.endedAtMs)
+            assertNull(f.heartRate.activeSessionId)
+            assertEquals(1, f.port.count("stop"))
+            SessionHeartRate.verifyFile(f.directory, stopped.sessionId, stopped.heartRate!!)
+        }
+
+    @Test fun rejectedStopKeepsHeartRateActiveUntilAnAcceptedStop() = Fixture(withHeartRate = true).use { f ->
+        f.beginHeartRateCollecting()
+        val id = f.store.readPending()!!.sessionId
+        f.heartRate.sample()
+        f.port.accept = { it != "stop" }
+
+        f.owner.stop()
+
+        assertEquals(FreeLivingSessionPhase.COLLECTING, f.store.readPending()!!.phase)
+        assertNull(f.store.readPending()!!.heartRate!!.endedAtMs)
+        assertEquals(id, f.heartRate.activeSessionId)
+        assertTrue(f.heartRate.state.recording)
+        assertTrue(f.heartRate.finished.isEmpty())
+        f.heartRate.sample(74)
+        assertEquals(2L, f.store.readPending()!!.heartRate!!.sampleCount)
+        f.port.accept = { true }
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        assertEquals(CollectionPage.FINISH, f.owner.state.page)
+        assertNotNull(f.store.readPending()!!.heartRate!!.endedAtMs)
+        assertNull(f.heartRate.activeSessionId)
+        assertEquals(listOf(id), f.heartRate.finished)
+        assertTrue(f.errors.isEmpty())
+    }
+
+    @Test fun nonStepSportSaveKeepsSealedHeartRateAndOmitsReferenceSteps() {
+        val uploads = RecordingUploads()
+        Fixture(uploads, withHeartRate = true).use { f ->
+            f.beginHeartRateCollecting(SessionActivity.BADMINTON)
+            f.heartRate.sample()
+            f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            val sealed = f.store.readPending()!!.heartRate!!
+
+            f.owner.finalizeSession(true, "", "not_applicable", "")
+            f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+
+            val saved = f.store.read()!!
+            assertEquals(SessionActivity.BADMINTON, saved.activity)
+            assertEquals(ReferenceStatus.NOT_APPLICABLE, saved.reference!!.status)
+            assertNull(saved.reference!!.steps)
+            assertEquals(sealed, saved.heartRate)
+            assertNotNull(saved.localData)
+            assertNull(f.heartRate.activeSessionId)
+            SessionHeartRate.verifyFile(f.directory, saved.sessionId, sealed)
+            val manifest = f.store.manifestSnapshot(saved.sessionId)
+            assertEquals("none", manifest["ground_truth_source"].asString)
+            assertTrue(manifest.getAsJsonObject("heart_rate")["enabled"].asBoolean)
+            val hrFile = manifest.getAsJsonArray("files").single { it.asJsonObject["role"].asString == "polar_hr_rr" }.asJsonObject
+            assertEquals(sealed.file!!.fileName, hrFile["file_name"].asString)
+            assertEquals(listOf(saved.sessionId to false), uploads.requests)
+        }
+    }
+
+    @Test fun nonStepSportDeferRetainsHeartRateAcrossReopenAndSameSessionResume() {
+        val uploads = RecordingUploads()
+        Fixture(uploads, withHeartRate = true).use { f ->
+            f.beginHeartRateCollecting(SessionActivity.STRENGTH_TRAINING)
+            f.heartRate.sample()
+            f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+            f.owner.finalizeSession(false, "", "not_applicable", "")
+            val deferred = f.store.readPending()!!
+            val heartRateFile = File(f.directory, deferred.heartRate!!.file!!.fileName)
+            val originalBytes = heartRateFile.readBytes()
+            assertEquals(CollectionPage.RING_PENDING, f.owner.state.page)
+            assertEquals(ReferenceStatus.NOT_APPLICABLE, deferred.reference!!.status)
+            assertNull(deferred.reference!!.steps)
+            assertNull(f.heartRate.activeSessionId)
+            assertTrue(f.port.reads.isEmpty())
+            assertTrue(uploads.requests.isEmpty())
+
+            f.reopen()
+            assertEquals(deferred, f.store.readPending())
+            assertTrue(f.heartRate.restored.isEmpty())
+            assertArrayEquals(originalBytes, heartRateFile.readBytes())
+            f.owner.resumeRingTransfer(); f.owner.onConnected(f.port.generation)
+            f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+
+            val saved = f.store.read(deferred.sessionId)!!
+            assertEquals(deferred.heartRate, saved.heartRate)
+            assertEquals(deferred.reference, saved.reference)
+            assertNotNull(saved.localData)
+            assertArrayEquals(originalBytes, heartRateFile.readBytes())
+            assertEquals(listOf(saved.sessionId), f.heartRate.prepared)
+            assertEquals(listOf(saved.sessionId to false), uploads.requests)
+        }
+    }
+
+    @Test fun nonStepSportDiscardRemovesOnlyItsOwnedHeartRateFile() = Fixture(withHeartRate = true).use { f ->
+        val unrelated = File(f.directory, "unrelated-heart-rate.csv").apply { writeText("keep this file") }
+        f.beginHeartRateCollecting(SessionActivity.BASKETBALL)
+        f.heartRate.sample()
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        val session = f.store.readPending()!!
+        val heartRateFile = File(f.directory, session.heartRate!!.file!!.fileName)
+        assertTrue(heartRateFile.isFile)
+
+        f.owner.discardSession()
+
+        assertNull(f.store.readPending())
+        assertTrue(f.store.read(session.sessionId)!!.isDiscarded)
+        assertEquals(listOf(session.sessionId), f.heartRate.discarded)
+        assertNull(f.heartRate.activeSessionId)
+        assertFalse(heartRateFile.exists())
+        assertEquals("keep this file", unrelated.readText())
+        assertTrue(f.port.reads.isEmpty())
+        assertTrue(f.errors.isEmpty())
+    }
+
+    @Test fun asynchronousPreflightHeartRateChoiceDoesNotCarryIntoTheNextSession() = Fixture(withHeartRate = true).use { f ->
+        f.beginHeartRateCollecting(SessionActivity.BADMINTON)
+        f.heartRate.sample()
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        f.owner.finalizeSession(true, "", "not_applicable", "")
+        f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+        val saved = f.store.read()!!
+        assertNotNull(saved.heartRate)
+
+        f.owner.home()
+        f.heartRate.state = f.heartRate.state.copy(connected = false, hrReady = false)
+        f.owner.onHeartRateChanged()
+
+        assertFalse(f.owner.state.heartRateEnabled)
+        assertTrue(f.owner.state.canStart)
+        f.startSelected(); f.observe(stopped(), listOf(finalRecord))
+        assertNotEquals(saved.sessionId, f.store.readPending()!!.sessionId)
+        assertNull(f.store.readPending()!!.heartRate)
+        assertEquals(listOf(saved.sessionId), f.heartRate.prepared)
+    }
+
+    @Test fun restoredActiveHeartRateCaptureDoesNotEnableHeartRateForTheNextSession() = Fixture(withHeartRate = true).use { f ->
+        f.beginHeartRateCollecting(SessionActivity.BADMINTON)
+        f.heartRate.sample()
+        val id = f.store.readPending()!!.sessionId
+        f.reopen(); f.owner.onConnected(f.port.generation)
+        f.observe(collecting(), listOf(initialRecord))
+        assertEquals(CollectionPage.COLLECTING, f.owner.state.page)
+        assertTrue(f.owner.state.heartRateEnabled)
+        assertEquals(listOf(id), f.heartRate.restored)
+        f.heartRate.sample(74)
+        f.owner.stop(); f.observe(stopped(), listOf(finalRecord))
+        f.owner.finalizeSession(true, "", "not_applicable", "")
+        f.observe(stopped(), listOf(finalRecord)); f.finishDownload()
+        assertEquals(2L, f.store.read(id)!!.heartRate!!.sampleCount)
+
+        f.owner.home()
+        f.heartRate.state = f.heartRate.state.copy(connected = false, hrReady = false)
+        f.owner.onHeartRateChanged()
+
+        assertFalse(f.owner.state.heartRateEnabled)
+        assertTrue(f.owner.state.canStart)
+        f.startSelected(); f.observe(stopped(), listOf(finalRecord))
+        assertNotEquals(id, f.store.readPending()!!.sessionId)
+        assertNull(f.store.readPending()!!.heartRate)
+        assertEquals(listOf(id), f.heartRate.prepared)
+        assertTrue(f.errors.isEmpty())
+    }
+
+    @Test fun archivingAnUnconfirmedStartSealsAndReleasesHeartRate() = Fixture(withHeartRate = true).use { f ->
+        f.connectReady(); f.enableReadyHeartRate()
+        f.startSelected(); f.observe(idle())
+        f.heartRate.sample()
+        f.observeUnconfirmedStart(idle().copy(errorCode = -16))
+        val id = f.store.readPending()!!.sessionId
+        assertEquals(id, f.heartRate.activeSessionId)
+        assertTrue(f.owner.state.canEndStartAttempt)
+
+        f.owner.endStartAttempt("未开始活动")
+        f.owner.onConnected(f.port.generation); f.observe(idle().copy(errorCode = -16))
+
+        val archived = f.store.read(id)!!
+        assertNull(f.store.readPending())
+        assertNotNull(archived.startAttemptArchive)
+        assertNotNull(archived.heartRate!!.endedAtMs)
+        assertEquals(1L, archived.heartRate!!.sampleCount)
+        assertEquals(listOf(id), f.heartRate.discarded)
+        assertNull(f.heartRate.activeSessionId)
+        assertFalse(f.owner.state.heartRateEnabled)
+        SessionHeartRate.verifyFile(f.directory, id, archived.heartRate!!)
+        assertTrue(f.errors.isEmpty())
+    }
+
+    @Test fun archivingAZeroClockStartAfterBackupClosesItsHeartRateOwner() =
+        Fixture(syncClock = true, withHeartRate = true).use { f ->
+            val old = finalRecord.copy(unixMs = 0)
+            f.owner.initialize(); f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(old))
+            f.finishDownload(); f.observe(stopped(), listOf(old))
+            f.enableReadyHeartRate()
+            f.startSelected(); f.observe(stopped(), listOf(old)); f.timeReply()
+            f.observe(stopped(), listOf(old)); f.heartRate.sample()
+            f.observeUnconfirmedStart(stopped(), listOf(old))
+            val id = f.store.readPending()!!.sessionId
+
+            f.owner.endStartAttempt("未开始活动")
+            f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(old))
+            f.finishDownload(); f.observe(stopped(), listOf(old)); f.observe(stopped(), listOf(old))
+
+            val archived = f.store.read(id)!!
+            assertNull(f.store.readPending())
+            assertNotNull(archived.startAttemptArchive)
+            assertNotNull(archived.heartRate!!.endedAtMs)
+            assertNull(f.heartRate.activeSessionId)
+            assertTrue(id in f.heartRate.discarded)
+            assertFalse(f.owner.state.heartRateEnabled)
+            SessionHeartRate.verifyFile(f.directory, id, archived.heartRate!!)
+            assertTrue(f.errors.isEmpty())
+        }
+
+    @Test fun completingAnUnconfirmedStartAbortSealsAndReleasesHeartRate() =
+        Fixture(syncClock = true, withHeartRate = true).use { f ->
+            val initial = f.beginUnconfirmedZeroTimeStart(enableHeartRate = true)
+            val final = initial.copy(bytes = payload.size.toLong(), records = 2)
+            val id = f.store.readPending()!!.sessionId
+            f.heartRate.sample()
+            f.owner.stop(); f.observe(collecting(), listOf(initial))
+            f.observe(stopped(), listOf(final))
+            f.owner.onConnected(f.port.generation); f.observe(stopped(), listOf(final))
+            f.finishDownload(); f.observe(stopped(), listOf(final))
+
+            val audit = f.store.read(id)!!
+            assertNull(f.store.readPending())
+            assertNotNull(audit.startAbort!!.completedAtMs)
+            assertNotNull(audit.startAbort!!.preservation)
+            assertNotNull(audit.heartRate!!.endedAtMs)
+            assertEquals(1L, audit.heartRate!!.sampleCount)
+            assertNull(audit.reference)
+            assertNull(audit.localData)
+            assertNull(f.heartRate.activeSessionId)
+            assertTrue(id in f.heartRate.discarded)
+            assertFalse(f.owner.state.heartRateEnabled)
+            assertTrue(f.owner.state.records.isEmpty())
+            SessionHeartRate.verifyFile(f.directory, id, audit.heartRate!!)
+            assertTrue(f.errors.isEmpty())
+        }
+
     @Test fun unknownIdleRecordIsBackedUpAutomaticallyWithoutCreatingResearchData() {
         val uploads = RecordingUploads()
         Fixture(uploads).use { f ->
@@ -197,7 +582,7 @@ class RealCollectionControllerTest {
                 f.finishDownload()
                 assertEquals(0L, f.store.read()!!.reference!!.steps)
                 assertNotNull(f.store.read()!!.localData)
-                assertEquals(7, f.store.manifestSnapshot(f.store.read()!!.sessionId)["version"].asInt)
+                assertEquals(8, f.store.manifestSnapshot(f.store.read()!!.sessionId)["version"].asInt)
                 assertEquals(2, f.port.reads.size)
             }
         }
@@ -876,7 +1261,7 @@ class RealCollectionControllerTest {
         val saved = f.store.read()!!
         assertEquals(CollectionPage.COMPLETE, f.owner.state.page)
         assertEquals(0L, saved.reference!!.steps)
-        assertEquals(7, f.store.manifestSnapshot(saved.sessionId).get("version").asInt)
+        assertEquals(8, f.store.manifestSnapshot(saved.sessionId).get("version").asInt)
         assertNotNull(f.store.manifestSnapshot(saved.sessionId).getAsJsonObject("start_baseline")["charging_recovery_evidence"])
         assertEquals(1, f.port.count("start"))
         f.reopen()
@@ -2969,7 +3354,8 @@ class RealCollectionControllerTest {
         private val preserveUnassignedExisting: Boolean = true,
         private val referenceDraftCommit: (File, File) -> Unit = { source, target -> replace(source, target) },
         profileLabel: String = "owner001",
-        identityType: PreparationIdentityType = PreparationIdentityType.RESEARCH_ID) : AutoCloseable {
+        identityType: PreparationIdentityType = PreparationIdentityType.RESEARCH_ID,
+        private val withHeartRate: Boolean = false) : AutoCloseable {
         val directory = temporary.newFolder()
         var failCommit = false
         var failObservation = false
@@ -2987,6 +3373,7 @@ class RealCollectionControllerTest {
         }, {})
         val clock = TestClock(epoch)
         val port = RecordingPort()
+        val heartRate = RecordingHeartRatePort(directory, store, clock)
         private val scheduled = mutableListOf<Pair<Long, () -> Unit>>()
         val errors = mutableListOf<Exception>()
         val observations = mutableListOf<HealthRecordObservation>()
@@ -3011,6 +3398,7 @@ class RealCollectionControllerTest {
                 referenceDraftCommit, {}),
             preserveUnassignedExisting = preserveUnassignedExisting, syncClockBeforeStart = syncClock,
             requireBatteryBeforeStart = requireBattery,
+            heartRate = heartRate.takeIf { withHeartRate },
             saveClockEvidence = { evidence, sessionId ->
                 if (failClockEvidence) throw IOException("校时证据保存失败")
                 clockEvidence += evidence to sessionId
@@ -3102,12 +3490,37 @@ class RealCollectionControllerTest {
             assertEquals("errors=$errors", CollectionPage.REFERENCE, owner.state.page)
         }
 
-        fun startSelected() { owner.selectActivity(SessionActivity.WALKING); owner.start() }
+        fun startSelected(activity: SessionActivity = SessionActivity.WALKING) {
+            owner.selectActivity(activity); owner.start()
+        }
 
-        fun beginUnconfirmedZeroTimeStart(keepOld: Boolean = false, empty: Boolean = false): HealthMessage.ListItem {
+        fun enableReadyHeartRate() {
+            owner.setHeartRateEnabled(true)
+            heartRate.ready()
+            owner.onHeartRateChanged()
+            assertTrue("H10 readiness should permit start; errors=$errors", owner.state.canStart)
+        }
+
+        fun beginHeartRateCollecting(activity: SessionActivity = SessionActivity.WALKING) {
+            connectReady()
+            enableReadyHeartRate()
+            startSelected(activity)
+            observe(idle())
+            if (deferCaptureWaits) {
+                runDelay(FreeLivingCaptureCoordinator.START_SETTLE_DELAY_MS)
+                runDelay(FreeLivingCaptureCoordinator.START_FIRST_POLL_DELAY_MS)
+            }
+            observe(collecting(), listOf(initialRecord))
+            assertEquals("errors=$errors", CollectionPage.COLLECTING, owner.state.page)
+            assertEquals(store.readPending()!!.sessionId, heartRate.activeSessionId)
+        }
+
+        fun beginUnconfirmedZeroTimeStart(keepOld: Boolean = false, empty: Boolean = false,
+            enableHeartRate: Boolean = false): HealthMessage.ListItem {
             val old = finalRecord.copy(unixMs = 0)
             owner.initialize(); owner.onConnected(port.generation); observe(stopped(), listOf(old))
             finishDownload(); observe(stopped(), listOf(old))
+            if (enableHeartRate) enableReadyHeartRate()
             startSelected(); observe(stopped(), listOf(old)); timeReply()
             observe(stopped(), listOf(old))
             if (deferCaptureWaits) { runDelay(500); runDelay(1_000) }
@@ -3165,6 +3578,64 @@ class RealCollectionControllerTest {
     }
 
     private data class Read(val sessionId: Int, val offset: Long, val length: Int)
+
+    /** A controllable H10 transport with the production CSV and journal owner underneath. */
+    private class RecordingHeartRatePort(directory: File, private val store: FreeLivingSessionStore,
+        private val clock: TestClock) : SessionHeartRatePort {
+        private val recorder = SessionHeartRateRecorder(directory, store, clock, {})
+        override var state = PolarUiState()
+        val prepared = mutableListOf<String>()
+        val restored = mutableListOf<String>()
+        val finished = mutableListOf<String>()
+        val discarded = mutableListOf<String>()
+        var resetCount = 0
+        var prepareAccepted = true
+        var prepareError: Exception? = null
+        var finishError: Exception? = null
+        val activeSessionId get() = recorder.activeSessionId
+
+        fun ready() {
+            state = PolarUiState(devices = listOf(PolarUiDevice("H10-TEST", "Polar H10 fixture", -45)),
+                selectedDeviceId = "H10-TEST", connected = true, hrReady = true)
+        }
+
+        fun sample(hr: Int = 72) {
+            recorder.write(HeartRateSample(hr, hr, 0, true, true, true, listOf(833), listOf(853)), ++clock.now)
+            recorder.checkpoint()
+            state = state.copy(lastHeartRate = hr)
+        }
+
+        override fun resetSelection() { resetCount++; state = PolarUiState() }
+        override fun search() { state = state.copy(scanning = true) }
+        override fun connect(deviceId: String) {
+            state = state.copy(selectedDeviceId = deviceId, connecting = true, scanning = false)
+        }
+        override fun prepare(session: FreeLivingSession): Boolean {
+            check(store.read(session.sessionId)?.heartRate == session.heartRate)
+            prepared += session.sessionId
+            recorder.open(session, recovering = false)
+            state = state.copy(recording = true)
+            prepareError?.let { throw it }
+            return prepareAccepted
+        }
+        override fun restore(session: FreeLivingSession) {
+            restored += session.sessionId
+            recorder.open(session, recovering = true)
+            state = state.copy(selectedDeviceId = session.heartRate!!.deviceId, recording = true)
+        }
+        override fun finish(session: FreeLivingSession) {
+            finished += session.sessionId
+            finishError?.let { throw it }
+            recorder.finish(session)
+            state = state.copy(recording = recorder.activeSessionId != null)
+        }
+        override fun discard(session: FreeLivingSession) {
+            discarded += session.sessionId
+            recorder.discard(session)
+            state = state.copy(recording = recorder.activeSessionId != null)
+        }
+        override fun close() { recorder.close(); state = state.copy(recording = false) }
+    }
 
     private class RecordingUploads : RealUploadPort {
         val requests = mutableListOf<Pair<String, Boolean>>()

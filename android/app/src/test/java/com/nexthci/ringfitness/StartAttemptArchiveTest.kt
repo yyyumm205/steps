@@ -158,6 +158,7 @@ class StartAttemptArchiveTest {
                 it.remove("completion_policy"); it.remove("discarded"); it.remove("start_abort")
                 it.remove("reference_revisions"); it.remove("start_command_dispatch")
                 it.remove("stop_observed_at_ms"); it.remove("stop_origin"); it.remove("stop_command_dispatch")
+                it.remove("heart_rate")
                 it.get("start_baseline").takeUnless { value -> value.isJsonNull }?.asJsonObject?.let { baseline ->
                     baseline.remove("charging_recovery_evidence"); baseline.remove("unknown_time_start_evidence")
                 }
@@ -169,7 +170,7 @@ class StartAttemptArchiveTest {
         f.journal.writeText(envelope.toString())
         assertEquals(f.pending, f.open().readPending())
         f.archive()
-        assertEquals(13, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
+        assertEquals(14, JsonParser.parseString(f.journal.readText()).asJsonObject.get("journal_version").asInt)
         val expected = manifest.deepCopy().apply {
             addProperty("stop_origin", StopOrigin.LEGACY_UNSPECIFIED.wireValue)
         }

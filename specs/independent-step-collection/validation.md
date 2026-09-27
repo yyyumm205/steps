@@ -1183,3 +1183,30 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 0.8.18将下载页和前台通知统一为“正在从戒指保存到手机”，进度明确标为蓝牙传输，完成后再按用户选择上传。Android JVM测试677项全部通过；研究端pytest 550项全部通过。API31模拟器完整instrumentation发现102项，其中83项通过，19项依据明确的真实硬件、RecoveryQA或Release前置条件跳过，0项失败；29张流程截图未发现控件重叠，崩溃缓冲为空，未发现FATAL或ANR。初轮3项Bridge测试沿用单次停止快照，未满足现行“两次一致停止快照”契约；对齐测试夹具后定向3项及完整102项均通过，生产停止保护保持不变。模拟器证据保存在`.local/validation/2026-09-24-0.8.18-release/emulator/`。
 
 正式包为`android/dist/0.8.18/RingFitness-Steps-0.8.18.apk`，大小13,439,818字节，SHA-256为`a60a28a836573172aa9751668a2ea551aa3fec61df214c139719864b21f231a3`。包名`com.nexthci.ringfitness.steps`、versionCode 60、versionName 0.8.18，v3签名有效，证书与华为当前正式安装一致；Release清单不包含演示入口。华为原位升级及升级后222步记录保留需在系统安装确认完成后追加。
+
+## E46：多运动与可选 Polar H10（2026-09-27）
+
+本轮0.9.0（versionCode 61）扩展至九类运动，所有运动均可选 Polar H10，且每段默认关闭。走路、跑步沿用计步器参考；其余七类以 `none/not_applicable` 保存参考适用性，步数与记录时间为空。心率沿用原版实时 HR/RR 与手机接收时间，和戒指数据绑定同一 session。完整行为与数据契约见[多运动与可选心率带](multisport-heart-rate.md)。
+
+| 验证项 | 结果 | 证据与边界 |
+| --- | --- | --- |
+| Android JVM | 42个测试套件共724项通过，失败0、错误0、跳过0 | `jvm-final.txt`记录构建成功；计数依据`android/app/build/test-results/testDebugUnitTest/TEST-*.xml`逐套件汇总。覆盖运动与参考适用性、心率生命周期、恢复、冻结和历史兼容 |
+| Python研究端 | pytest 728项通过，失败0、跳过0 | `pytest-final.txt`记录`728 passed in 58.61s`；覆盖v8校验、HR/RR导出与质量证据、旧包兼容、重复导入及冲突隔离 |
+| 模拟器完整回归 | 发现108项，其中89项执行通过、19项按前置条件跳过、0项失败 | `instrumentation-complete.txt`最终为`OK (108 tests)`；逐条统计`INSTRUMENTATION_STATUS_CODE: 0`为89条、`-4`为19条。跳过项包括真实设备检查6项、独立Recovery QA／恢复开关9项、Release专用3项及全目录截图开关1项 |
+| 多运动与心率页面 | 新增`MultisportFlowInstrumentedTest`6项全部执行通过；既有`CollectionFlowInstrumentedTest`48项通过、1项全目录导出跳过 | 覆盖九种运动选择、七类无读数收尾与保存失败提示、走跑空值及有效0步、H10关闭／未就绪／就绪、断连后原位恢复与结束按钮可用，以及羽毛球暂存、页面重建、放弃隔离和下一段默认关闭心率 |
+| Android打包到Python导入 | 九种运动×H10开／关共18个包全部首次导入成功，重复导入均为`already_imported`；研究索引18行，失败0 | 18个独立session和18个不同戒指原始文件SHA-256；14段参考不适用、4段有效参考，H10开启／关闭各9段，合成HR共18个样本。输入ZIP字节保持，网络操作0次；以`android-contract-verified`及对应通过报告为准 |
+| Polar SDK运行时 | API31模拟器加载真实Polar SDK，客户端构造、选择重置及幂等关闭1项通过，失败0、跳过0 | `polar-sdk-runtime.txt`记录`OK (1 test)`。检查在主线程执行，范围为SDK依赖加载与客户端生命周期；扫描与硬件连接另行验证 |
+| 大字体页面 | 显式开启流程验证后，6项多运动页面测试全部通过，失败0、跳过0；5张大字体截图已逐张检查，长内容可滚动，检查后恢复默认字体 | `instrumentation-large-font.txt`和`screens-large/`。此为独立补充运行，沿用相同6项用例，不计为新增测试；默认字体截图保存在`screens-default/` |
+| 构建与签名 | Debug、AndroidTest、Release、`lintVitalRelease`及JVM任务构建成功；截图辅助修正后AndroidTest再次构建成功；Release v3签名校验通过 | `build-final.txt`、`build-runtime-test.txt`及`release-signature.txt` |
+| Release原位升级 | API31模拟器升级前快照及升级后校验各1项通过，安装成功；`filesDir`中全部文件的相对路径和SHA-256保持一致，Release不可调试，Demo Activity与两项旧服务均未注册 | `release-upgrade-before.txt`、`release-install.txt`和`release-upgrade-after.txt`。仅验证本次模拟器安装与文件保留，真实手机升级仍按设备组合核对 |
+| 手动演示与运行日志 | 测试用户`demo090`完成两条羽毛球路径：模拟H10采集后暂存再继续，下一段H10默认关闭后直接保存；终态为“2 条记录 · 已全部上传”，下一段显示“启用 Polar H10”，重开返回九运动首页。运行后日志无`FATAL EXCEPTION`或目标应用ANR，崩溃缓冲区为空 | `live-demo/demo-saved-records.xml`、`live-demo/08-saved-records.png`和`live-demo/demo-resumed-check.xml`记录终态；`logcat-after-ui.txt`及0字节的`crash-after-ui.txt`保留运行检查。设备、心率和上传均为本地模拟，云端真实上传另验 |
+
+本节本地证据根目录为`.local/qa/multisport-h10-20260927/`。跨端最终报告为`cross-platform-validation/run-20260927T124458.143157Z/report.json`，其中`passed=true`、`synthetic_fixtures_only=true`、`input_zip_bytes_preserved=true`。跨端包使用测试用户名`contractqa`，由JVM夹具经正式打包代码生成；为了核对正式格式，包内文件元数据使用`simulated=false`，数据来源仍是合成测试。目录内`TEST-FIXTURES-ONLY.txt`明确其用途；全部产物留在隔离目录，不上传研究云盘。
+
+页面测试仅在模拟器和显式`verifyCollectionFlow=true`下运行，演示数据写入cache内的独立目录，并核对正式用户资料文件在测试前后的哈希保持一致。默认字体与大字体截图分别保存在`screens-default/`和`screens-large/`，各包含`nine_activities_home.png`、`h10_ready.png`、`badminton_finish.png`、`h10_disconnected_capture.png`和`ring_deferred.png`。大字体检查保留全部入口与内容，超出屏幕的部分通过滚动访问。
+
+此前失败及纠正过程一并保留：首轮跨端目录混入两轮导出的36个包，且旧夹具缺少有效的`device_record_evidence`，首次报告未通过；补齐设备证据，并在独立`android-contract-verified`目录导出18个不同原始文件后，完整导入与幂等核对通过。初轮页面测试出现旧App APK与新测试APK不匹配，非计步保存失败仍显示旧“步数未保存”文案；重新构建并匹配安装后恢复正确提示。随后两项测试因截图辅助函数的文件名校验失败，修正辅助函数、重建测试APK后，完整108项回归达到上述89通过／19跳过／0失败。初轮`instrumentation.txt`、中间`instrumentation-final.txt`和首轮跨端报告均保留，最终结论以完整重跑及verified报告为准。首次大字体运行遗漏显式开关，`instrumentation-large-font-missing-opt-in.txt`虽输出`OK (6 tests)`，实际为0通过、6跳过；补齐开关后在`instrumentation-large-font.txt`取得6项执行通过的有效证据。
+
+正式交付包为`android/dist/0.9.0/RingFitness-Steps-0.9.0.apk`，大小13,517,642字节，SHA-256为`577a6c8be322a6916eee6d0233ddb38d7bf9d77825403ad616ef8d3443c16f2a`。完成Release校验后，为保留用户的模拟演示入口，将Debug APK复制并签名为本地`emulator-demo-only.apk`，原位装回API31模拟器。该文件仅用于演示；正式dist APK与生产签名文件保持不变，交付仍使用上述正式包。
+
+本轮软件实现、自动回归、跨端契约及API31模拟器交付检查已完成。真实H10佩戴采集、戒指与H10双设备并行、断连返回、锁屏后台及长时运行尚未取得本轮实物证据。既有E41／E45的华为戒指长时结果保留原版本与范围；H10的持续采集、手机接收缺口和设备间时间对应须另行实测。胸带离线回补和逐心搏精密同步继续属于后续范围。

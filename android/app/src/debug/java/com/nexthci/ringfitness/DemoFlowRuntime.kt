@@ -54,6 +54,9 @@ object DemoFlowRuntime {
             override fun register(participantId: String, placement: RingPlacement) { executor.execute { controller.register(participantId, placement) } }
             override fun start() { executor.execute { controller.start() } }
             override fun selectActivity(activity: SessionActivity) { executor.execute { controller.selectActivity(activity) } }
+            override fun setHeartRateEnabled(enabled: Boolean) { executor.execute { controller.setHeartRateEnabled(enabled) } }
+            override fun scanHeartRate() { executor.execute { controller.scanHeartRate() } }
+            override fun connectHeartRate(deviceId: String) { executor.execute { controller.connectHeartRate(deviceId) } }
             override fun stop() { executor.execute { controller.stop() } }
             override fun chooseFinish(uploadNow: Boolean) { executor.execute { controller.chooseFinish(uploadNow) } }
             override fun finalizeSession(uploadNow: Boolean, stepsText: String, status: String, reason: String) {

@@ -152,6 +152,14 @@ abstract class StepCollectionActivity : Activity() {
         }
         // State updates unrelated to the form must not steal focus or replace a user's input.
         if (old == state) return
+        // Heart-rate notifications arrive independently of the ring. Keep the page, scroll
+        // position and form views stable while refreshing the small heart-rate surface.
+        if (old != null && old.session?.sessionId == state.session?.sessionId &&
+            old.copy(heartRateEnabled = state.heartRateEnabled, heartRateState = state.heartRateState,
+                canStart = state.canStart, session = old.session?.copy(heartRate = state.session?.heartRate)) == state) {
+            updateHeartRateViews(state, old)
+            return
+        }
         // Transport retries update the existing recovery view in place. Rebuilding the whole
         // Activity every time a GATT attempt begins/ends caused the reconnect action to flicker.
         if (old != null && disconnectedCapture(old) && disconnectedCapture(state) &&
@@ -423,19 +431,34 @@ abstract class StepCollectionActivity : Activity() {
                     background = ui.linkBackground()
                 }
             }
-        } else if (state.canStart) {
+        } else if (state.connected && !state.busy && !state.checkingDevice && !state.preservingExisting) {
             val startCard = ui.card(body, ui.statusSurface)
             ui.text(startCard, "本次活动", 14f, muted = true)
             ui.gap(startCard, 10)
-            val choices = LinearLayout(this)
-            startCard.addView(choices, LinearLayout.LayoutParams(-1, -2))
-            listOf(SessionActivity.WALKING, SessionActivity.RUNNING).forEachIndexed { index, activity ->
-                ui.button(choices, activity.label, primary = state.selectedActivity == activity,
-                    tag = "activity_${activity.wireValue}") { flow.selectActivity(activity) }.layoutParams =
-                    LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = ui.dp(12) }
+            SessionActivity.selectable.chunked(3).forEachIndexed { rowIndex, activities ->
+                val choices = LinearLayout(this)
+                startCard.addView(choices, LinearLayout.LayoutParams(-1, -2).apply {
+                    if (rowIndex > 0) topMargin = ui.dp(8)
+                })
+                activities.forEachIndexed { index, activity ->
+                    ui.button(choices, activity.label, primary = state.selectedActivity == activity,
+                        tag = "activity_${activity.wireValue}") { flow.selectActivity(activity) }.apply {
+                        isSelected = state.selectedActivity == activity
+                        setSingleLine(false)
+                        setPadding(ui.dp(8), ui.dp(12), ui.dp(8), ui.dp(12))
+                        layoutParams = LinearLayout.LayoutParams(0, -2, 1f).apply {
+                            if (index > 0) marginStart = ui.dp(8)
+                        }
+                    }
+                }
             }
             ui.gap(startCard, 18)
-            ui.text(startCard, "佩戴好设备，站定后将计步器清零。", 15f, muted = true)
+            ui.text(startCard, when {
+                state.selectedActivity == null -> "选择本次活动，佩戴好设备后开始。"
+                state.selectedActivity.requiresReferenceSteps -> "佩戴好设备，站定后将计步器清零。"
+                else -> "佩戴好设备，准备完成后开始。"
+            }, 15f, muted = true).tag = "home_preparation_hint"
+            heartRateControls(body, state)
         }
 
         val localRecords = state.records.filter { it.localComplete || it.ringDeferred }
@@ -449,10 +472,80 @@ abstract class StepCollectionActivity : Activity() {
                 redraw()
             }
         }
-        if (!pendingTask && state.canStart && state.selectedActivity != null && !state.busy) {
-            action(footer, "开始采集") { flow.start() }
-        } else if (!pendingTask && state.canStart && state.selectedActivity == null) {
-            ui.text(footer, "选择走路或跑步后开始。", 14f, muted = true)
+        if (!pendingTask && state.selectedActivity != null && !state.busy && state.connected) {
+            action(footer, "开始采集", enabled = canStartWithHeartRate(state)) { flow.start() }
+            ui.text(footer, "", 14f, muted = true).tag = "heart_rate_start_hint"
+        } else if (!pendingTask && state.connected && state.selectedActivity == null) {
+            ui.text(footer, "选择本次活动后开始。", 14f, muted = true)
+        }
+        updateHeartRateViews(state)
+    }
+
+    private fun heartRateControls(body: LinearLayout, state: CollectionFlowState) {
+        val card = ui.card(body).apply { tag = "heart_rate_controls" }
+        ui.text(card, "心率带（可选）", 16f, bold = true)
+        ui.button(card, "", tag = "heart_rate_toggle") {
+            current?.let { flow.setHeartRateEnabled(!it.heartRateEnabled) }
+        }
+        val details = ui.column(card).apply { tag = "heart_rate_details" }
+        ui.gap(details, 12)
+        ui.text(details, heartRateStatusLabel(state.heartRateEnabled, state.heartRateState), 14f,
+            muted = true).tag = "heart_rate_status"
+        ui.text(details, "采集时请将手机保持在心率带附近。", 14f, muted = true)
+        ui.button(details, "搜索 Polar H10", tag = "heart_rate_scan") { flow.scanHeartRate() }
+        ui.column(details).tag = "heart_rate_devices"
+    }
+
+    private fun canStartWithHeartRate(state: CollectionFlowState): Boolean = state.canStart &&
+        (!state.heartRateEnabled || state.heartRateState.ready)
+
+    private fun heartRateCaptureActive(state: CollectionFlowState): Boolean =
+        state.session?.let { it.phase == FreeLivingSessionPhase.COLLECTING &&
+            it.heartRate != null && it.heartRate.endedAtMs == null } == true
+
+    private fun updateHeartRateViews(state: CollectionFlowState, previous: CollectionFlowState? = null) {
+        val polar = state.heartRateState
+        val editable = state.session?.isPending != true && !state.busy && state.connected
+        window.decorView.findViewWithTag<TextView>("home_device_status")?.text = connectionLabel(state)
+        window.decorView.findViewWithTag<Button>("heart_rate_toggle")?.apply {
+            text = if (state.heartRateEnabled) "关闭心率带" else "启用 Polar H10"
+            isEnabled = editable
+        }
+        window.decorView.findViewWithTag<View>("heart_rate_details")?.visibility =
+            if (state.heartRateEnabled) View.VISIBLE else View.GONE
+        window.decorView.findViewWithTag<TextView>("heart_rate_status")?.text =
+            heartRateStatusLabel(state.heartRateEnabled, polar, heartRateCaptureActive(state))
+        window.decorView.findViewWithTag<TextView>("heart_rate_capture_hint")?.visibility =
+            if (heartRateCaptureActive(state) && (!polar.ready || !polar.recording)) View.VISIBLE else View.GONE
+        window.decorView.findViewWithTag<Button>("heart_rate_scan")?.apply {
+            text = if (polar.scanning) "正在搜索…" else "搜索 Polar H10"
+            isEnabled = editable && !polar.scanning && !polar.connecting
+        }
+        val devices = window.decorView.findViewWithTag<LinearLayout>("heart_rate_devices")
+        if (devices != null) {
+            if (previous == null || previous.heartRateState.devices != polar.devices) {
+                devices.removeAllViews()
+                polar.devices.forEach { device ->
+                    ui.button(devices, "", tag = "heart_rate_device_${device.deviceId}") {
+                        flow.connectHeartRate(device.deviceId)
+                    }.setSingleLine(false)
+                }
+            }
+            polar.devices.forEach { device ->
+                devices.findViewWithTag<Button>("heart_rate_device_${device.deviceId}")?.apply {
+                    val selected = polar.selectedDeviceId == device.deviceId
+                    text = "${device.name} · ${device.deviceId}" + if (selected && polar.ready) " · 已连接" else ""
+                    isEnabled = editable && !polar.connecting && !(selected && polar.ready)
+                }
+            }
+        }
+        window.decorView.findViewWithTag<TextView>("heart_rate_start_hint")?.apply {
+            text = "心率带就绪后即可开始。"
+            visibility = if (state.heartRateEnabled && !polar.ready) View.VISIBLE else View.GONE
+        }
+        if (usesHomeSurface(state) && !showingRecords && state.session?.isPending != true) {
+            window.decorView.findViewWithTag<Button>("flow_primary")?.isEnabled =
+                canStartWithHeartRate(state) && !state.busy
         }
     }
 
@@ -471,7 +564,7 @@ abstract class StepCollectionActivity : Activity() {
                 record.activity.label,
             ).joinToString(" · "), 14f, muted = true).tag = "record_time_${record.sessionId}"
             ui.gap(card, 8)
-            ui.text(card, record.steps?.let { "$it 步" } ?: "未提供读数", 22f, bold = true).tag =
+            ui.text(card, record.referenceLabel, 22f, bold = true).tag =
                 "record_steps_${record.sessionId}"
             ui.gap(card, 8)
             ui.text(card, recordStatus(record, state), 14f, muted = true).tag = "record_status_${record.sessionId}"
@@ -479,7 +572,7 @@ abstract class StepCollectionActivity : Activity() {
                 ui.gap(card, 8)
                 ui.text(card, "读数已注明异常", 14f, muted = true)
             }
-            if (record.referenceEditable) {
+            if (record.activity.requiresReferenceSteps && record.referenceEditable) {
                 ui.button(card, "修改步数", tag = "edit_reference_${record.sessionId}") {
                     showReferenceCorrection(record)
                 }
@@ -539,9 +632,12 @@ abstract class StepCollectionActivity : Activity() {
     private data class HomeTask(val title: String, val status: String, val action: String, val hint: String? = null)
 
     private fun homeTask(state: CollectionFlowState): HomeTask = when {
-        state.session?.isRingDeferred == true -> HomeTask("本段步数已保存", "已暂存到戒指", "下载并上传",
+        state.session?.isRingDeferred == true -> HomeTask(if (state.session.activity.requiresReferenceSteps)
+            "本段步数已保存" else "本段信息已保存", "已暂存到戒指", "下载并上传",
             "下载到手机后，即可开始下一段。")
         state.canRecordReferenceLocally -> if (state.session?.completionPolicy == null)
+            HomeTask("采集已结束", "待保存本段", "继续收尾")
+        else if (state.session?.activity?.requiresReferenceSteps == false)
             HomeTask("采集已结束", "待保存本段", "继续收尾")
         else HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
         disconnectedCapture(state) -> HomeTask("本次采集", "连接已中断", "重新连接",
@@ -553,10 +649,11 @@ abstract class StepCollectionActivity : Activity() {
             if (state.preservingExisting || state.taskPage == CollectionPage.DOWNLOADING)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
             else HomeTask("数据待保存", "戒指已停止", "继续保存", displayError(state.error))
-        state.preservingExisting -> HomeTask("正在准备戒指", "请稍候", "保存中…", "完成后即可选择走路或跑步。")
+        state.preservingExisting -> HomeTask("正在准备戒指", "请稍候", "保存中…", "完成后即可选择本次活动。")
         state.checkingDevice -> HomeTask("设备", "正在检查戒指", "检查中…")
         state.canStopUnconfirmedStart -> HomeTask("当前记录", "需要结束戒指记录", "结束并保存可用数据", "数据会保留在手机。")
-        state.canStart -> HomeTask("开始这一段", "可以开始", "开始采集", "佩戴好设备，站定后将计步器清零。")
+        state.canStart -> HomeTask("开始这一段", "可以开始", "开始采集", if (state.selectedActivity?.requiresReferenceSteps != false)
+            "佩戴好设备，站定后将计步器清零。" else "佩戴好设备，准备完成后开始。")
         state.session == null -> HomeTask("设备", "戒指暂未就绪", "重新检查", displayError(state.error))
         else -> when (state.taskPage) {
             CollectionPage.STARTING -> HomeTask("本次采集", "正在确认开始", "查看进度", "请站定等候。")
@@ -565,20 +662,25 @@ abstract class StepCollectionActivity : Activity() {
             else HomeTask("本次采集", "采集状态待确认", "重新检查")
             CollectionPage.STOPPING -> HomeTask("本次采集", "正在确认结束", "查看进度", "请站定等候。")
             CollectionPage.FINISH -> HomeTask("采集已结束", "待保存本段", "继续收尾")
-            CollectionPage.REFERENCE -> if (state.session?.stopConfirmedAtMs != null)
+            CollectionPage.REFERENCE -> if (state.session?.activity?.requiresReferenceSteps == false)
+                HomeTask("本次采集", if (state.session.stopConfirmedAtMs != null) "待保存本段" else "结束状态待确认", "继续收尾")
+            else if (state.session?.stopConfirmedAtMs != null)
                 HomeTask("待填写步数", "采集已结束", "填写步数", "填写计步器显示的本次总数。")
             else HomeTask("本次采集", "结束状态待确认", "先填写步数", "可以先填写计步器读数。")
-            CollectionPage.SAVING -> HomeTask("正在保存步数", "正在保存", "查看进度")
+            CollectionPage.SAVING -> HomeTask(if (state.session?.activity?.requiresReferenceSteps != false)
+                "正在保存步数" else "正在保存记录", "正在保存", "查看进度")
             CollectionPage.DOWNLOADING -> if (state.session.startAbort != null)
                 HomeTask("正在保留戒指数据", "戒指已停止", "查看进度")
-            else HomeTask("正在从戒指保存到手机", "步数已保存", "查看下载", downloadHint(state))
+            else HomeTask("正在从戒指保存到手机", if (state.session.activity.requiresReferenceSteps)
+                "步数已保存" else "采集已结束", "查看下载", downloadHint(state))
             CollectionPage.UPLOADING -> HomeTask("正在上传记录", "数据已保存在手机", "查看上传")
             CollectionPage.ERROR -> when {
                 state.session?.localData != null -> if (state.uploadAvailable)
                     HomeTask("待上传记录", "数据已保存在手机", "重试上传")
                 else HomeTask("本次记录", "数据已保存在手机", "查看记录")
                 state.session?.reference != null && state.session.stopConfirmedAtMs != null ->
-                    HomeTask("待下载数据", "步数已保存", "重试下载")
+                    HomeTask("待下载数据", if (state.session.activity.requiresReferenceSteps)
+                        "步数已保存" else "采集已结束", "重试下载")
                 else -> HomeTask("本次采集", "记录需要检查", "重新检查")
             }
             else -> HomeTask("本次采集", when {
@@ -693,14 +795,25 @@ abstract class StepCollectionActivity : Activity() {
         detail(card, "活动", session?.takeIf { it.isPending }?.activity?.label ?: "正在准备")
         ui.gap(card, 14)
         detail(card, "戒指", if (!state.connected) "连接已中断" else connectionLabel(state))
-        if (phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference != null) {
+        if (state.heartRateEnabled) {
+            ui.gap(card, 14)
+            ui.text(card, heartRateStatusLabel(true, state.heartRateState, heartRateCaptureActive(state)),
+                14f, muted = true).tag = "heart_rate_status"
+            ui.text(card, "心率恢复后继续本段，连接缺口随记录保存。", 14f, muted = true).apply {
+                tag = "heart_rate_capture_hint"
+                visibility = if (heartRateCaptureActive(state) &&
+                    (!state.heartRateState.ready || !state.heartRateState.recording)) View.VISIBLE else View.GONE
+            }
+        }
+        if (phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference != null && session.activity.requiresReferenceSteps) {
             ui.gap(card, 14)
             detail(card, "计步器读数", session.reference.steps?.let { "$it 步 · 已保存" } ?: "已保存")
         }
 
         when {
             phase == FreeLivingSessionPhase.COLLECTING && state.canStop && !state.busy -> {
-                ui.text(footer, "站定后结束，再查看计步器读数。", 14f, muted = true)
+                ui.text(footer, if (session?.activity?.requiresReferenceSteps != false)
+                    "站定后结束，再查看计步器读数。" else "活动结束后，保存本段记录。", 14f, muted = true)
                 action(footer, "结束采集") { flow.stop() }
             }
             state.canStopUnconfirmedStart && !state.busy ->
@@ -715,7 +828,8 @@ abstract class StepCollectionActivity : Activity() {
                 action(footer, "重新检查") { flow.retry() }
             phase == FreeLivingSessionPhase.START_REQUESTED && state.canEndStartAttempt && !state.busy ->
                 action(footer, "结束本次") { showEndStartAttempt() }
-            phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference == null ->
+            phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference == null &&
+                session?.activity?.requiresReferenceSteps != false ->
                 ui.button(footer, "记录计步器读数", tag = "preserve_reference") { flow.enterReference() }
             phase == FreeLivingSessionPhase.STOP_REQUESTED && session?.reference != null && state.canRetry && !state.busy ->
                 action(footer, "继续确认结束") { flow.retry() }
@@ -727,7 +841,8 @@ abstract class StepCollectionActivity : Activity() {
         val card = ui.card(body)
         card.addView(ui.progress(), LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)).apply { gravity = Gravity.CENTER })
         ui.gap(card, 18)
-        ui.text(card, "正在把本次读数保存在手机", 16f, bold = true).gravity = Gravity.CENTER
+        ui.text(card, if (state.session?.activity?.requiresReferenceSteps != false)
+            "正在把本次读数保存在手机" else "正在保存本段记录", 16f, bold = true).gravity = Gravity.CENTER
         state.session?.activity?.let { activity ->
             ui.gap(card, 18); detail(card, "活动", activity.label)
         }
@@ -735,7 +850,8 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun finishSession(body: LinearLayout, state: CollectionFlowState) {
         // Keep the complete form scrollable when the keyboard or larger system text reduces space.
-        title(body, "结束本段", "填写计步器显示的本次总数。")
+        val requiresSteps = state.session?.activity?.requiresReferenceSteps != false
+        title(body, "结束本段", if (requiresSteps) "填写计步器显示的本次总数。" else "选择本段数据的保存方式。")
         val summary = ui.card(body, ui.statusSurface)
         detail(summary, "活动", state.session?.activity?.label ?: "—")
         ui.gap(summary, 14)
@@ -756,20 +872,22 @@ abstract class StepCollectionActivity : Activity() {
             gravity = Gravity.CENTER
         }
 
-        val input = ui.card(body)
-        val savedReference = state.session?.reference
-        if (savedReference != null) {
-            ui.text(input, "计步器读数已保存", 14f, muted = true)
-            ui.gap(input, 10)
-            ui.text(input, savedReference.steps?.let { "$it 步" } ?: "无法提供读数", 24f, bold = true)
-            savedReference.reason?.let { reason ->
+        if (requiresSteps) {
+            val input = ui.card(body)
+            val savedReference = state.session?.reference
+            if (savedReference != null) {
+                ui.text(input, "计步器读数已保存", 14f, muted = true)
+                ui.gap(input, 10)
+                ui.text(input, savedReference.steps?.let { "$it 步" } ?: "无法提供读数", 24f, bold = true)
+                savedReference.reason?.let { reason ->
+                    ui.gap(input, 12)
+                    ui.text(input, reason, 14f, muted = true)
+                }
+            } else {
+                referenceInput(input)
                 ui.gap(input, 12)
-                ui.text(input, reason, 14f, muted = true)
+                ui.text(input, "无法提供本次步数时，可放弃本段。", 14f, muted = true).tag = "no_reference_hint"
             }
-        } else {
-            referenceInput(input)
-            ui.gap(input, 12)
-            ui.text(input, "无法提供本次步数时，可放弃本段。", 14f, muted = true).tag = "no_reference_hint"
         }
 
         val recovery = ui.button(body, "继续确认结束", primary = true, tag = "finish_stop_recovery") {
@@ -810,6 +928,11 @@ abstract class StepCollectionActivity : Activity() {
             hideKeyboard()
             if (current?.session?.completionPolicy != null) flow.retry()
             else flow.chooseFinish(uploadNow)
+            return
+        }
+        if (current?.session?.activity?.requiresReferenceSteps == false) {
+            hideKeyboard()
+            flow.finalizeSession(uploadNow, "", "not_applicable", "")
             return
         }
         if (stepsDraft.isBlank()) {
@@ -862,9 +985,9 @@ abstract class StepCollectionActivity : Activity() {
 
     private fun isPendingStopForm(state: CollectionFlowState): Boolean = state.session?.let { session ->
         session.phase == FreeLivingSessionPhase.STOP_REQUESTED && session.stopConfirmedAtMs == null &&
-            session.reference == null && state.page in setOf(
+            session.reference == null && (state.page in setOf(
                 CollectionPage.STOPPING, CollectionPage.RECOVERY, CollectionPage.ERROR,
-            )
+            ) || (!session.activity.requiresReferenceSteps && state.page == CollectionPage.REFERENCE))
     } == true
 
     private fun isConfirmedFinishForm(state: CollectionFlowState): Boolean = state.session?.let { session ->
@@ -886,6 +1009,8 @@ abstract class StepCollectionActivity : Activity() {
             else -> "正在结束采集"
         }
         window.decorView.findViewWithTag<TextView>("stop_confirmation_hint")?.text = when {
+            state.session?.activity?.requiresReferenceSteps == false ->
+                if (!state.connected) "请将戒指靠近手机，连接恢复后继续确认。" else "确认完成后即可选择保存方式。"
             state.connecting -> "可以先填写计步器读数，连接恢复后继续确认。"
             !state.connected -> "请将戒指靠近手机，已填写内容会保留。"
             state.canRetry && !state.busy -> "继续确认后即可选择保存方式。"
@@ -956,6 +1081,10 @@ abstract class StepCollectionActivity : Activity() {
     }
 
     private fun reference(body: LinearLayout, footer: LinearLayout, state: CollectionFlowState) {
+        if (state.session?.activity?.requiresReferenceSteps == false) {
+            finishSession(body, state)
+            return
+        }
         title(body, "记录计步器读数", "结束确认恢复后，App会继续保存本段。")
         val card = ui.card(body)
         val uncertain = state.session?.stopConfirmedAtMs == null
@@ -1078,7 +1207,7 @@ abstract class StepCollectionActivity : Activity() {
             if (abortedStopConfirmed) {
                 ui.gap(card, 18)
                 detail(card, "戒指", "已停止")
-            } else if (!unconfirmedStart) {
+            } else if (!unconfirmedStart && session.activity.requiresReferenceSteps) {
                 ui.gap(card, 18)
                 detail(card, "计步器读数", session.reference?.steps?.let { "$it 步" }
                     ?: if (session.reference != null) "已记录原因" else "待填写")
@@ -1086,7 +1215,8 @@ abstract class StepCollectionActivity : Activity() {
         }
         if (state.canRecordReferenceLocally) {
             ui.button(body, "继续收尾", tag = "preserve_reference") { flow.enterFinish() }
-        } else if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null) {
+        } else if (session?.phase == FreeLivingSessionPhase.STOP_REQUESTED && state.referenceStatus == null &&
+            session.activity.requiresReferenceSteps) {
             ui.button(body, "记录计步器读数", tag = "preserve_reference") { flow.enterReference() }
         }
         if (state.canEndStartAttempt && !state.canStopUnconfirmedStart) {
@@ -1138,6 +1268,7 @@ abstract class StepCollectionActivity : Activity() {
         state.preservingExisting -> "正在准备"
         state.checkingDevice -> "正在检查"
         state.session?.isPending == true -> "已连接"
+        state.heartRateEnabled && !state.heartRateState.ready -> "已连接"
         state.canStart -> "可以开始"
         else -> "需要检查"
     }
@@ -1201,7 +1332,9 @@ abstract class StepCollectionActivity : Activity() {
             raw.contains("连接") || raw.contains("超时") || raw.contains("靠近") -> "请将戒指靠近手机后重试。"
             raw.contains("上传") || raw.contains("网络") -> "数据已保存在手机，联网后可继续上传。"
             raw.contains("下载") || raw.contains("文件") -> "数据下载未完成，请重试。"
-            raw.contains("未保存") || raw.contains("保存失败") -> "步数未保存，请重试。"
+            raw.contains("未保存") || raw.contains("保存失败") ->
+                if (current?.session?.activity?.requiresReferenceSteps == false) "本段记录未保存，请重试。"
+                else "步数未保存，请重试。"
             raw.contains("身份") || raw.contains("用户") || raw.contains("佩戴") -> "请检查用户名与戒指设置。"
             raw.contains("联系研究者") -> "本次记录需要检查，请重试。"
             else -> "暂时无法完成，请重试。"
