@@ -1305,6 +1305,7 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 - 三项既有模拟器回归执行通过、0失败、0跳过，37.579秒：`sevenNonStepSportsOmitReadingsAndSubmitNotApplicableForEitherSaveChoice`、`aRealZeroRemainsValidAfterNativeInputSaveAndRecreation`、`historicalMissingAndUnreliableReferencesRenderAndRetryWithoutBeingRewritten`。
 - 模拟器同源演示入口实际完成羽毛球保存，在记录页核对三条卡片均只显示日期／活动和模拟上传状态；UI树无“无需步数／无需计步”，截图确认未残留空行，演示数据保留在隔离入口。
 - 正式0.9.3（64）签名包已生成，哈希及大小见[发布说明](../../docs/release-0.9.3.md)；原0.9.2产物保持。
-- 初始ADB仅有模拟器；稍后三星重新连接，但仍锁屏，尚未确认当前采集状态，因此本节记录时未覆盖安装。已集中提示用户解锁，待确认空闲后更新；未停止采集或清除手机数据。
+- 初次准备时三星锁屏，未覆盖安装。用户随后明确要求更新；08:30确认手机停在运动选择页、无在途采集后，已用`adb install -r`原位安装0.9.3（64）。系统确认版本及更新时间2026-09-28 08:30:09，首次安装时间保持2026-09-23 22:36:38。重开显示原用户名／右手食指／Ringo5422、“可以开始”和5条记录已全部上传。未卸载、清除数据或发送START/STOP。
+- 更新后准备打开记录页截图时USB设备离线，因此本轮未取得新版真机记录页截图及安装APK读回哈希；安装成功、版本和首页5条记录由断线前返回值确认，文案及布局效果由上述同源模拟器证据支持。
 
 证据目录为`.local/qa/record-copy-093-20260928/`，包括构建、签名、定向测试日志，模拟器记录页截图与UI树，以及手机更新前状态。此补丁仅调整记录展示，底层完整回归和真实硬件范围沿用E48。
