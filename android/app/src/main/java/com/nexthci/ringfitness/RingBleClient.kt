@@ -47,6 +47,8 @@ class RingBleClient(
     private val scanner get() = adapter?.bluetoothLeScanner
     private val discoveredDevices = linkedMapOf<String, BluetoothDevice>()
     private val discoveredRings = linkedMapOf<String, ScannedRing>()
+    private val observedScanAddresses = linkedSetOf<String>()
+    private var observedScanCallbacks = 0
     private var gatt: BluetoothGatt? = null
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var ready = false
@@ -74,10 +76,15 @@ class RingBleClient(
         if (!scanning) return@Runnable
         stopScan()
         val rings = currentRings()
+        Log.i(
+            TAG,
+            "BLE scan finished callbacks=$observedScanCallbacks " +
+                "devices=${observedScanAddresses.size} rings=${rings.size}",
+        )
         listener.onRingsFound(rings)
         listener.onBleState(
             if (rings.isEmpty()) {
-                "没有发现戒指，请确认戒指已唤醒且未连接其他设备"
+                "没有发现戒指，请确认戒指已取出充电盒且未连接其他手机或 App"
             } else {
                 "搜索完成，请选择要连接的戒指"
             },
@@ -97,8 +104,10 @@ class RingBleClient(
         override fun onScanFailed(errorCode: Int) {
             scanning = false
             mainHandler.removeCallbacks(scanTimeout)
-            listener.onBleError("BLE 搜索失败：$errorCode")
-            listener.onBleState("搜索失败，请点击按钮重试", false)
+            Log.w(TAG, "BLE scan failed code=$errorCode")
+            val message = RingDiscoveryGuidance.scanFailure(errorCode)
+            listener.onBleError(message)
+            listener.onBleState(message, false)
         }
     }
 
@@ -235,13 +244,26 @@ class RingBleClient(
         stopScan()
         discoveredDevices.clear()
         discoveredRings.clear()
+        observedScanAddresses.clear()
+        observedScanCallbacks = 0
         listener.onRingsFound(emptyList())
         listener.onBleState("正在搜索附近的 Ringo 戒指…", false)
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
+        val activeScanner = scanner
+        if (activeScanner == null) {
+            listener.onBleError("手机蓝牙扫描暂时不可用，请关闭并重新打开蓝牙后重试")
+            return
+        }
         scanning = true
-        scanner?.startScan(null, settings, scanCallback)
+        try {
+            activeScanner.startScan(null, settings, scanCallback)
+        } catch (_: Exception) {
+            scanning = false
+            listener.onBleError("手机蓝牙扫描暂时不可用，请关闭并重新打开蓝牙后重试")
+            return
+        }
         mainHandler.postDelayed(scanTimeout, SCAN_TIMEOUT_MS)
     }
 
@@ -363,6 +385,8 @@ class RingBleClient(
         enqueue(RingProtocol.buildHealthRead(sessionId, offset, maxLength))
 
     private fun addScanResult(result: ScanResult) {
+        observedScanCallbacks += 1
+        observedScanAddresses += result.device.address
         val advertisedServices = result.scanRecord?.serviceUuids.orEmpty()
         val name = result.scanRecord?.deviceName ?: result.device.name
         val isRingo = name?.contains("Ringo", ignoreCase = true) == true ||

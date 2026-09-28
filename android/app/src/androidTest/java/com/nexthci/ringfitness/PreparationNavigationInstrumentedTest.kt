@@ -40,6 +40,14 @@ class PreparationNavigationInstrumentedTest {
     private val ring = PreparedRing("AA:BB:CC:DD:EE:01", "Ringo navigation test")
 
     @Test
+    fun installedLegacyPackageIsVisibleWhenExplicitlyRequested() {
+        assumeTrue("Explicit legacy-package check is required",
+            InstrumentationRegistry.getArguments().getString("verifyLegacyPackage") == "true")
+        val environment = RingDiscoverySupport.inspect(context, knownRing = null)
+        assertTrue("The installed original RingFitness package must be visible", environment.legacyAppInstalled)
+    }
+
+    @Test
     fun firstUseHasOneUsernameFieldAndKeepsAllSixOriginalPlacementChoices() = withIsolatedFiles {
         launch().use { scenario ->
             awaitHeading(scenario, "开始使用")
@@ -136,6 +144,139 @@ class PreparationNavigationInstrumentedTest {
             }
         } finally {
             instrumentation.removeMonitor(monitor)
+        }
+    }
+
+    @Test
+    fun ringSearchExplainsLegacyConflictAndClearsRecoveryAfterDiscovery() = withIsolatedFiles {
+        grantBluetoothPermissions()
+        launch().use { scenario ->
+            awaitHeading(scenario, "开始使用")
+            scenario.onActivity { tagged<EditText>(it, "participant_input").setText("P001") }
+            choosePlacement(scenario, RingPlacement.RIGHT_INDEX)
+            click(scenario, "primary")
+            awaitHeading(scenario, "选择戒指")
+            scenario.onActivity { activity ->
+                StepPreparationActivity::class.java.getDeclaredMethod("stopScan")
+                    .apply { isAccessible = true }.invoke(activity)
+                updateViews(activity)
+            }
+
+            val access = FakeDiscoveryAccess(
+                RingDiscoveryEnvironment(legacyAppInstalled = true, connectedRingNames = emptyList()),
+            )
+            scenario.onActivity { activity -> setField(activity, "discoveryAccess", access) }
+            click(scenario, "primary")
+            deliverNoResult(scenario)
+            scenario.onActivity { activity ->
+                assertEquals(RingDiscoveryGuidance.notFound(true),
+                    tagged<TextView>(activity, "scan_status").text.toString())
+                assertEquals("重新搜索", tagged<Button>(activity, "primary").text.toString())
+                assertTrue(tagged<Button>(activity, "legacy_app_settings").let { it.isShown && it.isEnabled })
+            }
+            click(scenario, "legacy_app_settings")
+            assertEquals(1, access.settingsOpened)
+
+            access.environment = RingDiscoveryEnvironment(
+                legacyAppInstalled = true,
+                connectedRingNames = listOf("Ringo5422"),
+            )
+            click(scenario, "primary")
+            await(scenario, "persistent legacy connection") { activity ->
+                tagged<TextView>(activity, "scan_status").text.toString() ==
+                    RingDiscoveryGuidance.connectedElsewhere(access.environment)
+            }
+            scenario.onActivity { activity ->
+                assertEquals(RingDiscoveryGuidance.connectedElsewhere(access.environment),
+                    tagged<TextView>(activity, "scan_status").text.toString())
+                assertNull(scanner(activity))
+            }
+
+            access.environment = RingDiscoveryEnvironment(
+                legacyAppInstalled = false,
+                connectedRingNames = emptyList(),
+            )
+            click(scenario, "primary")
+            deliverScanResult(scenario, ScannedRing(ring.address, ring.name, -45))
+            scenario.onActivity { activity ->
+                assertFalse(tagged<Button>(activity, "legacy_app_settings").isShown)
+                assertNotNull(scannedRingButton(activity, ScannedRing(ring.address, ring.name, -45)))
+            }
+        }
+    }
+
+    @Test
+    fun ringSelectionRechecksAConnectionClaimedDuringTheScan() = withIsolatedFiles {
+        grantBluetoothPermissions()
+        launch().use { scenario ->
+            awaitHeading(scenario, "开始使用")
+            scenario.onActivity { tagged<EditText>(it, "participant_input").setText("P001") }
+            choosePlacement(scenario, RingPlacement.RIGHT_INDEX)
+            click(scenario, "primary")
+            awaitHeading(scenario, "选择戒指")
+            scenario.onActivity { activity ->
+                StepPreparationActivity::class.java.getDeclaredMethod("stopScan")
+                    .apply { isAccessible = true }.invoke(activity)
+                updateViews(activity)
+            }
+
+            val access = FakeDiscoveryAccess(
+                RingDiscoveryEnvironment(legacyAppInstalled = true, connectedRingNames = emptyList()),
+            )
+            scenario.onActivity { activity -> setField(activity, "discoveryAccess", access) }
+            click(scenario, "primary")
+            deliverScanResult(scenario, ScannedRing(ring.address, ring.name, -45))
+
+            access.environment = RingDiscoveryEnvironment(
+                legacyAppInstalled = true,
+                connectedRingNames = listOf(ring.name),
+            )
+            clickScannedRing(scenario, ring)
+            await(scenario, "selection conflict rechecked") { activity ->
+                tagged<TextView>(activity, "scan_status").text.toString() ==
+                    RingDiscoveryGuidance.connectedElsewhere(access.environment)
+            }
+            scenario.onActivity { activity ->
+                assertEquals("选择戒指", tagged<TextView>(activity, "heading").text.toString())
+                assertTrue(tagged<Button>(activity, "legacy_app_settings").isShown)
+                val snapshot = StepPreparationActivity::class.java.getDeclaredField("snapshot")
+                    .apply { isAccessible = true }.get(activity) as PreparationSnapshot
+                assertNull(snapshot.ring)
+            }
+        }
+    }
+
+    @Test
+    fun recentlyReleasedGattDoesNotBecomeAPermanentConflict() = withIsolatedFiles {
+        grantBluetoothPermissions()
+        launch().use { scenario ->
+            awaitHeading(scenario, "开始使用")
+            scenario.onActivity { tagged<EditText>(it, "participant_input").setText("P001") }
+            choosePlacement(scenario, RingPlacement.RIGHT_INDEX)
+            click(scenario, "primary")
+            awaitHeading(scenario, "选择戒指")
+            scenario.onActivity { activity ->
+                StepPreparationActivity::class.java.getDeclaredMethod("stopScan")
+                    .apply { isAccessible = true }.invoke(activity)
+                updateViews(activity)
+            }
+
+            val access = FakeDiscoveryAccess(
+                RingDiscoveryEnvironment(legacyAppInstalled = true, connectedRingNames = listOf(ring.name)),
+            )
+            scenario.onActivity { activity -> setField(activity, "discoveryAccess", access) }
+            click(scenario, "primary")
+            access.environment = RingDiscoveryEnvironment(
+                legacyAppInstalled = true,
+                connectedRingNames = emptyList(),
+            )
+
+            await(scenario, "released GATT starts the real scan") { activity -> scanner(activity) != null }
+            scenario.onActivity { activity ->
+                assertTrue(tagged<TextView>(activity, "scan_status").text.toString()
+                    .startsWith("正在搜索附近的"))
+                assertFalse(tagged<Button>(activity, "legacy_app_settings").isShown)
+            }
         }
     }
 
@@ -527,6 +668,30 @@ class PreparationNavigationInstrumentedTest {
         }
     }
 
+    private fun deliverNoResult(scenario: ActivityScenario<StepPreparationActivity>) {
+        await(scenario, "scanner ready") { scanner(it) != null }
+        scenario.onActivity { activity ->
+            val scanner = requireNotNull(scanner(activity))
+            scanner.stop()
+            val listener = RingBleClient::class.java.getDeclaredField("listener")
+                .apply { isAccessible = true }.get(scanner) as RingBleClient.Listener
+            listener.onRingsFound(emptyList())
+            listener.onBleState("没有发现戒指", false)
+        }
+        await(scenario, "empty search result") { activity ->
+            tagged<TextView>(activity, "scan_status").text.toString().startsWith("未找到戒指")
+        }
+    }
+
+    private fun scanner(activity: StepPreparationActivity): RingBleClient? =
+        StepPreparationActivity::class.java.getDeclaredField("scanner").apply { isAccessible = true }
+            .get(activity) as RingBleClient?
+
+    private fun setField(activity: StepPreparationActivity, field: String, value: Any?) {
+        StepPreparationActivity::class.java.getDeclaredField(field).apply { isAccessible = true }
+            .set(activity, value)
+    }
+
     private fun clickScannedRing(scenario: ActivityScenario<StepPreparationActivity>, prepared: PreparedRing) {
         scenario.onActivity { activity ->
             val button = requireNotNull(scannedRingButton(activity, ScannedRing(prepared.address, prepared.name, -45)))
@@ -664,6 +829,19 @@ class PreparationNavigationInstrumentedTest {
                 if (saved.exists()) check(saved.copyRecursively(root, true))
             }
             check(backup.deleteRecursively())
+        }
+    }
+
+    private class FakeDiscoveryAccess(
+        var environment: RingDiscoveryEnvironment,
+    ) : RingDiscoveryAccess {
+        var settingsOpened = 0
+
+        override fun inspect(context: android.content.Context, knownRing: PreparedRing?) = environment
+
+        override fun openLegacyAppSettings(context: android.content.Context): Boolean {
+            settingsOpened++
+            return true
         }
     }
 

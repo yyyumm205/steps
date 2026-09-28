@@ -377,6 +377,16 @@ abstract class StepCollectionActivity : Activity() {
                 minimumHeight = ui.dp(48); minHeight = ui.dp(48)
             }
         }
+        if (!state.isSimulation && !state.connected && !state.connecting && state.canRetry &&
+            RingDiscoverySupport.inspect(this, knownRing = null).legacyAppInstalled) {
+            ui.gap(device, 8)
+            ui.button(device, "前往系统设置停止旧版", tag = "home_legacy_app_settings") {
+                Toast.makeText(this, "请在系统页点“强行停止”，再返回步数采集。", Toast.LENGTH_LONG).show()
+                if (!RingDiscoverySupport.openLegacyAppSettings(this)) {
+                    Toast.makeText(this, "未找到旧版 RingFitness。", Toast.LENGTH_SHORT).show()
+                }
+            }.apply { background = ui.linkBackground() }
+        }
 
         val pendingTask = state.session?.isPending == true || state.preservingExisting ||
             (state.taskPage in setOf(CollectionPage.STARTING, CollectionPage.COLLECTING, CollectionPage.STOPPING,

@@ -15,6 +15,7 @@ class RealCollectionActivity : StepCollectionActivity() {
     private val pageLease = Any()
     private var permissionRequestInFlight = false
     private var ownerStarted = false
+    private var pageLeaseReleased = false
     private var permissionDialog: AlertDialog? = null
 
     override fun onResume() {
@@ -22,14 +23,19 @@ class RealCollectionActivity : StepCollectionActivity() {
         // Returning from system settings can grant access without a permission callback.
         // The first onResume must not duplicate the request made by provideFlow().
         if (!permissionRequestInFlight && BluetoothPermissionRecovery.missing(this).isEmpty() &&
-            (!ownerStarted || !RealCollectionBridge.isRunning())) startOwner()
+            (pageLeaseReleased || !ownerStarted || !RealCollectionBridge.isRunning())) startOwner()
     }
 
     override fun onStop() {
         permissionDialog?.dismiss()
         permissionDialog = null
         super.onStop()
-        if (isFinishing) RealCollectionBridge.releaseIfIdle(pageLease)
+        // Active capture and local finalization keep their owner. An idle home page releases
+        // GATT even when the participant presses Home, so another phone or app can use the ring.
+        if (!isChangingConfigurations) {
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            pageLeaseReleased = true
+        }
     }
 
     override fun provideFlow(): CollectionFlow {
@@ -86,6 +92,7 @@ class RealCollectionActivity : StepCollectionActivity() {
         if (ownerStarted && RealCollectionBridge.isRunning()) return
         runCatching { RealCollectionBridge.ensureStarted(this, pageLease) }.onSuccess {
             ownerStarted = true
+            pageLeaseReleased = false
         }.onFailure {
             ownerStarted = false
             RealCollectionBridge.fail("采集服务未能启动，请返回后重试")

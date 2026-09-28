@@ -58,9 +58,12 @@ class StepPreparationActivity : Activity() {
     private var pendingBluetoothAction: (() -> Unit)? = null
     private var deviceSettingsReturnPending = false
     private var scanner: RingBleClient? = null
+    private var discoveryAccess: RingDiscoveryAccess = RingDiscoverySupport
     private var scanning = false
     private var scanGeneration = 0L
     private var scanMessage: String? = null
+    private var legacyAppInstalled = false
+    private var showLegacyRecovery = false
     private var collectionLoaded = false
     private var collectionPending = false
     private var collectionOwnerBusy = false
@@ -84,6 +87,7 @@ class StepPreparationActivity : Activity() {
     private lateinit var placementPicker: Spinner
     private lateinit var devices: LinearLayout
     private lateinit var scanStatus: TextView
+    private lateinit var legacyAppSettings: Button
     private lateinit var results: LinearLayout
     private lateinit var settings: LinearLayout
     private lateinit var participantLabel: TextView
@@ -285,6 +289,10 @@ class StepPreparationActivity : Activity() {
         devices = section(body)
         val scanCard = ui.card(devices)
         scanStatus = label(scanCard, "", 16f).apply { tag = "scan_status" }
+        legacyAppSettings = link(scanCard, "前往系统设置停止旧版") { openLegacyAppSettings() }.apply {
+            tag = "legacy_app_settings"
+            visibility = View.GONE
+        }
         results = section(devices)
 
         settings = section(body)
@@ -461,6 +469,7 @@ class StepPreparationActivity : Activity() {
             Page.REGISTER -> saveRegistration()
             Page.DEVICES -> if (scanning) {
                 stopScan()
+                showLegacyRecovery = false
                 scanMessage = "搜索已停止"
                 updateViews()
             } else withBluetooth(::scan)
@@ -582,7 +591,8 @@ class StepPreparationActivity : Activity() {
             retiringSettings -> "正在关闭戒指连接"
             hasStorageProblem -> "已有采集记录会保留"
             page == Page.REGISTER -> "填写用户名和佩戴位置"
-            page == Page.DEVICES -> "点击正在使用的戒指"
+            page == Page.DEVICES && scanMessage == "选择正在使用的戒指" -> "点击正在使用的戒指"
+            page == Page.DEVICES -> "将戒指完全取出充电盒，放在手机旁"
             locked -> "当前记录完成后可修改设置"
             else -> "用户与戒指"
         }
@@ -598,8 +608,10 @@ class StepPreparationActivity : Activity() {
         }
         scanStatus.text = if (missingBluetooth) BluetoothPermissionRecovery.scanHint else scanMessage ?: when {
             !bluetoothEnabled() -> "打开手机蓝牙后即可搜索"
-            else -> "将戒指放在手机附近"
+            else -> "将戒指完全取出充电盒，放在手机旁"
         }
+        legacyAppSettings.visibility = if (page == Page.DEVICES && !missingBluetooth &&
+            !scanning && showLegacyRecovery && legacyAppInstalled) View.VISIBLE else View.GONE
         primary.text = when {
             pendingSettings -> "返回当前记录"
             hasStorageProblem && profileUnreadable -> "重新登记"
@@ -863,10 +875,39 @@ class StepPreparationActivity : Activity() {
     private fun scan() {
         if (!collectionLoaded || collectionPending) return
         stopScan()
-        scanMessage = "正在搜索附近的戒指…"
         results.removeAllViews()
         scanning = true
+        showLegacyRecovery = false
+        scanMessage = "正在核对戒指连接…"
         val generation = scanGeneration
+        inspectBeforeScan(generation, CONNECTION_RELEASE_RECHECKS)
+        updateViews()
+    }
+
+    private fun inspectBeforeScan(generation: Long, retriesRemaining: Int) {
+        if (!visible || generation != scanGeneration) return
+        val environment = discoveryAccess.inspect(this, snapshot?.ring)
+        legacyAppInstalled = environment.legacyAppInstalled
+        if (environment.connectedRingNames.isNotEmpty()) {
+            if (retriesRemaining > 0) {
+                scanMessage = "正在等待戒指连接释放…"
+                showLegacyRecovery = false
+                updateViews()
+                main.postDelayed({ inspectBeforeScan(generation, retriesRemaining - 1) },
+                    CONNECTION_RELEASE_RECHECK_MS)
+                return
+            }
+            scanning = false
+            showPersistentConnection(environment)
+            updateViews()
+            return
+        }
+        beginRingScan(generation)
+    }
+
+    private fun beginRingScan(generation: Long) {
+        if (!visible || generation != scanGeneration) return
+        scanMessage = "正在搜索附近的戒指…"
         val client = RingBleClient(this, object : RingBleClient.Listener {
             private fun deliver(action: () -> Unit) {
                 main.post { if (visible && generation == scanGeneration) action() }
@@ -874,8 +915,21 @@ class StepPreparationActivity : Activity() {
 
             override fun onBleState(message: String, ready: Boolean) = deliver {
                 scanMessage = when {
-                    message.startsWith("搜索完成") -> "选择正在使用的戒指"
-                    message.startsWith("没有发现") -> "没有发现戒指，请靠近后重新搜索"
+                    message.startsWith("搜索完成") -> {
+                        showLegacyRecovery = false
+                        "选择正在使用的戒指"
+                    }
+                    message.startsWith("没有发现") -> {
+                        val environment = discoveryAccess.inspect(this@StepPreparationActivity, snapshot?.ring)
+                        legacyAppInstalled = environment.legacyAppInstalled
+                        if (environment.connectedRingNames.isNotEmpty()) {
+                            scanning = true
+                            inspectAfterEmptyScan(generation, CONNECTION_RELEASE_RECHECKS)
+                            return@deliver
+                        }
+                        showLegacyRecovery = legacyAppInstalled
+                        RingDiscoveryGuidance.notFound(legacyAppInstalled)
+                    }
                     else -> message
                 }
                 if (message.startsWith("搜索完成") || message.startsWith("没有发现")) scanning = false
@@ -884,7 +938,8 @@ class StepPreparationActivity : Activity() {
 
             override fun onBleError(message: String) = deliver {
                 scanning = false
-                scanMessage = "搜索失败，请检查蓝牙后重试"
+                showLegacyRecovery = false
+                scanMessage = message
                 updateViews()
             }
 
@@ -892,13 +947,14 @@ class StepPreparationActivity : Activity() {
 
             override fun onRingsFound(rings: List<ScannedRing>) = deliver {
                 results.removeAllViews()
+                if (rings.isNotEmpty()) showLegacyRecovery = false
                 rings.forEach { ring ->
                     button(results, "${ring.name} · ${ring.address.takeLast(5)}", false) {
                         if (!busy && !collectionPending && !collectionOwnerBusy && !RealCollectionBridge.isRunning()) {
                             stopScan()
-                            persist(afterSave = {
-                                openCollectionAndFinish()
-                            }) { withIdleCollectionOwner { store.selectRing(PreparedRing(ring.address, ring.name)) } }
+                            scanning = true
+                            val selectionGeneration = scanGeneration
+                            inspectBeforeSelection(ring, selectionGeneration, CONNECTION_RELEASE_RECHECKS)
                         } else if (collectionPending || collectionOwnerBusy || RealCollectionBridge.isRunning()) {
                             stopScan()
                             openCollectionAndFinish()
@@ -910,9 +966,70 @@ class StepPreparationActivity : Activity() {
         scanner = client
         runCatching { client.scanForRings() }.onFailure {
             stopScan()
-            scanMessage = "搜索失败，请检查蓝牙后重试"
+            scanMessage = "手机蓝牙扫描暂时不可用，请关闭并重新打开蓝牙后重试"
         }
         updateViews()
+    }
+
+    private fun inspectAfterEmptyScan(generation: Long, retriesRemaining: Int) {
+        if (!visible || generation != scanGeneration) return
+        val environment = discoveryAccess.inspect(this, snapshot?.ring)
+        legacyAppInstalled = environment.legacyAppInstalled
+        if (environment.connectedRingNames.isNotEmpty() && retriesRemaining > 0) {
+            scanMessage = "正在等待戒指连接释放…"
+            showLegacyRecovery = false
+            updateViews()
+            main.postDelayed({ inspectAfterEmptyScan(generation, retriesRemaining - 1) },
+                CONNECTION_RELEASE_RECHECK_MS)
+            return
+        }
+        scanning = false
+        if (environment.connectedRingNames.isNotEmpty()) showPersistentConnection(environment)
+        else {
+            showLegacyRecovery = legacyAppInstalled
+            scanMessage = RingDiscoveryGuidance.notFound(legacyAppInstalled)
+        }
+        updateViews()
+    }
+
+    private fun inspectBeforeSelection(ring: ScannedRing, generation: Long, retriesRemaining: Int) {
+        if (!visible || generation != scanGeneration) return
+        val environment = discoveryAccess.inspect(this, PreparedRing(ring.address, ring.name))
+        legacyAppInstalled = environment.legacyAppInstalled
+        if (environment.connectedRingNames.isNotEmpty()) {
+            if (retriesRemaining > 0) {
+                scanMessage = "正在等待戒指连接释放…"
+                showLegacyRecovery = false
+                updateViews()
+                main.postDelayed({ inspectBeforeSelection(ring, generation, retriesRemaining - 1) },
+                    CONNECTION_RELEASE_RECHECK_MS)
+                return
+            }
+            scanning = false
+            showPersistentConnection(environment)
+            updateViews()
+            return
+        }
+        scanning = false
+        persist(afterSave = { openCollectionAndFinish() }) {
+            withIdleCollectionOwner { store.selectRing(PreparedRing(ring.address, ring.name)) }
+        }
+    }
+
+    private fun showPersistentConnection(environment: RingDiscoveryEnvironment) {
+        scanMessage = RingDiscoveryGuidance.connectedElsewhere(environment)
+        showLegacyRecovery = environment.legacyAppInstalled
+    }
+
+    private fun openLegacyAppSettings() {
+        deviceSettingsReturnPending = page == Page.DEVICES
+        if (!discoveryAccess.openLegacyAppSettings(this)) {
+            deviceSettingsReturnPending = false
+            legacyAppInstalled = false
+            showLegacyRecovery = false
+            scanMessage = RingDiscoveryGuidance.notFound(legacyAppInstalled = false)
+            updateViews()
+        }
     }
 
     private fun stopScan() {
@@ -1030,6 +1147,8 @@ class StepPreparationActivity : Activity() {
         private const val STATE_PERMISSION_DENIED = "permission_denied"
         private const val STATE_RETURN_TO_SETTINGS = "return_to_settings"
         private const val STATE_DEVICE_SETTINGS_RETURN = "device_settings_return"
+        private const val CONNECTION_RELEASE_RECHECKS = 2
+        private const val CONNECTION_RELEASE_RECHECK_MS = 500L
         private const val REQUEST_BLUETOOTH = 10
         private const val REQUEST_NOTIFICATIONS = 11
         private const val ACCESS_PREFERENCES = "long_running_access"

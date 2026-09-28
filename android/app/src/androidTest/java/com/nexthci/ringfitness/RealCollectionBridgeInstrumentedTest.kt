@@ -324,6 +324,29 @@ class RealCollectionBridgeInstrumentedTest {
         }
     }
 
+    @Test fun samePageReturningBeforeQueuedIdleReleaseKeepsTheLiveOwner() = withIdleBridge {
+        OwnerFixture().use { f ->
+            f.owner.initialize()
+            f.runWorker()
+            assertTrue(f.owner.canReleaseIfIdle())
+
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            assertTrue("Home queues an idle release", f.hasWorkerTasks())
+            RealCollectionBridge.ensureStarted(f.context, pageLease)
+            val disconnects = f.port.disconnects
+            f.runWorker()
+
+            assertTrue("Immediate return renews the page lease", RealCollectionBridge.isRunning())
+            assertEquals(0, f.releases)
+            assertEquals(disconnects, f.port.disconnects)
+
+            RealCollectionBridge.releaseIfIdle(pageLease)
+            f.runWorker()
+            assertFalse(RealCollectionBridge.isRunning())
+            assertEquals(1, f.releases)
+        }
+    }
+
     @Test fun leavingDuringDownloadReleasesAfterLocalCommitWhileUploadRemainsInFlight() = withIdleBridge {
         OwnerFixture().use { f ->
             f.beginDownload()
