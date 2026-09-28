@@ -564,9 +564,10 @@ abstract class StepCollectionActivity : Activity() {
                 formatDateTime(record.displayStartedAtMs, record.timeZoneId) ?: "时间未知",
                 record.activity.label,
             ).joinToString(" · "), 14f, muted = true).tag = "record_time_${record.sessionId}"
-            ui.gap(card, 8)
-            ui.text(card, record.referenceLabel, 22f, bold = true).tag =
-                "record_steps_${record.sessionId}"
+            record.referenceLabel?.let { label ->
+                ui.gap(card, 8)
+                ui.text(card, label, 22f, bold = true).tag = "record_steps_${record.sessionId}"
+            }
             ui.gap(card, 8)
             ui.text(card, recordStatus(record, state), 14f, muted = true).tag = "record_status_${record.sessionId}"
             if (record.referenceStatus == "unreliable") {

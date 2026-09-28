@@ -73,8 +73,8 @@ data class FlowRecordSummary(
 internal val FlowRecordSummary.displayStartedAtMs: Long?
     get() = startedAtMs ?: phoneStartAtMs
 
-internal val FlowRecordSummary.referenceLabel: String
-    get() = if (!activity.requiresReferenceSteps) "无需计步" else steps?.let { "$it 步" } ?: "未提供读数"
+internal val FlowRecordSummary.referenceLabel: String?
+    get() = if (!activity.requiresReferenceSteps) null else steps?.let { "$it 步" } ?: "未提供读数"
 
 internal fun FreeLivingSession.phoneStartAnchorMs(): Long? =
     startConfirmedAtMs ?: startRequestedAtMs.takeIf { it > 0 }

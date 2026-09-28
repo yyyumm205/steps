@@ -1,5 +1,7 @@
 # RingFitness Android
 
+当前界面补丁为 **0.9.3（versionCode 64）**：记录列表省略非计步运动的“无需计步”及对应空白行，保留日期、运动名称和传输状态；走跑读数继续显示。底层行为及设备验证范围沿用下述0.9.2，补丁验证见[E49](../specs/independent-step-collection/validation.md#e49记录列表文案精简0932026-09-28)。
+
 当前工作版本：**步数采集 0.9.2（versionCode 63）**，应用 ID 为 `com.nexthci.ringfitness.steps`。在九种运动和可选 Polar H10 基础上，修复新增运动上传文件名、旧冻结包跨版本续传、暂存提示和冷重开后的放弃操作；沿用原版 Android 0.5.3 的 H10 实时 HR/RR 方案与现有戒指采集流程。数据及生命周期契约见 [多运动与心率](../specs/independent-step-collection/multisport-heart-rate.md)，发布说明见 [release-0.9.2](../docs/release-0.9.2.md)，本轮三星真实羽毛球、力量训练及篮球三分支结果见 [E48](../specs/independent-step-collection/validation.md#e48新增运动真机闭环与092修复2026-09-28)。18 包跨端证据保留在 E46，华为戒指长时与云端读回证据保留在 E41–E45；新增 H10 的硬件支持范围单独验证。
 
 ## 当前流程

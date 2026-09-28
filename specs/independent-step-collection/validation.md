@@ -1296,3 +1296,15 @@ APK SHA-256：`9d78a2e8ad57f25b6b6d81da371c70f04f95b3e36da8a8e8d5e7c40c6cfb0e36`
 本地证据：`.local/qa/real-device-0.9.1-20260928/`，包含修复前失败日志、最终构建/测试日志、原位安装及APK读回、三份关键手机快照、`final-phone-preservation.json`、暂存/取消/放弃/冷开/已上传页面截图。云端核对报告分别为`.local/research/multisport-091-phone-readback/READBACK_VALIDATION.md`、`.local/research/multisport-092-strength-readback/READBACK_VALIDATION.md`。原始数据、身份、上传配置及快照均留在本机受控目录，不进入Git。
 
 尚未取得真实H10 HR/RR、戒指与H10双设备断连/锁屏后台及长时证据。七类入口均检查，完整硬件收尾本轮抽取上述三类；其余活动共用路径的软件回归单独记录。10小时与华为/小米新增功能兼容性继续按设备验收；既有华为长记录证据维持原版本、设备与时长范围。
+
+## E49：记录列表文案精简0.9.3（2026-09-28）
+
+用户要求删除“无需步数”无关文字，实际记录列表显示为“无需计步”。非计步运动的`referenceLabel`现返回空值，记录卡片整体省略该TextView及其专属间距；日期、运动名称、保存／上传状态及可执行操作保持。走跑实际读数、0步与历史缺失参考照常显示；内部`not_applicable`、文件、上传和研究端字段未改动。
+
+- Debug、AndroidTest、Release与lintVitalRelease构建通过。
+- 三项既有模拟器回归执行通过、0失败、0跳过，37.579秒：`sevenNonStepSportsOmitReadingsAndSubmitNotApplicableForEitherSaveChoice`、`aRealZeroRemainsValidAfterNativeInputSaveAndRecreation`、`historicalMissingAndUnreliableReferencesRenderAndRetryWithoutBeingRewritten`。
+- 模拟器同源演示入口实际完成羽毛球保存，在记录页核对三条卡片均只显示日期／活动和模拟上传状态；UI树无“无需步数／无需计步”，截图确认未残留空行，演示数据保留在隔离入口。
+- 正式0.9.3（64）签名包已生成，哈希及大小见[发布说明](../../docs/release-0.9.3.md)；原0.9.2产物保持。
+- 初始ADB仅有模拟器；稍后三星重新连接，但仍锁屏，尚未确认当前采集状态，因此本节记录时未覆盖安装。已集中提示用户解锁，待确认空闲后更新；未停止采集或清除手机数据。
+
+证据目录为`.local/qa/record-copy-093-20260928/`，包括构建、签名、定向测试日志，模拟器记录页截图与UI树，以及手机更新前状态。此补丁仅调整记录展示，底层完整回归和真实硬件范围沿用E48。
